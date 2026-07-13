@@ -42,7 +42,9 @@ impl client::Handler for Handler {
 
 fn expand_tilde(path: &str) -> String {
     match path.strip_prefix("~/") {
-        Some(rest) => format!("{}/{}", std::env::var("HOME").unwrap_or_default(), rest),
+        Some(rest) => dirs::home_dir()
+            .map(|h| h.join(rest).to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string()),
         None => path.to_string(),
     }
 }
@@ -72,9 +74,9 @@ pub async fn connect_auth(
         .await
         .map_err(|e| match e {
             russh::Error::UnknownKey => {
-                "la clé du serveur a changé (risque de MITM) — vérifie ~/.ssh/known_hosts".to_string()
+                "the server key changed (MITM risk) — check ~/.ssh/known_hosts".to_string()
             }
-            e => format!("connexion: {e}"),
+            e => format!("connection: {e}"),
         })?;
 
     match auth.as_deref() {
@@ -84,13 +86,13 @@ pub async fn connect_auth(
             let pw = passphrase
                 .filter(|p| !p.is_empty())
                 .or_else(|| identity_id.as_deref().and_then(crate::store::passphrase_get))
-                .ok_or("mot de passe introuvable (Keychain)")?;
+                .ok_or("password not found (Keychain)")?;
             let res = handle
                 .authenticate_password(user, pw)
                 .await
                 .map_err(|e| format!("auth: {e}"))?;
             if !res.success() {
-                return Err("mot de passe refusé".into());
+                return Err("password rejected".into());
             }
         }
         _ => {
@@ -99,7 +101,7 @@ pub async fn connect_auth(
                 .filter(|p| !p.is_empty())
                 .or_else(|| identity_id.as_deref().and_then(crate::store::passphrase_get));
             let key = load_secret_key(expand_tilde(key_path), passphrase.as_deref())
-                .map_err(|e| format!("clé: {e}"))?;
+                .map_err(|e| format!("key: {e}"))?;
             let hash = handle
                 .best_supported_rsa_hash()
                 .await
@@ -110,7 +112,7 @@ pub async fn connect_auth(
                 .await
                 .map_err(|e| format!("auth: {e}"))?;
             if !res.success() {
-                return Err("authentification refusée".into());
+                return Err("authentication refused".into());
             }
         }
     }
@@ -126,7 +128,7 @@ async fn auth_agent(handle: &mut client::Handle<Handler>, user: &str) -> Result<
         .map_err(|e| format!("ssh-agent: {e}"))?;
     let ids = agent.request_identities().await.map_err(|e| e.to_string())?;
     if ids.is_empty() {
-        return Err("ssh-agent : aucune clé chargée (ssh-add ?)".into());
+        return Err("ssh-agent: no keys loaded (ssh-add?)".into());
     }
     let hash = handle.best_supported_rsa_hash().await.ok().flatten().flatten();
     for id in ids {
@@ -142,7 +144,7 @@ async fn auth_agent(handle: &mut client::Handle<Handler>, user: &str) -> Result<
             return Ok(());
         }
     }
-    Err("ssh-agent : aucune clé acceptée par le serveur".into())
+    Err("ssh-agent: no key accepted by the server".into())
 }
 
 #[tauri::command]
@@ -262,7 +264,7 @@ pub async fn claude_sync(
     identity_id: Option<String>,
     auth: Option<String>,
 ) -> Result<String, String> {
-    let home = std::env::var("HOME").map_err(|e| e.to_string())?;
+    let home = crate::home_dir()?;
     // ponytail: whitelist explicite — ~/.claude contient aussi l'historique de
     // sessions et des caches qu'il ne faut surtout pas pousser
     const ITEMS: [&str; 5] = [
@@ -278,7 +280,7 @@ pub async fn claude_sync(
         .filter(|p| std::path::Path::new(&home).join(p).exists())
         .collect();
     if existing.is_empty() {
-        return Err("aucun élément à synchroniser dans ~/.claude".into());
+        return Err("nothing to sync in ~/.claude".into());
     }
     let tar = tokio::process::Command::new("tar")
         .arg("czf")
@@ -300,8 +302,8 @@ pub async fn claude_sync(
 
     let (_, boot) = exec(
         &handle,
-        "command -v claude >/dev/null 2>&1 && echo présent || \
-         (curl -fsSL https://claude.ai/install.sh | bash >/dev/null 2>&1 && echo installé || echo échec-installation)",
+        "command -v claude >/dev/null 2>&1 && echo present || \
+         (curl -fsSL https://claude.ai/install.sh | bash >/dev/null 2>&1 && echo installed || echo install-failed)",
         None,
     )
     .await?;
@@ -309,15 +311,66 @@ pub async fn claude_sync(
 
     let (status, out) = exec(&handle, "tar xzf - -C \"$HOME\"", Some(&tar.stdout)).await?;
     if status != 0 {
-        return Err(format!("tar distant (code {status}): {out}"));
+        return Err(format!("remote tar (code {status}): {out}"));
     }
 
     let hooks = install_hooks(&handle).await;
+    let plugins = provision_plugins(&handle, &home).await;
 
-    Ok(format!(
-        "claude {boot} · {} élément(s) de config poussés · {hooks}",
+    let mut msg = format!(
+        "claude {boot} · {} config item(s) pushed · {hooks} · {plugins}",
         existing.len()
-    ))
+    );
+    if let Some(w) = statusline_warning(&handle, &home).await {
+        msg.push_str(&format!(" · {w}"));
+    }
+    Ok(msg)
+}
+
+/// Installe zsh-autosuggestions sur le VPS (suggestions grises en fin de frappe)
+/// et le source dans ~/.zshrc. Idempotent : ré-exécutable sans effet de bord.
+#[tauri::command]
+pub async fn shell_enhance(
+    host: String,
+    port: u16,
+    user: String,
+    key_path: String,
+    identity_id: Option<String>,
+    auth: Option<String>,
+) -> Result<String, String> {
+    // sh POSIX (pas zsh : on ne dépend que du shell de login pour installer).
+    // git en priorité, sinon tarball via curl. La ligne source n'est ajoutée
+    // qu'une fois (grep) et pointe le chemin absolu résolu.
+    const SETUP: &str = r#"set -e
+command -v zsh >/dev/null 2>&1 || { echo "zsh-absent"; exit 3; }
+DIR="$HOME/.zsh/zsh-autosuggestions"
+if [ ! -f "$DIR/zsh-autosuggestions.zsh" ]; then
+  mkdir -p "$HOME/.zsh"
+  if command -v git >/dev/null 2>&1; then
+    git clone -q --depth=1 https://github.com/zsh-users/zsh-autosuggestions "$DIR"
+  elif command -v curl >/dev/null 2>&1; then
+    curl -fsSL https://github.com/zsh-users/zsh-autosuggestions/archive/refs/heads/master.tar.gz \
+      | tar xz -C "$HOME/.zsh"
+    mv "$HOME/.zsh/zsh-autosuggestions-master" "$DIR"
+  else
+    echo "no-fetch"; exit 4
+  fi
+fi
+RC="$HOME/.zshrc"
+grep -qF "zsh-autosuggestions.zsh" "$RC" 2>/dev/null || \
+  printf '\n# arabel: suggestions\nsource %s/zsh-autosuggestions.zsh\n' "$DIR" >> "$RC"
+[ "$(basename "${SHELL:-}")" = zsh ] && echo ok || echo "ok-not-default"
+"#;
+    let handle = connect_auth(&host, port, &user, &key_path, None, identity_id, auth).await?;
+    match exec(&handle, "sh", Some(SETUP.as_bytes())).await? {
+        (0, out) if out.trim() == "ok-not-default" => {
+            Ok("suggestions installed — but your default shell isn't zsh (chsh -s $(which zsh)). Open a new terminal.".into())
+        }
+        (0, _) => Ok("suggestions enabled — open a new terminal.".into()),
+        (3, _) => Err("zsh missing on the VPS (install it: apt/dnf install zsh)".into()),
+        (4, _) => Err("neither git nor curl on the VPS to fetch the plugin".into()),
+        (c, out) => Err(format!("failed (code {c}): {}", out.trim())),
+    }
 }
 
 /// Installe le script de hook arabel et le branche dans ~/.claude/settings.json distant.
@@ -335,13 +388,16 @@ except Exception:
     cfg = {}
 cmd = {"type": "command", "command": "$HOME/.arabel/hook.sh"}
 h = cfg.setdefault("hooks", {})
-for ev in ("Notification", "Stop"):
+changed = False
+# PreToolUse/UserPromptSubmit alimentent l'activité live du dashboard ;
+# Notification/Stop portent l'attente (permission/question) et la fin.
+for ev in ("Notification", "Stop", "PreToolUse", "UserPromptSubmit"):
     entries = h.setdefault(ev, [])
     if not any("arabel" in json.dumps(e) for e in entries):
-        entries.append({"hooks": [cmd]})
+        entries.append({"hooks": [cmd]}); changed = True
 os.makedirs(os.path.dirname(p), exist_ok=True)
 json.dump(cfg, open(p, "w"), indent=2)
-print("ok")
+print("installed" if changed else "present")
 "#;
     let w = exec(
         handle,
@@ -350,12 +406,113 @@ print("ok")
     )
     .await;
     if !matches!(w, Ok((0, _))) {
-        return "hooks non installés (écriture script échouée)".into();
+        return "hooks not installed (script write failed)".into();
     }
     match exec(handle, "python3 -", Some(MERGE_PY.as_bytes())).await {
-        Ok((0, _)) => "hooks de notification installés".into(),
-        _ => "hooks non branchés (python3 absent sur le VPS ?)".into(),
+        Ok((0, out)) if out.contains("present") => "hooks already in place".into(),
+        Ok((0, _)) => "notification hooks installed".into(),
+        _ => "hooks not wired up (python3 missing on the VPS?)".into(),
     }
+}
+
+/// Plugins activés localement (clés `nom@marketplace` de settings.json).
+fn read_enabled_plugins(home: &str) -> Vec<String> {
+    let txt = match std::fs::read_to_string(std::path::Path::new(home).join(".claude/settings.json")) {
+        Ok(t) => t,
+        Err(_) => return vec![],
+    };
+    serde_json::from_str::<serde_json::Value>(&txt)
+        .ok()
+        .and_then(|v| v.get("enabledPlugins")?.as_object().map(|o| {
+            o.iter()
+                .filter(|(_, v)| v.as_bool() == Some(true))
+                .map(|(k, _)| k.clone())
+                .collect()
+        }))
+        .unwrap_or_default()
+}
+
+/// Sources des marketplaces connues localement (repo github ou url), pour
+/// `claude plugin marketplace add`.
+fn read_marketplaces(home: &str) -> Vec<String> {
+    let txt = match std::fs::read_to_string(
+        std::path::Path::new(home).join(".claude/plugins/known_marketplaces.json"),
+    ) {
+        Ok(t) => t,
+        Err(_) => return vec![],
+    };
+    serde_json::from_str::<serde_json::Value>(&txt)
+        .ok()
+        .and_then(|v| {
+            v.as_object().map(|obj| {
+                obj.values()
+                    .filter_map(|m| {
+                        let src = m.get("source")?;
+                        match src.get("source").and_then(|s| s.as_str()) {
+                            Some("github") => src.get("repo").and_then(|r| r.as_str()),
+                            _ => src.get("url").and_then(|u| u.as_str()),
+                        }
+                        .map(String::from)
+                    })
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
+}
+
+/// Réinstalle les plugins activés depuis leurs marketplaces (git) sur le VPS —
+/// plutôt que de copier le cache local (binaires/chemins Mac non portables).
+/// C'est le duo `marketplace add` + `install` fait automatiquement.
+async fn provision_plugins(handle: &client::Handle<Handler>, home: &str) -> String {
+    let plugins = read_enabled_plugins(home);
+    if plugins.is_empty() {
+        return "no enabled plugin".into();
+    }
+    // valeurs issues de la config locale de l'utilisateur (repos github, noms de
+    // plugins) : simples, mais on quote quand même pour éviter toute surprise.
+    let mut script = String::from("set +e\n");
+    for repo in read_marketplaces(home) {
+        script.push_str(&format!("claude plugin marketplace add '{repo}' >/dev/null 2>&1\n"));
+    }
+    for p in &plugins {
+        script.push_str(&format!("claude plugin install '{p}' >/dev/null 2>&1\n"));
+    }
+    script.push_str("claude plugin list 2>/dev/null\n");
+    let out = match exec(handle, "sh", Some(script.as_bytes())).await {
+        Ok((_, out)) => out,
+        Err(e) => return format!("plugins not installed ({e})"),
+    };
+    let ok = plugins
+        .iter()
+        .filter(|p| out.contains(p.split('@').next().unwrap_or(p)))
+        .count();
+    format!("{ok}/{} plugin(s) installed", plugins.len())
+}
+
+/// Détecte si la statusline configurée sera cassée sur le VPS : chemin absolu
+/// propre à la machine locale, ou dépendance (bun) absente à distance. On avertit
+/// seulement — on ne réécrit pas la config de l'utilisateur.
+async fn statusline_warning(handle: &client::Handle<Handler>, home: &str) -> Option<String> {
+    let txt = std::fs::read_to_string(std::path::Path::new(home).join(".claude/settings.json")).ok()?;
+    let cmd = serde_json::from_str::<serde_json::Value>(&txt)
+        .ok()?
+        .get("statusLine")?
+        .get("command")?
+        .as_str()?
+        .to_string();
+    let mut issues: Vec<String> = vec![];
+    if cmd.contains(home) {
+        issues.push(format!("local path {home}"));
+    }
+    if cmd.contains("bun")
+        && !matches!(
+            exec(handle, "command -v bun >/dev/null 2>&1 && echo y || echo n", None).await,
+            Ok((_, o)) if o.trim() == "y"
+        )
+    {
+        issues.push("bun missing on VPS".into());
+    }
+    (!issues.is_empty()).then(|| format!("⚠ status line needs adjusting ({})", issues.join(", ")))
 }
 
 /// Flux distants (hooks Claude, métriques) : une commande streamée par clé,
@@ -518,52 +675,122 @@ pub async fn metrics_unwatch(
     Ok(())
 }
 
-/// Parse ~/.ssh/config et renvoie les hôtes déclarés (motifs génériques ignorés).
-#[tauri::command]
-pub fn ssh_config_parse() -> Result<Vec<serde_json::Value>, String> {
-    fn push(
-        alias: &Option<String>,
-        hostname: &Option<String>,
-        user: &Option<String>,
-        port: &Option<u16>,
-        identity: &Option<String>,
-        out: &mut Vec<serde_json::Value>,
-    ) {
-        if let Some(a) = alias {
-            out.push(serde_json::json!({
-                "host": a,
-                "hostName": hostname.clone().unwrap_or_else(|| a.clone()),
-                "user": user.clone().unwrap_or_default(),
-                "port": port.unwrap_or(22),
-                "identityFile": identity.clone().unwrap_or_default(),
-            }));
+/// Étend `~/`, chemins absolus, ou relatifs à `~/.ssh` (sémantique `Include` d'OpenSSH).
+fn ssh_expand(home: &str, p: &str) -> std::path::PathBuf {
+    if let Some(r) = p.strip_prefix("~/") {
+        std::path::Path::new(home).join(r)
+    } else if p.starts_with('/') {
+        std::path::PathBuf::from(p)
+    } else {
+        std::path::Path::new(home).join(".ssh").join(p)
+    }
+}
+
+/// Extrait une valeur string d'un JSON(C) par recherche textuelle (settings.json de VS Code
+/// contient des commentaires, donc serde_json ne suffit pas).
+fn jsonc_string(text: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let after = &text[text.find(&needle)? + needle.len()..];
+    let a2 = &after[after.find(':')? + 1..];
+    let q1 = a2.find('"')?;
+    let q2 = a2[q1 + 1..].find('"')?;
+    Some(a2[q1 + 1..q1 + 1 + q2].to_string())
+}
+
+/// Idem pour une valeur numérique (ex. `"terminal.integrated.fontSize": 13`).
+fn jsonc_number(text: &str, key: &str) -> Option<f64> {
+    let needle = format!("\"{key}\"");
+    let after = &text[text.find(&needle)? + needle.len()..];
+    let a2 = after[after.find(':')? + 1..].trim_start();
+    let end = a2.find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-').unwrap_or(a2.len());
+    a2[..end].parse().ok()
+}
+
+/// Emplacements possibles du settings.json de VS Code (stable/Insiders/VSCodium).
+/// `dirs::config_dir()` pointe le bon dossier par OS : `~/Library/Application Support`
+/// (macOS), `%APPDATA%` (Windows), `~/.config` (Linux) — là où VS Code range sa config.
+fn vscode_settings_files() -> Vec<std::path::PathBuf> {
+    let Some(base) = dirs::config_dir() else { return Vec::new() };
+    ["Code", "Code - Insiders", "VSCodium"]
+        .iter()
+        .map(|b| base.join(b).join("User").join("settings.json"))
+        .collect()
+}
+
+/// Lit un réglage de VS Code (stable ou Insiders).
+fn vscode_setting(key: &str) -> Option<String> {
+    for p in vscode_settings_files() {
+        if let Ok(text) = std::fs::read_to_string(&p) {
+            if let Some(v) = jsonc_string(&text, key) {
+                return Some(v);
+            }
         }
     }
-    let home = std::env::var("HOME").map_err(|e| e.to_string())?;
-    let text = std::fs::read_to_string(std::path::Path::new(&home).join(".ssh/config")).unwrap_or_default();
-    let mut out = Vec::new();
+    None
+}
+
+fn push_host(
+    alias: &Option<String>, hostname: &Option<String>, user: &Option<String>,
+    port: &Option<u16>, identity: &Option<String>, out: &mut Vec<serde_json::Value>,
+) {
+    if let Some(a) = alias {
+        out.push(serde_json::json!({
+            "host": a,
+            "hostName": hostname.clone().unwrap_or_else(|| a.clone()),
+            "user": user.clone().unwrap_or_default(),
+            "port": port.unwrap_or(22),
+            "identityFile": identity.clone().unwrap_or_default(),
+        }));
+    }
+}
+
+/// Parse un fichier de config SSH (gère `Include`, récursif, protégé contre les boucles).
+fn parse_ssh_file(
+    path: &std::path::Path, home: &str,
+    out: &mut Vec<serde_json::Value>, seen: &mut std::collections::HashSet<std::path::PathBuf>,
+) {
+    if !seen.insert(path.to_path_buf()) {
+        return; // déjà lu (évite les Include circulaires)
+    }
+    let Ok(text) = std::fs::read_to_string(path) else { return };
     let (mut alias, mut hostname, mut user, mut port, mut identity): (
         Option<String>, Option<String>, Option<String>, Option<u16>, Option<String>,
     ) = (None, None, None, None, None);
+    let sep = |c: char| c.is_whitespace() || c == '=';
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let sep = |c: char| c.is_whitespace() || c == '=';
-        let (key, val) = match line.split_once(sep) {
-            Some((k, v)) => (k.to_ascii_lowercase(), v.trim_start_matches(sep).trim().to_string()),
-            None => continue,
-        };
+        let Some((k, v)) = line.split_once(sep) else { continue };
+        let key = k.to_ascii_lowercase();
+        let val = v.trim_start_matches(sep).trim().to_string();
         match key.as_str() {
+            "include" => {
+                push_host(&alias, &hostname, &user, &port, &identity, out);
+                (alias, hostname, user, port, identity) = (None, None, None, None, None);
+                for token in val.split_whitespace() {
+                    let ip = ssh_expand(home, token);
+                    if token.contains('*') {
+                        // glob simple : lit tous les fichiers du dossier
+                        if let Some(dir) = ip.parent() {
+                            if let Ok(rd) = std::fs::read_dir(dir) {
+                                let mut files: Vec<_> = rd.flatten().map(|e| e.path()).filter(|p| p.is_file()).collect();
+                                files.sort();
+                                for f in files {
+                                    parse_ssh_file(&f, home, out, seen);
+                                }
+                            }
+                        }
+                    } else {
+                        parse_ssh_file(&ip, home, out, seen);
+                    }
+                }
+            }
             "host" => {
-                push(&alias, &hostname, &user, &port, &identity, &mut out);
+                push_host(&alias, &hostname, &user, &port, &identity, out);
                 (hostname, user, port, identity) = (None, None, None, None);
-                // premier alias non générique du bloc
-                alias = val
-                    .split_whitespace()
-                    .find(|p| !p.contains('*') && !p.contains('?'))
-                    .map(str::to_string);
+                alias = val.split_whitespace().find(|p| !p.contains('*') && !p.contains('?')).map(str::to_string);
             }
             "hostname" => hostname = Some(val),
             "user" => user = Some(val),
@@ -572,8 +799,41 @@ pub fn ssh_config_parse() -> Result<Vec<serde_json::Value>, String> {
             _ => {}
         }
     }
-    push(&alias, &hostname, &user, &port, &identity, &mut out);
+    push_host(&alias, &hostname, &user, &port, &identity, out);
+}
+
+/// Parse ~/.ssh/config (+ Include) et le fichier SSH configuré dans VS Code.
+#[tauri::command]
+pub fn ssh_config_parse() -> Result<Vec<serde_json::Value>, String> {
+    let home = crate::home_dir()?;
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    parse_ssh_file(&std::path::Path::new(&home).join(".ssh/config"), &home, &mut out, &mut seen);
+    // VS Code Remote-SSH peut pointer un autre fichier
+    if let Some(cfg) = vscode_setting("remote.SSH.configFile") {
+        parse_ssh_file(&ssh_expand(&home, &cfg), &home, &mut out, &mut seen);
+    }
+    // dédoublonne par (host)
+    let mut names = std::collections::HashSet::new();
+    out.retain(|h| names.insert(h["host"].as_str().unwrap_or("").to_string()));
     Ok(out)
+}
+
+/// Police et taille du terminal configurées dans VS Code (pour import).
+#[tauri::command]
+pub fn vscode_terminal() -> serde_json::Value {
+    let (mut family, mut size) = (None, None);
+    for p in vscode_settings_files() {
+        if let Ok(text) = std::fs::read_to_string(&p) {
+            if family.is_none() {
+                family = jsonc_string(&text, "terminal.integrated.fontFamily");
+            }
+            if size.is_none() {
+                size = jsonc_number(&text, "terminal.integrated.fontSize");
+            }
+        }
+    }
+    serde_json::json!({ "fontFamily": family, "fontSize": size })
 }
 
 /// Redirections de ports (tunnels type `ssh -L`) : un listener local par tunnel,
@@ -596,7 +856,7 @@ pub async fn port_forward_start(
     auth: Option<String>,
 ) -> Result<u16, String> {
     if state.0.lock().await.contains_key(&id) {
-        return Err("tunnel déjà actif".into());
+        return Err("tunnel already active".into());
     }
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", local_port))
         .await
@@ -638,6 +898,25 @@ pub async fn port_forward_stop(state: State<'_, ForwardState>, id: String) -> Re
         let _ = tx.send(()).await;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{jsonc_number, jsonc_string};
+    #[test]
+    fn jsonc_extract() {
+        let s = r#"{
+          // commentaire style VS Code
+          "terminal.integrated.fontFamily": "JetBrains Mono, monospace",
+          "terminal.integrated.fontSize": 13,
+          "remote.SSH.configFile": "~/.ssh/vscode_config"
+        }"#;
+        assert_eq!(jsonc_string(s, "terminal.integrated.fontFamily").as_deref(), Some("JetBrains Mono, monospace"));
+        assert_eq!(jsonc_string(s, "remote.SSH.configFile").as_deref(), Some("~/.ssh/vscode_config"));
+        assert_eq!(jsonc_number(s, "terminal.integrated.fontSize"), Some(13.0));
+        assert_eq!(jsonc_string(s, "absent"), None);
+        assert_eq!(jsonc_number(s, "absent"), None);
+    }
 }
 
 async fn send(state: &SshState, session_id: &str, cmd: Cmd) -> Result<(), String> {

@@ -126,8 +126,8 @@ pub async fn sftp_download(
         .filter(|s| !s.is_empty() && *s != "..")
         .ok_or("nom de fichier invalide")?
         .to_string();
-    let home = std::env::var("HOME").map_err(|e| e.to_string())?;
-    let dl = std::path::Path::new(&home).join("Downloads");
+    // dossier Téléchargements par OS (~/Downloads, %USERPROFILE%\Downloads, XDG…)
+    let dl = dirs::download_dir().ok_or("Downloads folder not found")?;
     let mut target = dl.join(&name);
     let mut n = 1;
     while target.exists() {
@@ -140,6 +140,61 @@ pub async fn sftp_download(
     }
     std::fs::write(&target, &buf).map_err(|e| e.to_string())?;
     Ok(target.display().to_string())
+}
+
+/// Colle une image du presse-papier local vers le VPS : écrit dans
+/// `~/.arabel/paste/<name>` et renvoie le chemin ABSOLU distant (à insérer dans
+/// le terminal pour que l'agent distant le lise). Borne le dossier à 30 fichiers.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub async fn sftp_paste_image(
+    state: State<'_, SftpState>,
+    remote_id: String,
+    host: String,
+    port: u16,
+    user: String,
+    key_path: String,
+    identity_id: Option<String>,
+    auth: Option<String>,
+    name: String,
+    data_b64: String,
+) -> Result<String, String> {
+    let bytes = B64.decode(data_b64).map_err(|e| e.to_string())?;
+    // nom sûr : dernier segment uniquement (le nom est généré côté app mais on
+    // ne fait pas confiance aveugle à une entrée qui construit un chemin distant)
+    let name = std::path::Path::new(&name)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty() && *s != "..")
+        .ok_or("nom de fichier invalide")?
+        .to_string();
+    let mut pool = ensure(&state, &remote_id, &host, port, &user, &key_path, identity_id, auth).await?;
+    let sftp = &pool.get(&remote_id).unwrap().1;
+    let res: Result<String, String> = async {
+        let home = sftp.canonicalize(".").await.map_err(|e| e.to_string())?;
+        let dir = format!("{home}/.arabel/paste");
+        // mkdir -p best-effort : create_dir échoue si le dossier existe déjà, on ignore
+        let _ = sftp.create_dir(format!("{home}/.arabel")).await;
+        let _ = sftp.create_dir(&dir).await;
+        let path = format!("{dir}/{name}");
+        let mut f = sftp.create(&path).await.map_err(|e| e.to_string())?;
+        f.write_all(&bytes).await.map_err(|e| e.to_string())?;
+        f.shutdown().await.map_err(|e| e.to_string())?;
+        // borne le dossier : noms préfixés par un timestamp → tri = ordre chrono,
+        // on supprime les plus anciens au-delà de 30
+        if let Ok(rd) = sftp.read_dir(&dir).await {
+            let mut names: Vec<String> = rd.map(|e| e.file_name()).collect();
+            if names.len() > 30 {
+                names.sort();
+                for old in &names[..names.len() - 30] {
+                    let _ = sftp.remove_file(format!("{dir}/{old}")).await;
+                }
+            }
+        }
+        Ok(path)
+    }
+    .await;
+    drop_on_err(&mut pool, &remote_id, res)
 }
 
 #[tauri::command]

@@ -32,6 +32,20 @@ tauri-plugin-window-state = "2.4.1"
 portable-pty = "0.9.0"
 sysinfo = "0.39.6"
 russh-sftp = "2.3.0"
-core-text = "22.0.0"
-core-foundation = "0.10.1"
+# Énumération des fontes système sur macOS (Core Text), Windows (DirectWrite) et Linux.
+font-kit = "0.14"
+# Résolution cross-platform du home / Downloads (HOME sur Unix, %USERPROFILE% sur Windows).
+dirs = "5"
+
+# Build release optimisé : LTO complet + un seul codegen-unit = meilleur inlining
+# à travers les crates (crypto russh, tokio, parseur xterm côté natif). strip = binaire plus léger.
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
+# Les dépendances sont compilées en -O3 même en dev (crypto/SSH réactif dès
+# `tauri dev`) sans ralentir les rebuilds incrémentaux du code de l'app.
+[profile.dev.package."*"]
+opt-level = 3
 

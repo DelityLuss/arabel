@@ -1,0 +1,59 @@
+name: release
+
+# Un tag `v*` poussé déclenche le build sur les 3 OS et crée la release GitHub
+# avec les artefacts (.dmg/.app universel macOS, .msi/.exe Windows, .deb/.AppImage Linux).
+# Commande unique côté dev :  git tag v0.1.0 && git push origin v0.1.0
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  build:
+    permissions:
+      contents: write # tauri-action crée la release et y attache les binaires
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest      # binaire universel (Apple Silicon + Intel)
+            args: --target universal-apple-darwin
+          - platform: ubuntu-22.04
+            args: ''
+          - platform: windows-latest
+            args: ''
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dépendances système Linux (WebKitGTK, etc.)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # macOS : les deux cibles pour produire le binaire universel
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri -> target
+
+      - run: npm ci
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: Arabel ${{ github.ref_name }}
+          releaseDraft: true # release en brouillon : tu la publies en un clic après vérif
+          prerelease: false
+          args: ${{ matrix.args }}

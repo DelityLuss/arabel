@@ -12,13 +12,19 @@ pub fn local_metrics() -> serde_json::Value {
     use sysinfo::{Disks, System};
     let mut sys = System::new();
     sys.refresh_memory();
+    // ponytail: la load average n'existe pas sur Windows (sysinfo renvoie 0) —
+    // concept Unix, on l'accepte tel quel plutôt que d'échantillonner le CPU.
     let load = System::load_average().one;
     let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     let disks = Disks::new_with_refreshed_list();
+    // disque contenant le home : racine "/" sur Unix, "C:\" (ou autre) sur Windows.
+    // On prend le point de montage le plus spécifique qui préfixe le home.
+    let root = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
     let (disk_total, disk_used) = disks
         .list()
         .iter()
-        .find(|d| d.mount_point() == std::path::Path::new("/"))
+        .filter(|d| root.starts_with(d.mount_point()))
+        .max_by_key(|d| d.mount_point().as_os_str().len())
         .map(|d| (d.total_space(), d.total_space() - d.available_space()))
         .unwrap_or((0, 0));
     serde_json::json!({
@@ -40,26 +46,18 @@ fn size(cols: u32, rows: u32) -> PtySize {
     }
 }
 
-/// Terminal local : shell de l'utilisateur dans un PTY, mêmes events et mêmes
-/// commandes write/resize/disconnect que les sessions SSH (via SshState).
-#[tauri::command]
-pub async fn local_connect(
+/// Spawne une commande dans un PTY et la câble aux mêmes events/commandes que
+/// SSH (`ssh-output-*` / `ssh-closed-*`, SshState). Partagé par local + mosh.
+async fn spawn_in_pty(
     app: AppHandle,
-    state: State<'_, SshState>,
+    state: &SshState,
     session_id: String,
     cols: u32,
     rows: u32,
+    cmd: CommandBuilder,
 ) -> Result<(), String> {
     let pty = native_pty_system();
     let pair = pty.openpty(size(cols, rows)).map_err(|e| e.to_string())?;
-
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
-    let mut cmd = CommandBuilder::new(&shell);
-    cmd.arg("-l");
-    cmd.env("TERM", "xterm-256color");
-    if let Ok(home) = std::env::var("HOME") {
-        cmd.cwd(home);
-    }
     let mut child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
     drop(pair.slave);
 
@@ -108,4 +106,107 @@ pub async fn local_connect(
     });
 
     Ok(())
+}
+
+/// Terminal local : shell de l'utilisateur dans un PTY, mêmes events et mêmes
+/// commandes write/resize/disconnect que les sessions SSH (via SshState).
+#[tauri::command]
+pub async fn local_connect(
+    app: AppHandle,
+    state: State<'_, SshState>,
+    session_id: String,
+    cols: u32,
+    rows: u32,
+) -> Result<(), String> {
+    // Windows n'a pas de $SHELL ni de flag `-l` : PowerShell, présent partout.
+    #[cfg(windows)]
+    let mut cmd = CommandBuilder::new("powershell.exe");
+    #[cfg(not(windows))]
+    let mut cmd = {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+        let mut c = CommandBuilder::new(&shell);
+        c.arg("-l"); // shell de login
+        c
+    };
+    cmd.env("TERM", "xterm-256color");
+    if let Some(home) = dirs::home_dir() {
+        cmd.cwd(home);
+    }
+    spawn_in_pty(app, &state, session_id, cols, rows, cmd).await
+}
+
+/// Localise le binaire `mosh` (une app GUI macOS n'a pas Homebrew dans son PATH).
+fn find_mosh() -> Option<std::path::PathBuf> {
+    let mut dirs = vec!["/opt/homebrew/bin".to_string(), "/usr/local/bin".to_string()];
+    if let Ok(p) = std::env::var("PATH") {
+        dirs.extend(p.split(':').map(str::to_string));
+    }
+    dirs.into_iter()
+        .map(|d| std::path::Path::new(&d).join("mosh"))
+        .find(|p| p.exists())
+}
+
+/// Indique si le transport mosh est utilisable (binaire présent, hors Windows).
+#[tauri::command]
+pub fn mosh_available() -> bool {
+    !cfg!(windows) && find_mosh().is_some()
+}
+
+/// Transport mosh : lance `mosh` en local dans un PTY. mosh gère le bootstrap
+/// SSH, l'UDP, l'écho prédictif et la reprise de session après coupure ; son
+/// rendu (séquences d'échappement) est simplement affiché par xterm. Unix only.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub async fn mosh_connect(
+    app: AppHandle,
+    state: State<'_, SshState>,
+    session_id: String,
+    cols: u32,
+    rows: u32,
+    host: String,
+    port: u16,
+    user: String,
+    key_path: String,
+    auth: Option<String>,
+    exec_cmd: Option<String>,
+) -> Result<(), String> {
+    if auth.as_deref() == Some("password") {
+        return Err("mosh doesn't support password auth (the bootstrap ssh can't enter it) — use a key, ssh-agent, or the SSH transport".into());
+    }
+    let mosh = find_mosh().ok_or("mosh introuvable localement (brew install mosh)")?;
+    let bin_dir = mosh.parent().map(|p| p.display().to_string()).unwrap_or_default();
+
+    // ssh de bootstrap : port + TOFU (accept-new, comme russh) + clé si fournie
+    let mut ssh = format!("ssh -p {port} -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10");
+    if auth.as_deref() != Some("agent") && !key_path.is_empty() {
+        ssh.push_str(&format!(" -i {key_path}"));
+    }
+
+    let mut cmd = CommandBuilder::new(mosh.as_os_str());
+    cmd.arg(format!("--ssh={ssh}"));
+    cmd.arg(format!("{user}@{host}"));
+    if let Some(c) = exec_cmd.filter(|c| !c.is_empty()) {
+        // le snippet tmux est du shell : on l'exécute via un shell de login distant.
+        // mosh transmet l'argv structurellement (pas de ré-échappement à gérer).
+        cmd.arg("--");
+        cmd.arg("sh");
+        cmd.arg("-lc");
+        cmd.arg(c);
+    }
+    cmd.env("TERM", "xterm-256color");
+    // le wrapper mosh doit trouver mosh-client (à côté de lui) + ssh
+    cmd.env(
+        "PATH",
+        format!("{bin_dir}:/usr/bin:/bin:{}", std::env::var("PATH").unwrap_or_default()),
+    );
+    // mosh exige un locale UTF-8 ; une app GUI macOS hérite souvent d'un env sans
+    // LANG → fallback UTF-8 uniquement si l'env courant n'en fournit pas déjà un
+    let has_utf8 = ["LC_ALL", "LANG", "LC_CTYPE"]
+        .iter()
+        .filter_map(|k| std::env::var(k).ok())
+        .any(|v| v.to_uppercase().replace('-', "").contains("UTF8"));
+    if !has_utf8 {
+        cmd.env("LANG", "en_US.UTF-8");
+    }
+    spawn_in_pty(app, &state, session_id, cols, rows, cmd).await
 }

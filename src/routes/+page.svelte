@@ -2,7 +2,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { listen as tauriListen, type UnlistenFn } from "@tauri-apps/api/event";
   import { getCurrentWindow } from "@tauri-apps/api/window";
-  import { readText, writeText } from "@tauri-apps/plugin-clipboard-manager";
+  import { readText, writeText, readImage } from "@tauri-apps/plugin-clipboard-manager";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
   import { Terminal, type ITheme } from "@xterm/xterm";
@@ -17,6 +17,17 @@
   // ─── mode démo (aperçu navigateur sans Tauri) ─────────────────────────────
   const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
   if (!inTauri) try { tmuxccDemo(); } catch (e) { console.error("tmuxcc:", e); } // auto-test parseur en dev
+
+  // ─── plateforme : macOS vs Windows/Linux ──────────────────────────────────
+  const isMac = typeof navigator !== "undefined" && /Mac/i.test(navigator.platform || navigator.userAgent || "");
+  // Modificateur applicatif : ⌘ sur macOS, Ctrl+Maj ailleurs. Ctrl seul reste au
+  // terminal (^C, ^F, ^K…), donc on ne le capture jamais côté Windows/Linux.
+  const appMod = (e: KeyboardEvent) => (isMac ? e.metaKey : e.ctrlKey && e.shiftKey);
+  // Coffre système où keyring range les secrets (libellé UI selon l'OS).
+  const secretStore = isMac ? "the macOS Keychain" : "the system credential manager";
+  // Sans les feux macOS (fenêtre décorée nativement sur Windows), on récupère
+  // l'espace réservé en haut de la barre latérale / titlebar.
+  if (typeof document !== "undefined") document.body.classList.toggle("win", !isMac);
 
   const DEMO_STORE = {
     identities: [{ id: "i1", name: "id_ed25519", keyPath: "~/.ssh/id_ed25519", hasPassphrase: true }],
@@ -36,19 +47,22 @@
     "\x1b[32m❯\x1b[0m export ARABEL_PANE=…\r\n\x1b[32m❯\x1b[0m claude\r\n\r\n" +
     "\x1b[38;5;208m ▐▛███▜▌\x1b[0m   \x1b[1mClaude Code\x1b[0m v2.1\r\n" +
     "\x1b[38;5;208m▝▜█████▛▘\x1b[0m  \x1b[90m~/apps/api-backend\x1b[0m\r\n\r\n" +
-    "\x1b[1m>\x1b[0m corrige le bug de pagination puis lance les tests\r\n\r\n" +
-    "\x1b[90m✻ Réflexion…\x1b[0m\r\n\r\n" +
+    "\x1b[1m>\x1b[0m fix the pagination bug then run the tests\r\n\r\n" +
+    "\x1b[90m✻ Thinking…\x1b[0m\r\n\r\n" +
     "\x1b[32m●\x1b[0m \x1b[1mRead\x1b[0m src/routes/users.ts\r\n" +
     "\x1b[32m●\x1b[0m \x1b[1mEdit\x1b[0m src/routes/users.ts \x1b[90m(+4 -2)\x1b[0m\r\n" +
     "\x1b[33m●\x1b[0m \x1b[1mBash\x1b[0m npm test\r\n" +
-    "  \x1b[90m⎿ En attente de permission…\x1b[0m\r\n";
+    "  \x1b[90m⎿ Waiting for permission…\x1b[0m\r\n";
 
   async function rpc<T = unknown>(cmd: string, args?: Record<string, unknown>): Promise<T> {
     if (inTauri) return invoke<T>(cmd, args);
     // démo : réponses factices
     await new Promise((r) => setTimeout(r, cmd === "ssh_connect" ? 700 : 30));
     if (cmd === "store_load") return JSON.stringify(DEMO_STORE) as T;
-    if (cmd === "claude_sync") return "claude présent · 5 élément(s) de config poussés · hooks installés" as T;
+    if (cmd === "claude_sync") return "claude present · 5 config item(s) pushed · hooks installed" as T;
+    if (cmd === "shell_enhance") return "suggestions enabled — open a new terminal." as T;
+    if (cmd === "mosh_available") return true as T;
+    if (cmd === "sftp_paste_image") return "/home/deploy/.arabel/paste/demo.png" as T;
     if (cmd === "sftp_home") return "/home/deploy" as T;
     if (cmd === "sftp_list")
       return [
@@ -67,13 +81,15 @@
   // ─── types ────────────────────────────────────────────────────────────────
   type Identity = { id: string; name: string; keyPath: string; hasPassphrase: boolean };
   type AuthKind = "key" | "password" | "agent";
-  type Remote = { id: string; name: string; host: string; port: number; user: string; identityId: string; auth?: AuthKind; claude?: boolean; tmux?: boolean };
+  type Remote = { id: string; name: string; host: string; port: number; user: string; identityId: string; auth?: AuthKind; claude?: boolean; autoLaunch?: boolean; dir?: string; tmux?: boolean; mosh?: boolean };
   type ImportHost = { host: string; hostName: string; user: string; port: number; identityFile: string };
   type PaneNode = { leaf: string } | { dir: "h" | "v"; ratio: number; a: PaneNode; b: PaneNode };
   type Tab = { id: string; root: PaneNode | null; active: string | null; projectId: string | null; cc?: string };
   type ProjLeaf = { remoteId: string; cmd: string; id?: string };
   type ProjNode = ProjLeaf | { dir: "h" | "v"; ratio?: number; a: ProjNode; b: ProjNode };
-  type Project = { id: string; name: string; root: ProjNode };
+  // un projet = plusieurs vues (chaque vue = un onglet ; une vue peut être un split).
+  // `root` (legacy, une seule vue) est migré à la lecture via projectViews().
+  type Project = { id: string; name: string; views?: ProjNode[]; root?: ProjNode };
   type SessStatus = { status: "connecting" | "open" | "closed" | "error"; error: string };
   type Modal =
     | { type: "remote"; data: Remote; password: string; back?: boolean }
@@ -88,7 +104,7 @@
     | null;
 
   // pseudo-remote pour le terminal local
-  const LOCAL: Remote = { id: "local", name: "Ce Mac", host: "", port: 0, user: "", identityId: "" };
+  const LOCAL: Remote = { id: "local", name: "This Mac", host: "", port: 0, user: "", identityId: "" };
 
   // ─── thèmes terminal ──────────────────────────────────────────────────────
   const THEMES: Record<string, ITheme> = {
@@ -131,16 +147,45 @@
   let remotes = $state<Remote[]>([]);
   let projects = $state<Project[]>([]);
   const ANSI_KEYS = ["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white", "brightBlack", "brightRed", "brightGreen", "brightYellow", "brightBlue", "brightMagenta", "brightCyan", "brightWhite"] as const;
+
+  // ─── raccourcis clavier configurables ─────────────────────────────────────
+  // Combos normalisés « Meta+Shift+D », ordre canonique Meta→Ctrl→Alt→Shift+touche.
+  // Défauts : ⌘ sur macOS, Ctrl+Maj ailleurs (Ctrl seul reste au terminal).
+  const KMOD = isMac ? "Meta" : "Ctrl+Shift";
+  const DEFAULT_KEYS: Record<string, string> = {
+    palette: `${KMOD}+P`,
+    search: `${KMOD}+F`,
+    "new-connection": `${KMOD}+N`,
+    "close-pane": `${KMOD}+W`,
+    "split-h": `${KMOD}+D`,
+    "split-v": isMac ? "Meta+Shift+D" : "Ctrl+Shift+S",
+    clear: `${KMOD}+K`,
+    "toggle-sidebar": `${KMOD}+B`,
+    settings: `${KMOD}+Comma`,
+    zoom: isMac ? "Meta+Shift+Enter" : "Ctrl+Shift+Enter",
+    copy: `${KMOD}+C`,
+    paste: `${KMOD}+V`,
+    "next-tab": isMac ? "Meta+Shift+BracketRight" : "Ctrl+Alt+BracketRight",
+    "prev-tab": isMac ? "Meta+Shift+BracketLeft" : "Ctrl+Alt+BracketLeft",
+  };
+
   let settings = $state({
     fontSize: 13,
-    fontFamily: 'ui-monospace, "SF Mono", Menlo, monospace',
+    fontFamily: "SF Mono",
     theme: "Arabel Dark",
     copyOnSelect: true,
     sidebar: true,
+    sounds: true, // sons d'événements agent (validation demandée / terminé / refus)
+    tmuxStatus: false, // barre de statut tmux masquée par défaut (doublon de la sidebar)
+    cursorStyle: "bar" as "bar" | "block" | "underline",
+    cursorBlink: true,
+    scrollback: 10000,
+    lineHeight: 1.25,
+    keymap: { ...DEFAULT_KEYS } as Record<string, string>,
     customTheme: { ...THEMES["Arabel Dark"] } as ITheme,
   });
   function activeTheme(): ITheme {
-    return settings.theme === "Personnalisé" ? settings.customTheme : (THEMES[settings.theme] ?? THEMES["Arabel Dark"]);
+    return settings.theme === "Custom" ? settings.customTheme : (THEMES[settings.theme] ?? THEMES["Arabel Dark"]);
   }
   function setCustom(key: keyof ITheme, val: string) {
     settings.customTheme = { ...settings.customTheme, [key]: val };
@@ -150,13 +195,38 @@
   // fontes système (chargées à l'ouverture des réglages)
   let fontList = $state<string[]>([]);
   let fontOpen = $state(false);
+  let fontQuery = $state("");
+  const DEFAULT_FONT = "SF Mono";
   async function loadFonts() {
     if (fontList.length) return;
     fontList = (await rpc<string[]>("list_fonts")) ?? ["Menlo", "Monaco", "SF Mono", "Courier New", "Fira Code", "JetBrains Mono", "Hack", "Cascadia Code"];
   }
+  /** Pile CSS toujours valide : une famille seule reçoit un fallback monospace ; vide → défaut. */
+  function fontStack(f: string): string {
+    const t = (f || "").trim();
+    if (!t) return `"${DEFAULT_FONT}", ui-monospace, Menlo, monospace`;
+    if (t.includes(",")) return t; // déjà une pile
+    return `"${t}", ui-monospace, Menlo, monospace`;
+  }
+  function pickFont(f: string) {
+    settings.fontFamily = f.trim();
+    fontOpen = false;
+    fontQuery = "";
+    applySettings();
+  }
+  async function importVscodeFont() {
+    const t = await rpc<{ fontFamily?: string; fontSize?: number }>("vscode_terminal").catch(() => null);
+    if (!t?.fontFamily && !t?.fontSize) return toast("Nothing to import from VS Code", "info");
+    if (t.fontFamily) settings.fontFamily = t.fontFamily.split(",")[0].replace(/["']/g, "").trim();
+    if (t.fontSize) settings.fontSize = Math.round(t.fontSize);
+    applySettings();
+    toast("Font imported from VS Code", "success");
+  }
   let loaded = $state(false);
   let modal = $state<Modal>(null);
   let confirmDeleteId = $state<string | null>(null);
+  let moshOk = $state(false); // binaire mosh présent → propose le transport mosh
+  rpc<boolean>("mosh_available").then((v) => (moshOk = v)).catch(() => {});
 
   rpc<string>("store_load").then((json) => {
     const data = JSON.parse(json || "{}");
@@ -228,7 +298,7 @@
     const proj = t.projectId && projects.find((p) => p.id === t.projectId);
     if (proj) return proj.name;
     const sid = firstLeaf(t.root);
-    return (sid && sessions.get(sid)?.remote.name) || "nouvel onglet";
+    return (sid && sessions.get(sid)?.remote.name) || "new tab";
   }
   function newTab() {
     const t: Tab = { id: crypto.randomUUID(), root: null, active: null, projectId: null };
@@ -318,13 +388,17 @@
 
   function termOptions() {
     return {
-      fontFamily: settings.fontFamily,
+      fontFamily: fontStack(settings.fontFamily),
       fontSize: settings.fontSize,
-      cursorBlink: true,
-      cursorStyle: "bar" as const,
+      cursorBlink: settings.cursorBlink,
+      cursorStyle: settings.cursorStyle,
       macOptionIsMeta: true,
-      scrollback: 10000,
-      lineHeight: 1.25,
+      // dans une appli qui capte la souris (Claude Code, tmux, vim), la sélection
+      // est happée par l'appli → ⌥+glisser force une sélection locale (donc le
+      // copier-auto-sur-sélection remarche à l'intérieur de ces applis)
+      macOptionClickForcesSelection: true,
+      scrollback: settings.scrollback,
+      lineHeight: settings.lineHeight,
       theme: activeTheme(),
     };
   }
@@ -346,11 +420,18 @@
       `tmux set -g allow-passthrough on 2>/dev/null; ` +
       `tmux set -s extended-keys on 2>/dev/null; ` +
       `tmux set -as terminal-features 'xterm*:extkeys' 2>/dev/null; `;
+    // options tmux scoppées à CETTE session (-t, pas -g, pour ne pas toucher les
+    // autres sessions de l'utilisateur), appliquées à chaque (ré)attache :
+    //  - status : barre de statut (masquée par défaut)
+    //  - mouse on : molette = défilement de l'historique tmux (sinon = flèches → historique de commandes)
+    const sopt =
+      `tmux set -t ${n} status ${settings.tmuxStatus ? "on" : "off"} 2>/dev/null; ` +
+      `tmux set -t ${n} mouse on 2>/dev/null; `;
     return (
       `export PATH="$PATH:/usr/local/bin:/opt/homebrew/bin"; ` + // exec SSH non-interactif = PATH minimal
       `if command -v tmux >/dev/null 2>&1; then ` +
-      `if tmux has-session -t ${n} 2>/dev/null; then ${setenv}exec tmux -u attach-session -t ${n}; ` +
-      `else tmux -u new-session -d -s ${n} && ${tset}${send}${setenv}exec tmux -u attach-session -t ${n}; fi; ` +
+      `if tmux has-session -t ${n} 2>/dev/null; then ${setenv}${sopt}exec tmux -u attach-session -t ${n}; ` +
+      `else tmux -u new-session -d -s ${n} && ${tset}${send}${setenv}${sopt}exec tmux -u attach-session -t ${n}; fi; ` +
       `else exec "$SHELL" -l; fi`
     );
   }
@@ -368,27 +449,27 @@
       if (sel && settings.copyOnSelect && inTauri) writeText(sel).catch(() => {});
     });
     term.attachCustomKeyEventHandler((e) => {
+      if (e.type !== "keydown") return true;
       // Shift+Entrée → nouvelle ligne sans envoyer (attendu par Claude Code) :
       // on émet ESC+CR, reconnu comme saut de ligne même à travers tmux
-      if (e.type === "keydown" && e.key === "Enter" && e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey) {
+      if (e.key === "Enter" && e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey) {
         send("\x1b\r");
         return false;
       }
-      if (e.type !== "keydown" || !e.metaKey) return true;
-      if (e.key === "Enter" && e.shiftKey) {
-        toggleZoom(sid); // ⌘⇧Entrée : plein écran du panneau
+      // Ctrl+V « nu » (la touche de collage de Claude Code, y compris sur Mac) :
+      // si une image locale est dispo on l'upload, sinon on restitue la frappe.
+      if (e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "v") {
+        pasteClipboard(sid, "\x16");
         return false;
       }
-      if (e.key === "v") {
-        if (inTauri) readText().then((t) => t && term.paste(t)).catch(() => {});
+      // raccourci configurable ? term = exécuté ici (accès sélection/pane) ;
+      // window = laissé remonter à globalKeydown, mais rien n'est envoyé au pty.
+      const id = actionCombos.get(comboOf(e));
+      if (id) {
+        const b = bindById.get(id)!;
+        if (b.scope === "term") b.run(sid);
         return false;
       }
-      if (e.key === "f") {
-        openSearch(sid);
-        return false;
-      }
-      // laisse les accélérateurs du menu natif / la palette (⌘P) agir sans que xterm n'envoie de séquence
-      if (["t", "w", "d", "k", "b", ",", "p"].includes(e.key)) return false;
       return true;
     });
     term.onData(send);
@@ -397,7 +478,7 @@
 
   function newSession(remote: Remote, cmd = "", key?: string): string {
     const sid = crypto.randomUUID();
-    const { term, fit, search } = setupTerm(sid, (data) => rpc("ssh_write", { sessionId: sid, data }));
+    const { term, fit, search } = setupTerm(sid, (data) => { lastInput[sid] = Date.now(); onClaudeInput(sid); rpc("ssh_write", { sessionId: sid, data }); });
     term.onResize(({ cols, rows }) => rpc("ssh_resize", { sessionId: sid, cols, rows }));
     sessions.set(sid, { term, fit, search, remote, cmd, key: key ?? sid, unlisteners: [], webgl: false });
     sessStatus[sid] = { status: "connecting", error: "" };
@@ -423,7 +504,7 @@
       if (authKind === "key") {
         const identity = identities.find((i) => i.id === s.remote.identityId);
         if (!identity) {
-          sessStatus[sid] = { status: "error", error: "Ce remote n'a pas d'identité valide." };
+          sessStatus[sid] = { status: "error", error: "This remote has no valid identity." };
           return;
         }
         keyPath = identity.keyPath;
@@ -439,29 +520,46 @@
             syncedRemotes.add(s.remote.id);
             s.term.write(`\x1b[90m[arabel] ${msg}\x1b[0m\r\n`);
           } catch (e) {
-            s.term.write(`\x1b[31m[arabel] sync échouée : ${e}\x1b[0m\r\n`);
+            s.term.write(`\x1b[31m[arabel] sync failed: ${e}\x1b[0m\r\n`);
           }
         }
         const init: string[] = [];
-        if (s.remote.claude) init.push(`export ARABEL_PANE=${sid}`);
+        if (s.remote.dir) init.push(`cd ${shq(s.remote.dir)} 2>/dev/null`); // répertoire de travail
+        if (s.remote.claude) init.push(`export ARABEL_PANE=${sid}`); // suivi : claude lancé plus tard sera tracké
         if (s.cmd) init.push(s.cmd);
-        else if (s.remote.claude) init.push("claude");
+        else if (s.remote.claude && s.remote.autoLaunch) init.push("claude"); // lancement auto uniquement si demandé
         execCmd = tmuxCmd(`arabel-${s.key.slice(0, 8)}`, init.join("; "), s.remote.claude ? sid : null);
       }
       try {
-        await rpc("ssh_connect", {
-          sessionId: sid,
-          host: s.remote.host,
-          port: Number(s.remote.port),
-          user: s.remote.user,
-          keyPath,
-          passphrase: null,
-          identityId,
-          auth: authKind,
-          cols: s.term.cols,
-          rows: s.term.rows,
-          execCmd,
-        });
+        if (s.remote.mosh) {
+          // transport mosh : UDP, écho prédictif, reprise après coupure (Unix).
+          // metrics/hooks/SFTP restent sur russh (canaux indépendants).
+          await rpc("mosh_connect", {
+            sessionId: sid,
+            cols: s.term.cols,
+            rows: s.term.rows,
+            host: s.remote.host,
+            port: Number(s.remote.port),
+            user: s.remote.user,
+            keyPath,
+            auth: authKind,
+            execCmd,
+          });
+        } else {
+          await rpc("ssh_connect", {
+            sessionId: sid,
+            host: s.remote.host,
+            port: Number(s.remote.port),
+            user: s.remote.user,
+            keyPath,
+            passphrase: null,
+            identityId,
+            auth: authKind,
+            cols: s.term.cols,
+            rows: s.term.rows,
+            execCmd,
+          });
+        }
       } catch (e) {
         sessStatus[sid] = { status: "error", error: String(e) };
         return;
@@ -470,7 +568,7 @@
     }
     sessStatus[sid] = { status: "open", error: "" };
     s.unlisteners.push(
-      await listen<string>(`ssh-output-${sid}`, (ev) => s.term.write(b64ToBytes(ev.payload))),
+      await listen<string>(`ssh-output-${sid}`, (ev) => { lastOut[sid] = Date.now(); s.term.write(b64ToBytes(ev.payload)); }),
       await listen(`ssh-closed-${sid}`, () => {
         if (!sessStatus[sid]) return; // fermeture volontaire déjà nettoyée
         sessStatus[sid] = { status: "closed", error: "" };
@@ -487,9 +585,10 @@
       if (s.remote.claude) rpc("events_watch", { remoteId: s.remote.id, ...remoteParams(s.remote) }).catch(() => {});
       if (!s.tmux) {
         // sans tmux : init envoyé dans le shell après connexion (comportement historique)
+        if (s.remote.dir) await rpc("ssh_write", { sessionId: sid, data: `cd ${shq(s.remote.dir)} 2>/dev/null\n` });
         if (s.remote.claude) await rpc("ssh_write", { sessionId: sid, data: `export ARABEL_PANE=${sid}\n` });
         if (s.cmd) await rpc("ssh_write", { sessionId: sid, data: s.cmd + "\n" });
-        else if (s.remote.claude) claudeSetup(sid, s.remote);
+        else if (s.remote.claude && s.remote.autoLaunch) claudeSetup(sid, s.remote);
       }
     } else {
       if (!inTauri) {
@@ -501,9 +600,20 @@
       s.term.write(DEMO_OUTPUT);
       if (s.remote.id !== "local")
         metrics[s.remote.id] = { load: 1.4, cpus: 4, memTotal: 8321499136, memUsed: 5100273664, diskTotal: 84825923584, diskUsed: 39728447488 };
-      // démo : simule une demande de permission Claude (état « attend » du dashboard)
-      if (s.remote.claude)
-        setTimeout(() => { attentions = [...attentions, { id: crypto.randomUUID(), sid, remoteId: s.remote.id, kind: "notif" as const, message: "Autoriser npm test ?" }].slice(-20); }, 1200);
+      // démo : activité live puis question à choix (états « travaille » / « attend »)
+      if (s.remote.claude) {
+        activity = { ...activity, [sid]: { label: "npm test", tool: "Bash", at: Date.now() } };
+        paneStatus = { ...paneStatus, [sid]: "working" };
+        setTimeout(() => {
+          paneStatus = { ...paneStatus, [sid]: "waiting" };
+          attentions = [...attentions, {
+            id: crypto.randomUUID(), sid, remoteId: s.remote.id, kind: "notif" as const,
+            message: "Waiting for permission to run: Bash 'npm test'",
+            question: "Do you want to proceed?",
+            options: ["Yes", "Yes, and don't ask again for npm", "No, and tell Claude what to do"],
+          }].slice(-20);
+        }, 1200);
+      }
     }
   }
 
@@ -527,6 +637,7 @@
     s.unlisteners.forEach((u) => u());
     s.term.dispose();
     attentions = attentions.filter((a) => a.sid !== sid);
+    { const { [sid]: _a, ...ra } = activity; activity = ra; const { [sid]: _p, ...rp } = paneStatus; paneStatus = rp; }
     if (![...sessions.values()].some((x) => x.remote.id === s.remote.id)) {
       rpc("events_unwatch", { remoteId: s.remote.id }).catch(() => {});
       rpc("metrics_unwatch", { remoteId: s.remote.id }).catch(() => {});
@@ -638,13 +749,13 @@
     rpc("ssh_write", { sessionId: cc.ctrlSid, data: `refresh-client -C ${cols}x${rows}\n` });
   }
   async function openTmuxNative(remote: Remote) {
-    if (remote.id === "local") return toast("Le mode tmux natif est pour les remotes SSH.", "error");
+    if (remote.id === "local") return toast("Native tmux mode is for SSH remotes.", "error");
     const authKind: AuthKind = remote.auth ?? "key";
     let keyPath = "";
     let identityId = remote.id;
     if (authKind === "key") {
       const identity = identities.find((i) => i.id === remote.identityId);
-      if (!identity) return toast("Ce remote n'a pas d'identité valide.", "error");
+      if (!identity) return toast("This remote has no valid identity.", "error");
       keyPath = identity.keyPath;
       identityId = identity.id;
     }
@@ -652,7 +763,7 @@
     const tabId = crypto.randomUUID();
     const cc: CcSession = { ctrlSid, remote, tabId, ctrl: null as unknown as TmuxControl, unlisteners: [], pending: [], windows: new Map(), activeWindow: null, winName: {} };
     cc.ctrl = new TmuxControl({
-      output: (pane, bytes) => sessions.get(ccSid(ctrlSid, pane))?.term.write(bytes),
+      output: (pane, bytes) => { const cs = ccSid(ctrlSid, pane); lastOut[cs] = Date.now(); sessions.get(cs)?.term.write(bytes); },
       layout: (win, tree) => ccApplyLayout(cc, win, tree),
       windowClose: (win) => {
         cc.windows.delete(win);
@@ -683,7 +794,7 @@
         keyPath, passphrase: null, identityId, auth: authKind, cols: 200, rows: 50, execCmd,
       });
     } catch (e) {
-      toast(`tmux natif : ${e}`, "error");
+      toast(`native tmux: ${e}`, "error");
       return closeCc(cc);
     }
     cc.unlisteners.push(
@@ -731,15 +842,8 @@
     if (m.projectId) {
       const p = projects.find((x) => x.id === m.projectId);
       if (!p) return;
-      let tab = openTabFor(p.id);
-      if (!tab) {
-        openProject(p);
-        tab = openTabFor(p.id);
-      }
-      if (!tab) return;
-      const sid = newSession(remote);
-      addPaneToTab(tab, sid);
-      activeTabId = tab.id;
+      // vue séparée (nouvel onglet), pas de split auto
+      addProjectTerminal(p, newSession(remote));
       persistProject(p);
     } else if (m.dir && m.sid && m.tabId) {
       const tab = tabs.find((t) => t.id === m.tabId);
@@ -760,7 +864,7 @@
   // ─── déplacement de panneaux (drag & drop, + sur projet) ─────────────────
   let dragSid = $state<string | null>(null);
   let dropTarget = $state<string | null>(null); // id de projet ou "standalone"
-  let dropRow = $state<{ sid: string; after: boolean } | null>(null); // réordonnancement
+  let dropRow = $state<{ sid: string; mode: "before" | "after" | "merge" } | null>(null); // réordonner / fusionner
 
   function ensureOneTab() {
     if (!tabs.length) tabs.push({ id: crypto.randomUUID(), root: null, active: null, projectId: null });
@@ -779,27 +883,29 @@
     tab.root = tab.root ? { dir: "h", ratio: 0.5, a: tab.root, b: { leaf: sid } } : { leaf: sid };
     tab.active = sid;
   }
-  /** Ré-enregistre le layout ouvert d'un projet dans sa définition. */
+  /** Ajoute un terminal à un projet comme une vue séparée (nouvel onglet), pas un split. */
+  function addProjectTerminal(p: Project, sid: string) {
+    const tab: Tab = { id: crypto.randomUUID(), root: { leaf: sid }, active: sid, projectId: p.id };
+    tabs.push(tab);
+    activeTabId = tab.id;
+  }
+  /** Ré-enregistre les vues ouvertes d'un projet dans sa définition. */
   function persistProject(p: Project) {
-    const tab = openTabFor(p.id);
-    if (tab?.root) {
-      const root = serializeTree(tab.root);
-      if (root) p.root = root;
+    const views = projectTabs(p.id)
+      .map((t) => (t.root ? serializeTree(t.root) : null))
+      .filter((v): v is ProjNode => !!v);
+    if (views.length) {
+      p.views = views;
+      delete p.root; // migre l'ancien format
     }
     save();
   }
   function movePaneToProject(sid: string, p: Project) {
-    let tab = openTabFor(p.id);
-    if (!tab) {
-      openProject(p);
-      tab = openTabFor(p.id);
-    }
-    if (!tab || leaves(tab.root).includes(sid)) return;
     const from = tabs.find((t) => leaves(t.root).includes(sid));
+    if (from?.projectId === p.id) return; // déjà dans ce projet
     const fromProject = from?.projectId ? projects.find((x) => x.id === from.projectId) : null;
     extractPane(sid);
-    addPaneToTab(tab, sid);
-    activeTabId = tab.id;
+    addProjectTerminal(p, sid); // devient une vue séparée du projet
     if (fromProject) persistProject(fromProject);
     persistProject(p);
   }
@@ -856,28 +962,45 @@
     tabs.splice(tabs.indexOf(fromTab), 1);
     tabs.splice(tabs.indexOf(toTab) + (after ? 1 : 0), 0, fromTab);
   }
-  /** Handlers de dépôt sur une ligne de terminal pour la réordonner (section autonome). */
-  function reorderzone(sid: string, sub: boolean) {
-    if (sub) return {}; // les panneaux d'un projet ne se réordonnent pas ainsi
+  /** Fusionne deux terminaux : `fromSid` rejoint la vue de `toSid` en split. */
+  function mergeTerminal(fromSid: string, toSid: string) {
+    if (fromSid === toSid) return;
+    const fromTab = tabs.find((t) => leaves(t.root).includes(fromSid));
+    const toTab = tabs.find((t) => leaves(t.root).includes(toSid));
+    if (!fromTab || !toTab || fromTab === toTab || !toTab.root) return; // déjà dans la même vue
+    const fromProject = fromTab.projectId ? projects.find((p) => p.id === fromTab.projectId) : null;
+    const toProject = toTab.projectId ? projects.find((p) => p.id === toTab.projectId) : null;
+    extractPane(fromSid); // retire de sa vue (supprime l'onglet s'il devient vide)
+    toTab.root = withSplit(toTab.root, toSid, "h", fromSid); // à côté de toSid
+    toTab.active = fromSid;
+    activeTabId = toTab.id;
+    if (fromProject && fromProject !== toProject) persistProject(fromProject);
+    if (toProject) persistProject(toProject);
+  }
+  /** Dépôt sur une ligne de terminal : bord haut/bas → réordonner (autonomes), milieu → fusionner. */
+  function paneDropzone(sid: string, sub: boolean) {
     return {
       ondragover: (e: DragEvent) => {
-        // seulement entre terminaux autonomes ; sinon on laisse la section gérer
-        // (déplacer-vers-standalone) ou la ligne cible n'est pas concernée
-        if (!dragSid || dragSid === sid || !isStandalone(dragSid)) return;
+        if (!dragSid || dragSid === sid) return;
         e.preventDefault();
         e.stopPropagation();
         const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-        dropRow = { sid, after: e.clientY > r.top + r.height / 2 };
+        const y = (e.clientY - r.top) / r.height;
+        // réordonner seulement entre deux terminaux autonomes ; fusion partout ailleurs
+        const canReorder = !sub && isStandalone(dragSid);
+        dropRow = { sid, mode: canReorder && y < 0.3 ? "before" : canReorder && y > 0.7 ? "after" : "merge" };
         dropTarget = null;
       },
       ondragleave: () => {
         if (dropRow?.sid === sid) dropRow = null;
       },
       ondrop: (e: DragEvent) => {
-        if (!dragSid || !isStandalone(dragSid)) return;
+        if (!dragSid || dragSid === sid) return;
         e.preventDefault();
         e.stopPropagation();
-        reorderTerminal(dragSid, sid, dropRow?.after ?? false);
+        const mode = dropRow?.mode ?? "merge";
+        if (mode === "merge") mergeTerminal(dragSid, sid);
+        else reorderTerminal(dragSid, sid, mode === "after");
         dragSid = null;
         dropRow = null;
         dropTarget = null;
@@ -901,6 +1024,13 @@
   function projLeaves(n: ProjNode): ProjLeaf[] {
     return "remoteId" in n ? [n] : [...projLeaves(n.a), ...projLeaves(n.b)];
   }
+  /** Vues d'un projet (compat : ancien format `root` = une seule vue). */
+  function projectViews(p: Project): ProjNode[] {
+    return p.views ?? (p.root ? [p.root] : []);
+  }
+  function projectTabs(pid: string): Tab[] {
+    return tabs.filter((t) => t.projectId === pid);
+  }
   function projRemote(remoteId: string): Remote | undefined {
     return remoteId === "local" ? LOCAL : remotes.find((r) => r.id === remoteId);
   }
@@ -917,14 +1047,19 @@
     return { dir: n.dir, ratio: n.ratio ?? 0.5, a, b };
   }
   function openProject(p: Project) {
-    const root = buildNode(p.root);
-    if (!root) {
-      toast("Aucun remote de ce projet n'existe encore.", "error");
+    let last: string | null = null;
+    for (const view of projectViews(p)) {
+      const root = buildNode(view);
+      if (!root) continue;
+      const tab: Tab = { id: crypto.randomUUID(), root, active: firstLeaf(root), projectId: p.id };
+      tabs.push(tab);
+      last = tab.id;
+    }
+    if (!last) {
+      toast("None of this project's remotes exist yet.", "error");
       return;
     }
-    const tab: Tab = { id: crypto.randomUUID(), root, active: firstLeaf(root), projectId: p.id };
-    tabs.push(tab);
-    activeTabId = tab.id;
+    activeTabId = last;
   }
   async function confirmSaveProject() {
     if (modal?.type !== "saveProject") return;
@@ -937,13 +1072,13 @@
     const existing = tab.projectId && projects.find((p) => p.id === tab.projectId);
     if (existing) {
       existing.name = name;
-      existing.root = root;
+      persistProject(existing); // enregistre toutes ses vues ouvertes
     } else {
-      const p: Project = { id: crypto.randomUUID(), name, root };
+      const p: Project = { id: crypto.randomUUID(), name, views: [root] };
       projects = [...projects, p];
       tab.projectId = p.id;
     }
-    toast(`Projet « ${name} » enregistré`, "success");
+    toast(`Project "${name}" saved`, "success");
     await save();
   }
 
@@ -973,7 +1108,7 @@
   async function deleteRemote(r: Remote) {
     if (r.auth === "password") await rpc("passphrase_delete", { identityId: r.id }).catch(() => {});
     remotes = remotes.filter((x) => x.id !== r.id);
-    projects = projects.filter((p) => projLeaves(p.root).some((l) => remotes.some((x) => x.id === l.remoteId)));
+    projects = projects.filter((p) => projectViews(p).flatMap(projLeaves).some((l) => remotes.some((x) => x.id === l.remoteId)));
     confirmDeleteId = null;
     await save();
   }
@@ -981,7 +1116,7 @@
     try {
       const hosts = (await rpc<ImportHost[]>("ssh_config_parse")) ?? [];
       const fresh = hosts.filter((h) => !remotes.some((r) => r.host === h.hostName && r.user === h.user));
-      if (!fresh.length) return toast("Aucun nouvel hôte dans ~/.ssh/config", "info");
+      if (!fresh.length) return toast("No new hosts to import (SSH / VS Code)", "info");
       modal = { type: "sshImport", hosts: fresh, back: true };
     } catch (e) {
       toast(String(e), "error");
@@ -995,7 +1130,7 @@
       const existing = identities.find((i) => i.keyPath === h.identityFile);
       if (existing) identityId = existing.id;
       else {
-        const id: Identity = { id: crypto.randomUUID(), name: h.identityFile.split("/").pop() ?? "clé", keyPath: h.identityFile, hasPassphrase: false };
+        const id: Identity = { id: crypto.randomUUID(), name: h.identityFile.split("/").pop() ?? "key", keyPath: h.identityFile, hasPassphrase: false };
         identities = [...identities, id];
         identityId = id.id;
       }
@@ -1016,7 +1151,7 @@
   async function saveIdentity() {
     if (modal?.type !== "identity") return;
     const i = modal.data;
-    if (!i.name) i.name = i.keyPath.split("/").pop() ?? "clé";
+    if (!i.name) i.name = i.keyPath.split("/").pop() ?? "key";
     if (modal.passphrase) {
       await rpc("passphrase_set", { identityId: i.id, passphrase: modal.passphrase });
       i.hasPassphrase = true;
@@ -1027,7 +1162,7 @@
   }
   async function deleteIdentity(i: Identity) {
     if (remotes.some((r) => r.identityId === i.id)) {
-      toast(`« ${i.name} » est utilisée par un remote.`, "error");
+      toast(`"${i.name}" is used by a remote.`, "error");
       confirmDeleteId = null;
       return;
     }
@@ -1053,8 +1188,12 @@
   function applySettings() {
     for (const s of sessions.values()) {
       s.term.options.fontSize = settings.fontSize;
-      s.term.options.fontFamily = settings.fontFamily;
+      s.term.options.fontFamily = fontStack(settings.fontFamily);
       s.term.options.theme = activeTheme();
+      s.term.options.cursorStyle = settings.cursorStyle;
+      s.term.options.cursorBlink = settings.cursorBlink;
+      s.term.options.scrollback = settings.scrollback;
+      s.term.options.lineHeight = settings.lineHeight;
       s.fit.fit();
     }
     save();
@@ -1076,26 +1215,49 @@
     if (!s) return;
     try {
       if (!syncedRemotes.has(remote.id)) {
-        s.term.write("\x1b[90m[arabel] sync config Claude Code…\x1b[0m\r\n");
+        s.term.write("\x1b[90m[arabel] syncing Claude Code config…\x1b[0m\r\n");
         const msg = await rpc<string>("claude_sync", remoteParams(remote));
         syncedRemotes.add(remote.id);
         s.term.write(`\x1b[90m[arabel] ${msg}\x1b[0m\r\n`);
       }
       await rpc("ssh_write", { sessionId: sid, data: "claude\n" });
     } catch (e) {
-      s.term.write(`\x1b[31m[arabel] sync échouée : ${e}\x1b[0m\r\n`);
-      toast(`Sync Claude échouée : ${e}`, "error");
+      s.term.write(`\x1b[31m[arabel] sync failed: ${e}\x1b[0m\r\n`);
+      toast(`Claude sync failed: ${e}`, "error");
+    }
+  }
+  async function enhanceShell(sid: string) {
+    const s = sessions.get(sid);
+    if (!s || s.remote.id === "local") return;
+    s.term.write("\r\n\x1b[90m[arabel] installing autosuggestions…\x1b[0m\r\n");
+    try {
+      const msg = await rpc<string>("shell_enhance", remoteParams(s.remote));
+      s.term.write(`\x1b[90m[arabel] ${msg}\x1b[0m\r\n`);
+      toast("Autosuggestions installed", "success");
+    } catch (e) {
+      s.term.write(`\x1b[31m[arabel] ${e}\x1b[0m\r\n`);
+      toast(`Autosuggestions: ${e}`, "error");
     }
   }
   async function syncNow(sid: string) {
     const s = sessions.get(sid);
     if (!s || s.remote.id === "local") return;
-    s.term.write("\r\n\x1b[90m[arabel] injection de la config…\x1b[0m\r\n");
+    s.term.write("\r\n\x1b[90m[arabel] injecting config…\x1b[0m\r\n");
     try {
       const msg = await rpc<string>("claude_sync", remoteParams(s.remote));
       syncedRemotes.add(s.remote.id);
       s.term.write(`\x1b[90m[arabel] ${msg}\x1b[0m\r\n`);
-      toast("Config Claude synchronisée", "success");
+      // active le suivi Claude pour ce remote : flag persistant + écoute des hooks
+      // → le panneau apparaît dans le dashboard Agents et son état remonte
+      const wasTracked = s.remote.claude;
+      if (!wasTracked) {
+        s.remote.claude = true;
+        remotes = [...remotes]; // force la réactivité du dashboard
+        await save();
+      }
+      rpc("events_watch", { remoteId: s.remote.id, ...remoteParams(s.remote) }).catch(() => {});
+      s.term.write("\x1b[90m[arabel] agent tracking enabled (see the Agents section)\x1b[0m\r\n");
+      toast(wasTracked ? "Claude config synced" : "Claude tracking enabled for this remote", "success");
     } catch (e) {
       s.term.write(`\x1b[31m[arabel] ${e}\x1b[0m\r\n`);
       toast(String(e), "error");
@@ -1103,8 +1265,29 @@
   }
 
   // ─── attentions (hooks Claude Code) ──────────────────────────────────────
-  type Attention = { id: string; sid: string; remoteId: string; kind: "stop" | "notif"; message: string };
+  // question/options : extraits du buffer du terminal quand Claude pose un choix
+  // (aucun hook ne les expose — ils ne vivent que dans le rendu de la TUI).
+  type Attention = { id: string; sid: string; remoteId: string; kind: "stop" | "notif"; message: string; question?: string; options?: string[] };
   let attentions = $state<Attention[]>([]);
+  // activité live par pane, alimentée par PreToolUse/UserPromptSubmit : ce que
+  // Claude fait en ce moment, visible dans le dashboard même onglet non focus.
+  let activity = $state<Record<string, { label: string; tool: string; at: number }>>({});
+  // état persistant du pane (dernier hook gagne). « done » est collant : une
+  // frappe au clavier ne doit PAS le refaire passer en « working » — sinon un
+  // agent qui a fini réaffiche « travaille » dès qu'on touche le terminal.
+  let paneStatus = $state<Record<string, "working" | "waiting" | "done">>({});
+  // horloge de rafraîchissement : le buffer xterm change sans passer par notre
+  // code, donc on ré-évalue le statut visuel du terminal toutes les 500 ms.
+  let liveTick = $state(0);
+  $effect(() => {
+    const id = setInterval(() => liveTick++, 500);
+    return () => clearInterval(id);
+  });
+  // horodatage de la dernière sortie / entrée par pane (non réactif : relu à
+  // chaque liveTick, sinon on re-rendrait à chaque octet). Sert au spinner
+  // générique (process qui tourne) et à tuer le faux « done » après un envoi.
+  const lastOut: Record<string, number> = {};
+  const lastInput: Record<string, number> = {};
   let notifOk = false;
   if (inTauri) {
     (async () => {
@@ -1112,6 +1295,7 @@
     })();
   }
 
+  const recentHooks = new Map<string, number>(); // dédoublonnage (plusieurs watchers/listeners possibles)
   listen<{ remoteId: string; line: string }>("arabel-hook", (ev) => {
     let parsed: any = {};
     try {
@@ -1120,14 +1304,165 @@
       return;
     }
     const hook = parsed.event ?? {};
-    const kind: "stop" | "notif" = hook.hook_event_name === "Stop" ? "stop" : "notif";
+    const name: string = hook.hook_event_name ?? "";
     const sid: string = parsed.pane ?? "";
-    const remoteName = remotes.find((r) => r.id === ev.payload.remoteId)?.name ?? "remote";
-    const message = hook.message ?? (kind === "stop" ? "Claude a terminé" : "Claude attend une réponse");
-    if (kind === "stop") attentions = attentions.filter((a) => a.sid !== sid || a.kind !== "notif");
-    attentions = [...attentions, { id: crypto.randomUUID(), sid, remoteId: ev.payload.remoteId, kind, message }].slice(-20);
+    const remoteId = ev.payload.remoteId;
+
+    // Claude bosse : on met à jour l'activité live du pane et on efface une
+    // éventuelle attente (il a repris la main).
+    if (name === "PreToolUse" || name === "UserPromptSubmit") {
+      const tool = name === "UserPromptSubmit" ? "" : (hook.tool_name ?? "");
+      const label = name === "UserPromptSubmit" ? "thinking…" : toolLabel(hook.tool_name, hook.tool_input);
+      if (sid) { activity = { ...activity, [sid]: { label, tool, at: Date.now() } }; paneStatus = { ...paneStatus, [sid]: "working" }; }
+      clearPaneAttentions(sid);
+      return;
+    }
+    if (name !== "Stop" && name !== "Notification") return; // PostToolUse & co : ignorés
+
+    const kind: "stop" | "notif" = name === "Stop" ? "stop" : "notif";
+    const remoteName = remotes.find((r) => r.id === remoteId)?.name ?? "remote";
+    const message = hook.message ?? (kind === "stop" ? "Claude finished" : "Claude is waiting for a response");
+    // le même événement peut arriver en double (tail relancé, listener HMR) → on ignore les répétitions
+    const dsig = `${remoteId}|${sid}|${kind}|${message}`;
+    const now = Date.now();
+    if (now - (recentHooks.get(dsig) ?? 0) < 2000) return;
+    recentHooks.set(dsig, now);
+    // Stop qui tombe juste après un envoi clavier → c'est le tour PRÉCÉDENT qui
+    // se termine alors qu'on relance déjà : pas une vraie fin, on l'ignore
+    // (sinon « done » (son + toast) alors que Claude repart aussitôt).
+    if (kind === "stop" && sid && now - (lastInput[sid] ?? 0) < 1500) return;
+    if (sid) paneStatus = { ...paneStatus, [sid]: kind === "stop" ? "done" : "waiting" };
+    if (kind === "stop") {
+      attentions = attentions.filter((a) => a.sid !== sid || a.kind !== "notif");
+      if (sid) { const { [sid]: _, ...rest } = activity; activity = rest; } // plus d'activité en cours
+    }
+    const att: Attention = { id: crypto.randomUUID(), sid, remoteId, kind, message };
+    attentions = [...attentions, att].slice(-20);
+    // question à choix : on lit les options dans le terminal (léger différé, le
+    // temps que la TUI ait fini de rendre le menu).
+    if (kind === "notif" && sid) setTimeout(() => patchMenu(att.id, sid), 140);
     if (notifOk) sendNotification({ title: `Arabel — ${remoteName}`, body: message });
+    playSound(kind === "stop" ? "done" : "waiting");
   });
+
+  // ─── statut vivant dérivé du terminal (indépendant des hooks) ────────────
+  // Claude Code imprime des marqueurs fiables dans son TUI : « esc to interrupt »
+  // quand il travaille, un menu « ❯ 1. … » / « esc to cancel » quand il attend.
+  // On lit ça dans le buffer xterm → l'indicateur marche même sans hooks.
+  function bottomText(sid: string, n: number): string {
+    const term = sessions.get(sid)?.term;
+    if (!term) return "";
+    const buf = term.buffer.active;
+    let out = "";
+    for (let i = Math.max(0, buf.length - n); i < buf.length; i++)
+      out += (buf.getLine(i)?.translateToString(true) ?? "") + "\n";
+    return out;
+  }
+  function liveStatus(sid: string): "working" | "waiting" | "done" | null {
+    void liveTick; // dépendance réactive : ré-évalué à chaque tick
+    const s = sessions.get(sid);
+    if (!s) return null;
+    const now = Date.now();
+    const tail = bottomText(sid, 16);
+    // marqueurs explicites du TUI Claude — fiables, quel que soit le pane
+    if (/esc to interrupt/i.test(tail)) return "working"; // Claude génère (footer live)
+    if (/❯\s*[1-9][.)]/.test(tail) || /\besc to cancel\b/i.test(tail) || /Do you want to proceed/i.test(tail))
+      return "waiting"; // menu de permission / choix en attente de réponse
+    if (s.remote.claude) {
+      // pane Claude : PAS de détection par volume de sortie — sa TUI se redessine
+      // en continu (curseur, footer), ce qui faisait clignoter « running » en
+      // permanence. On s'appuie sur les marqueurs ci-dessus + les hooks.
+      if (now - (lastInput[sid] ?? 0) < 2000) return "working"; // tu viens d'envoyer → il repart (pas « done »)
+      const h = paneStatus[sid];
+      if (h === "waiting") return "waiting";
+      if (h === "working" && activity[sid] && now - activity[sid].at < 15000) return "working"; // hook d'outil récent
+      if (h === "done") return "done";
+      return null;
+    }
+    // pane non-Claude : spinner générique tant qu'une commande crache de la sortie
+    return now - (lastOut[sid] ?? 0) < 1000 ? "working" : null;
+  }
+
+  // ─── sons d'événements : tons synthétisés (aucun fichier à bundler) ──────
+  let audioCtx: AudioContext | null = null;
+  function playSound(kind: "waiting" | "done" | "error") {
+    if (!settings.sounds || typeof AudioContext === "undefined") return;
+    try {
+      audioCtx ??= new AudioContext();
+      const ctx = audioCtx;
+      if (ctx.state === "suspended") ctx.resume();
+      // séquence de notes [fréquence Hz, décalage s] par événement
+      const seq = {
+        waiting: [[660, 0], [880, 0.11]],  // montant — « à toi de jouer »
+        done: [[784, 0], [1047, 0.1]],     // quinte — terminé
+        error: [[330, 0], [220, 0.13]],    // descendant — refus / erreur
+      }[kind];
+      for (const [freq, at] of seq) {
+        const osc = ctx.createOscillator(), gain = ctx.createGain();
+        osc.type = "sine";
+        osc.frequency.value = freq;
+        const t0 = ctx.currentTime + at;
+        gain.gain.setValueAtTime(0, t0);
+        gain.gain.linearRampToValueAtTime(0.16, t0 + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.001, t0 + 0.18);
+        osc.connect(gain).connect(ctx.destination);
+        osc.start(t0);
+        osc.stop(t0 + 0.2);
+      }
+    } catch { /* audio indispo : silencieux */ }
+  }
+
+  /** Résumé court de l'outil en cours (PreToolUse) pour le dashboard. */
+  function toolLabel(tool?: string, input?: any): string {
+    const base = (p?: string) => (p ? p.split("/").pop() : "") ?? "";
+    const cut = (s: string, n: number) => (s.length > n ? s.slice(0, n - 1) + "…" : s);
+    switch (tool) {
+      case "Bash": return cut(String(input?.command ?? ""), 42);
+      case "Edit": case "MultiEdit": case "Write": case "NotebookEdit": return base(input?.file_path ?? input?.notebook_path);
+      case "Read": return base(input?.file_path);
+      case "Grep": case "Glob": return cut(String(input?.pattern ?? ""), 30);
+      case "Task": return "subagent";
+      case "WebFetch": case "WebSearch": return cut(String(input?.url ?? input?.query ?? ""), 34);
+      default: return tool ? (tool.startsWith("mcp__") ? tool.slice(5).replace(/__/g, " ") : tool) : "working…";
+    }
+  }
+
+  /** Lit le buffer xterm du pane et en extrait un bloc de choix numérotés. */
+  function scrapeMenu(sid: string): { question: string; options: string[] } | null {
+    const term = sessions.get(sid)?.term;
+    if (!term) return null;
+    const buf = term.buffer.active;
+    const start = Math.max(0, buf.length - 40);
+    const lines: string[] = [];
+    for (let i = start; i < buf.length; i++) lines.push((buf.getLine(i)?.translateToString(true) ?? "").replace(/\s+$/, ""));
+    // on retient le DERNIER bloc numéroté contigu de la fenêtre (le menu courant,
+    // pas un menu déjà répondu resté plus haut dans le scrollback).
+    let options: string[] = [], firstIdx = -1;
+    let cur: string[] = [], curStart = -1;
+    const flush = () => { if (cur.length >= 2) { options = cur; firstIdx = curStart; } cur = []; };
+    for (let i = 0; i < lines.length; i++) {
+      const m = lines[i].match(/^\s*[❯›▶>»]?\s*(\d)[.)]\s+(.+)$/); // « 1. Yes » / « ❯ 2. No »
+      if (!m) { flush(); continue; }
+      const n = +m[1];
+      if (n === cur.length + 1) { if (!cur.length) curStart = i; cur.push(m[2].trim()); }
+      else if (n === 1) { flush(); cur = [m[2].trim()]; curStart = i; } // nouveau bloc
+      else flush();
+    }
+    flush();
+    if (options.length < 2) return null;
+    let question = "";
+    for (let i = firstIdx - 1; i >= 0; i--) if (lines[i].trim()) { question = lines[i].trim(); break; }
+    return { question, options };
+  }
+  function patchMenu(id: string, sid: string) {
+    const menu = scrapeMenu(sid);
+    if (!menu) return;
+    attentions = attentions.map((a) => (a.id === id ? { ...a, question: menu.question, options: menu.options } : a));
+  }
+  function clearPaneAttentions(sid: string) {
+    if (!sid) return;
+    if (attentions.some((a) => a.sid === sid)) attentions = attentions.filter((a) => a.sid !== sid);
+  }
 
   // badge sur l'icône du Dock
   $effect(() => {
@@ -1153,6 +1488,7 @@
   function answerAttention(a: Attention, keys: string) {
     const sid = attentionTarget(a);
     if (sid) rpc("ssh_write", { sessionId: sid, data: keys });
+    if (keys === "\x1b") playSound("error"); // refus → ton descendant
     dismissAttention(a);
   }
   function dismissAttention(a: Attention) {
@@ -1161,25 +1497,14 @@
   function remoteAttention(rid: string): boolean {
     return attentions.some((a) => a.remoteId === rid);
   }
+  /** Tu réponds au clavier dans un panneau Claude → on retire ses toasts en
+   *  attente. L'état (working/waiting/done) reste piloté par les hooks. */
+  function onClaudeInput(sid: string) {
+    if (!sessions.get(sid)?.remote.claude) return;
+    if (attentions.some((a) => attentionTarget(a) === sid))
+      attentions = attentions.filter((a) => attentionTarget(a) !== sid);
+  }
 
-  // ─── dashboard agents : sessions Claude et leur état (dérivé des hooks) ────
-  type Agent = { sid: string; tab: Tab; name: string; status: "waiting" | "working" | "done"; message: string; notif?: Attention };
-  const agents = $derived.by(() => {
-    const list: Agent[] = [];
-    for (const t of tabs) {
-      for (const sid of leaves(t.root)) {
-        const s = sessions.get(sid);
-        if (!s || !s.remote.claude || s.cc) continue; // panneaux claude non-tmux-natif
-        const mine = attentions.filter((a) => attentionTarget(a) === sid);
-        const notif = mine.find((a) => a.kind === "notif");
-        const stop = mine.find((a) => a.kind === "stop");
-        const status = notif ? "waiting" : stop ? "done" : "working";
-        list.push({ sid, tab: t, name: s.remote.name, status, message: (notif ?? stop)?.message ?? (s.cmd || "session claude"), notif });
-      }
-    }
-    return list;
-  });
-  const waitingCount = $derived(agents.filter((a) => a.status === "waiting").length);
 
   // ─── métriques de l'hôte (façon MobaXterm) ───────────────────────────────
   type Metrics = { load: number; cpus: number; memTotal: number; memUsed: number; diskTotal: number; diskUsed: number };
@@ -1231,10 +1556,10 @@
     return p.split("/").slice(0, -1).join("/") || "/";
   }
   function humanSize(n: number): string {
-    if (n < 1024) return `${n} o`;
-    if (n < 1048576) return `${(n / 1024).toFixed(0)} Ko`;
-    if (n < 1073741824) return `${(n / 1048576).toFixed(1)} Mo`;
-    return `${(n / 1073741824).toFixed(2)} Go`;
+    if (n < 1024) return `${n} B`;
+    if (n < 1048576) return `${(n / 1024).toFixed(0)} KB`;
+    if (n < 1073741824) return `${(n / 1048576).toFixed(1)} MB`;
+    return `${(n / 1073741824).toFixed(2)} GB`;
   }
   async function filesLoad(path?: string) {
     const r = files.remote;
@@ -1278,7 +1603,7 @@
         remoteId: r.id, ...remoteParams(r),
         path: joinPath(files.path, entry.name), name: entry.name,
       });
-      toast(`Téléchargé : ${local}`, "success");
+      toast(`Downloaded: ${local}`, "success");
     } catch (e) {
       toast(String(e), "error");
     }
@@ -1303,7 +1628,7 @@
       try {
         const b64 = await fileToB64(f);
         await rpc("sftp_upload", { remoteId: r.id, ...remoteParams(r), path: joinPath(files.path, f.name), dataB64: b64 });
-        toast(`${f.name} envoyé sur ${r.name}`, "success");
+        toast(`${f.name} sent to ${r.name}`, "success");
       } catch (err) {
         toast(`${f.name} : ${err}`, "error");
       }
@@ -1380,14 +1705,69 @@
     else if (e.key === "Enter") s.search.findNext(searchState.query);
   }
 
+  /** RGBA brut → PNG base64 via canvas (encodage natif du navigateur, pas de crate). */
+  async function rgbaToPngB64(rgba: Uint8Array, w: number, h: number): Promise<string> {
+    const canvas = document.createElement("canvas");
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext("2d")!;
+    ctx.putImageData(new ImageData(new Uint8ClampedArray(rgba), w, h), 0, 0);
+    const blob: Blob = await new Promise((res, rej) =>
+      canvas.toBlob((b) => (b ? res(b) : rej(new Error("PNG encoding failed"))), "image/png"),
+    );
+    const dataUrl: string = await new Promise((res, rej) => {
+      const fr = new FileReader();
+      fr.onload = () => res(fr.result as string);
+      fr.onerror = () => rej(fr.error);
+      fr.readAsDataURL(blob);
+    });
+    return dataUrl.slice(dataUrl.indexOf(",") + 1);
+  }
+
+  /** Colle le presse-papier. Image (session distante) → upload SFTP + insertion
+   *  du chemin distant pour Claude Code. Sinon : `rawKey` fourni (Ctrl+V) → on
+   *  renvoie la frappe brute pour préserver le collage natif de l'appli distante ;
+   *  sans rawKey (⌘V) → collage texte via xterm (bracketed-paste-aware).
+   *  Le statut passe par des toasts, jamais par `term.write` (corromprait une TUI). */
+  async function pasteClipboard(sid: string, rawKey = "") {
+    const s = sessions.get(sid);
+    if (!s) return;
+    if (inTauri && s.remote.id !== "local") {
+      const img = await readImage().catch(() => null); // rejette s'il n'y a pas d'image
+      if (img) {
+        try {
+          const [rgba, { width, height }] = await Promise.all([img.rgba(), img.size()]);
+          const name = `${Date.now()}-${crypto.randomUUID()}.png`;
+          toast("Sending image to the VPS…");
+          const b64 = await rgbaToPngB64(new Uint8Array(rgba), width, height);
+          const path = await rpc<string>("sftp_paste_image", { ...remoteParams(s.remote), remoteId: s.remote.id, name, dataB64: b64 });
+          // Claude Code attache l'image dès que son chemin absolu apparaît dans
+          // l'invite. On l'insère, encadré d'espaces pour le délimiter.
+          await rpc("ssh_write", { sessionId: sid, data: ` ${path} ` });
+          toast("Image sent — path inserted for Claude", "success");
+        } catch (e) {
+          toast(`Image : ${e}`, "error");
+        }
+        return;
+      }
+    }
+    // pas d'image
+    if (rawKey) {
+      // Ctrl+V : la frappe a été consommée pour tester le presse-papier ; comme il
+      // n'y a pas d'image, on la restitue telle quelle à l'appli distante (Claude
+      // Code fait alors son propre collage, readline son « quoted-insert », etc.)
+      rpc("ssh_write", { sessionId: sid, data: rawKey }).catch(() => {});
+    } else if (inTauri) {
+      const t = await readText().catch(() => "");
+      if (t) s.term.paste(t);
+    }
+  }
+
   async function pasteInto(sid: string, e: MouseEvent) {
     e.preventDefault();
     if (!inTauri) return;
-    const t = await readText().catch(() => "");
-    if (t) {
-      sessions.get(sid)?.term.paste(t);
-      sessions.get(sid)?.term.focus();
-    }
+    await pasteClipboard(sid);
+    sessions.get(sid)?.term.focus();
   }
 
   // ─── menu natif + raccourcis ─────────────────────────────────────────────
@@ -1407,30 +1787,104 @@
       case "toggle-sidebar": settings.sidebar = !settings.sidebar; save(); break;
       case "settings": modal = { type: "settings" }; break;
       case "sync-config": if (sid) syncNow(sid); break;
+      case "enhance-shell": if (sid) enhanceShell(sid); break;
     }
   });
 
+  // ─── clavier : combo → action ─────────────────────────────────────────────
+  const MOD_CODES = new Set(["ShiftLeft", "ShiftRight", "ControlLeft", "ControlRight", "AltLeft", "AltRight", "MetaLeft", "MetaRight"]);
+  function keyName(e: KeyboardEvent): string {
+    const c = e.code;
+    if (c.startsWith("Key")) return c.slice(3); // KeyF → F
+    if (c.startsWith("Digit")) return c.slice(5); // Digit1 → 1
+    return c; // Comma, Enter, BracketRight…
+  }
+  /** Combo normalisé (ordre canonique) ou "" pour une touche modificatrice seule. */
+  function comboOf(e: KeyboardEvent): string {
+    if (MOD_CODES.has(e.code)) return "";
+    const p: string[] = [];
+    if (e.metaKey) p.push("Meta");
+    if (e.ctrlKey) p.push("Ctrl");
+    if (e.altKey) p.push("Alt");
+    if (e.shiftKey) p.push("Shift");
+    p.push(keyName(e));
+    return p.join("+");
+  }
+  function keyOf(id: string): string {
+    return settings.keymap?.[id] ?? DEFAULT_KEYS[id] ?? "";
+  }
+  function cycleTab(delta: number) {
+    const i = tabs.findIndex((t) => t.id === activeTabId);
+    if (i >= 0) activeTabId = tabs[(i + delta + tabs.length) % tabs.length].id;
+  }
+  type Binding = { id: string; label: string; scope: "window" | "term"; run: (sid: string | null) => void };
+  const KEYBINDINGS: Binding[] = [
+    { id: "palette", label: "Command palette", scope: "window", run: () => (modal = modal?.type === "palette" ? null : { type: "palette", filter: "" }) },
+    { id: "new-connection", label: "New terminal / connection", scope: "window", run: () => openPicker() },
+    { id: "close-pane", label: "Close pane", scope: "window", run: () => { const sid = activeTab?.active; if (sid) closePane(sid); else if (activeTab) closeTab(activeTab); } },
+    { id: "split-h", label: "Split right", scope: "window", run: () => { const sid = activeTab?.active; if (sid && activeTab) openPicker({ tabId: activeTab.id, sid, dir: "h" }); } },
+    { id: "split-v", label: "Split down", scope: "window", run: () => { const sid = activeTab?.active; if (sid && activeTab) openPicker({ tabId: activeTab.id, sid, dir: "v" }); } },
+    { id: "next-tab", label: "Next tab", scope: "window", run: () => cycleTab(1) },
+    { id: "prev-tab", label: "Previous tab", scope: "window", run: () => cycleTab(-1) },
+    { id: "toggle-sidebar", label: "Toggle sidebar", scope: "window", run: () => { settings.sidebar = !settings.sidebar; save(); } },
+    { id: "clear", label: "Clear terminal", scope: "window", run: () => { const sid = activeTab?.active; if (sid) sessions.get(sid)?.term.clear(); } },
+    { id: "settings", label: "Open settings", scope: "window", run: () => (modal = { type: "settings" }) },
+    { id: "search", label: "Find in terminal", scope: "window", run: () => { const sid = activeTab?.active; if (sid) openSearch(sid); } },
+    { id: "zoom", label: "Zoom pane (fullscreen)", scope: "term", run: (sid) => sid && toggleZoom(sid) },
+    { id: "copy", label: "Copy selection", scope: "term", run: (sid) => { const s = sid ? sessions.get(sid) : null; if (s?.term.hasSelection() && inTauri) writeText(s.term.getSelection()).catch(() => {}); } },
+    { id: "paste", label: "Paste", scope: "term", run: (sid) => { if (sid && inTauri) pasteClipboard(sid); } },
+  ];
+  const bindById = new Map(KEYBINDINGS.map((b) => [b.id, b]));
+  const actionCombos = $derived.by(() => {
+    const m = new Map<string, string>();
+    for (const b of KEYBINDINGS) { const c = keyOf(b.id); if (c) m.set(c, b.id); }
+    return m;
+  });
+
+  // réattribution : l'utilisateur clique un raccourci puis presse la combo
+  let recordingBind = $state<string | null>(null);
+  let settingsTab = $state<"appearance" | "terminal" | "shortcuts">("appearance");
+  function recordKey(e: KeyboardEvent, id: string) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.key === "Escape") { recordingBind = null; return; }
+    if (MOD_CODES.has(e.code)) return; // attend une vraie touche
+    const combo = comboOf(e);
+    if (!combo) return;
+    // libère toute action qui détenait déjà cette combo (une combo = une action)
+    const next: Record<string, string> = {};
+    for (const b of KEYBINDINGS) { const cur = keyOf(b.id); next[b.id] = cur === combo && b.id !== id ? "" : cur; }
+    next[id] = combo;
+    settings.keymap = next;
+    recordingBind = null;
+    save();
+  }
+  function resetKey(id: string) { settings.keymap = { ...settings.keymap, [id]: DEFAULT_KEYS[id] }; save(); }
+  function resetAllKeys() { settings.keymap = { ...DEFAULT_KEYS }; save(); }
+  const MAC_SYM: Record<string, string> = { Meta: "⌘", Ctrl: "⌃", Alt: "⌥", Shift: "⇧", Comma: ",", Enter: "↵", Space: "␣", BracketLeft: "[", BracketRight: "]", Backslash: "\\", Slash: "/", Minus: "-", Equal: "=", Backquote: "`" };
+  const WIN_NAME: Record<string, string> = { Meta: "Win", Comma: ",", Enter: "Enter", Space: "Space", BracketLeft: "[", BracketRight: "]" };
+  function formatCombo(combo: string): string {
+    if (!combo) return "—";
+    const parts = combo.split("+");
+    return isMac ? parts.map((p) => MAC_SYM[p] ?? p).join("") : parts.map((p) => WIN_NAME[p] ?? p).join("+");
+  }
+
   function globalKeydown(e: KeyboardEvent) {
-    if (!e.metaKey) {
+    if (recordingBind) return; // capture gérée par l'input de réglage
+    if (!e.metaKey && !e.ctrlKey && !e.altKey) {
       if (e.key === "Escape" && modal) modal = null;
       return;
     }
-    if (e.key >= "1" && e.key <= "9") {
-      const idx = Number(e.key) - 1;
-      if (tabs[idx]) {
-        activeTabId = tabs[idx].id;
-        e.preventDefault();
-      }
-    } else if (e.key === "f" && activeTab?.active) {
-      e.preventDefault();
-      openSearch(activeTab.active);
-    } else if (e.key === "p") {
-      e.preventDefault();
-      modal = modal?.type === "palette" ? null : { type: "palette", filter: "" };
-    } else if (!inTauri) {
-      // en mode démo (pas de menu natif), on émule les accélérateurs
-      if (e.key === "b") { e.preventDefault(); settings.sidebar = !settings.sidebar; }
-      if (e.key === "n") { e.preventDefault(); openPicker(); }
+    // ⌘1-9 / Ctrl+Maj+1-9 : bascule d'onglet (famille fixe, e.code robuste au Maj)
+    const digit = e.code.startsWith("Digit") ? Number(e.code.slice(5)) : NaN;
+    if (appMod(e) && digit >= 1 && digit <= 9) {
+      if (tabs[digit - 1]) { activeTabId = tabs[digit - 1].id; e.preventDefault(); }
+      return;
+    }
+    const id = actionCombos.get(comboOf(e));
+    if (id) {
+      const b = bindById.get(id)!;
+      if (b.scope === "window") { e.preventDefault(); b.run(activeTab?.active ?? null); }
     }
   }
 
@@ -1466,22 +1920,18 @@
         items.push({
           icon: s.remote.id === "local" ? "local" : "pane",
           label: s.remote.name + (s.cmd ? ` — ${s.cmd}` : ""),
-          sub: t.projectId ? projects.find((p) => p.id === t.projectId)?.name ?? "projet" : "terminal ouvert",
+          sub: t.projectId ? projects.find((p) => p.id === t.projectId)?.name ?? "project" : "open terminal",
           run: () => focusPane(t, sid),
         });
       }
     }
     for (const p of projects)
-      items.push({ icon: "project", label: p.name, sub: "projet", run: () => { const o = openTabFor(p.id); o ? (activeTabId = o.id) : openProject(p); } });
-    items.push({ icon: "local", label: LOCAL.name, sub: "nouveau terminal", run: () => openRemote(LOCAL) });
+      items.push({ icon: "project", label: p.name, sub: "project", run: () => { const o = openTabFor(p.id); o ? (activeTabId = o.id) : openProject(p); } });
+    items.push({ icon: "local", label: LOCAL.name, sub: "new terminal", run: () => openRemote(LOCAL) });
     for (const r of remotes)
       items.push({ icon: "remote", label: r.name, sub: `${r.user}@${r.host}`, run: () => openRemote(r) });
     return items;
   }
-  function paneAttention(sid: string): boolean {
-    return attentions.some((a) => attentionTarget(a) === sid);
-  }
-
   // ─── montage xterm ────────────────────────────────────────────────────────
   function b64ToBytes(b64: string): Uint8Array {
     const bin = atob(b64);
@@ -1543,6 +1993,14 @@
 <svelte:window onkeydown={globalKeydown} onresize={onWindowResize} ondragover={(e) => e.preventDefault()} ondrop={(e) => e.preventDefault()} />
 
 <!-- ─── icônes ─────────────────────────────────────────────────────────── -->
+{#snippet choiceBtns(att: Attention)}
+  {#if att.question}<span class="agent-q">{att.question}</span>{/if}
+  <div class="choice-row wrap">
+    {#each att.options ?? [] as opt, i}
+      <button class="choice" title={opt} onclick={(e) => { e.stopPropagation(); answerAttention(att, String(i + 1)); }}><b>{i + 1}</b>&nbsp;{opt}</button>
+    {/each}
+  </div>
+{/snippet}
 {#snippet iTerminal()}<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5.5 6 8l-3 2.5M8 11h5"/></svg>{/snippet}
 {#snippet iGrid()}<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2.5" y="2.5" width="4.5" height="4.5" rx="1"/><rect x="9" y="2.5" width="4.5" height="4.5" rx="1"/><rect x="2.5" y="9" width="4.5" height="4.5" rx="1"/><rect x="9" y="9" width="4.5" height="4.5" rx="1"/></svg>{/snippet}
 {#snippet iKey()}<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="5" cy="8" r="2.5"/><path d="M7.5 8h6M11 8v2.5M13.5 8v1.5"/></svg>{/snippet}
@@ -1570,28 +2028,56 @@
 {#snippet iWarn()}<svg width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2 1.5 13.5h13zM8 6.5V10M8 11.8v.2"/></svg>{/snippet}
 {#snippet iAlert()}<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><circle cx="8" cy="8" r="6"/><path d="M8 5v3.5M8 10.8v.2"/></svg>{/snippet}
 {#snippet iCheck()}<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg>{/snippet}
+{#snippet iSearch()}<svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5 14 14"/></svg>{/snippet}
+
+<!-- icône par outil : « ce que l'agent fait » d'un coup d'œil -->
+{#snippet toolIcon(tool: string)}
+  {#if tool === "Bash"}{@render iTerminal()}
+  {:else if tool === "Edit" || tool === "MultiEdit" || tool === "Write" || tool === "NotebookEdit"}{@render iPencil()}
+  {:else if tool === "Read"}{@render iFile()}
+  {:else if tool === "Grep" || tool === "Glob"}{@render iSearch()}
+  {:else if tool === "WebFetch" || tool === "WebSearch"}{@render iGlobe()}
+  {:else if tool === "Task"}{@render iBolt()}
+  {:else}{@render iBolt()}{/if}
+{/snippet}
+
+<!-- statut vivant d'un pane agent (working / waiting / done), piloté par les hooks -->
+{#snippet paneStat(sid: string)}
+  {@const ps = liveStatus(sid)}
+  {#if ps === "waiting"}
+    <span class="pstat waiting" title="Waiting for your input">{@render iAlert()}<span class="pstat-label">waiting…</span></span>
+  {:else if ps === "done"}
+    <span class="pstat done" title="Finished">{@render iCheck()}<span class="pstat-label">done</span></span>
+  {:else if ps === "working"}
+    <span class="pstat working" title={activity[sid]?.label ?? "running…"}>
+      {@render iSpinner(11)}
+      {#if activity[sid]?.tool}{@render toolIcon(activity[sid].tool)}{/if}
+      <span class="pstat-label">{activity[sid]?.label ?? "running…"}</span>
+    </span>
+  {/if}
+{/snippet}
 
 {#snippet sbSection(title: string, onAdd: (() => void) | null, addDisabled = false)}
   <div class="sb-head">
     <span>{title}</span>
-    {#if onAdd}<button class="icon-btn sb-add" onclick={onAdd} disabled={addDisabled} title="Ajouter">{@render iPlus()}</button>{/if}
+    {#if onAdd}<button class="icon-btn sb-add" onclick={onAdd} disabled={addDisabled} title="Add">{@render iPlus()}</button>{/if}
   </div>
 {/snippet}
 
 {#snippet rowActions(id: string, onEdit: () => void, onDelete: () => void)}
   <span class="row-actions">
     {#if confirmDeleteId === id}
-      <button class="confirm-del" onclick={(e) => { e.stopPropagation(); onDelete(); }}>Supprimer ?</button>
+      <button class="confirm-del" onclick={(e) => { e.stopPropagation(); onDelete(); }}>Delete?</button>
     {:else}
-      <button class="icon-btn" title="Modifier" onclick={(e) => { e.stopPropagation(); onEdit(); }}>{@render iPencil()}</button>
-      <button class="icon-btn" title="Supprimer" onclick={(e) => { e.stopPropagation(); confirmDeleteId = id; }}>{@render iTrash()}</button>
+      <button class="icon-btn" title="Edit" onclick={(e) => { e.stopPropagation(); onEdit(); }}>{@render iPencil()}</button>
+      <button class="icon-btn" title="Delete" onclick={(e) => { e.stopPropagation(); confirmDeleteId = id; }}>{@render iTrash()}</button>
     {/if}
   </span>
 {/snippet}
 
 {#snippet remoteRow(r: Remote, onPick: (r: Remote) => void, withActions: boolean)}
   <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
-  <div class="row" onclick={() => onPick(r)} title={r.id === "local" ? "Shell local" : `${r.user}@${r.host}:${r.port}`}>
+  <div class="row" onclick={() => onPick(r)} title={r.id === "local" ? "Local shell" : `${r.user}@${r.host}:${r.port}`}>
     <span class="row-icon">{#if r.id === "local"}{@render iLaptop()}{:else}{@render iTerminal()}{/if}</span>
     <span class="row-label">{r.name}</span>
     {#if r.claude}<span class="row-tag">claude</span>{/if}
@@ -1602,14 +2088,16 @@
 
 {#snippet sessRow(tab: Tab, sid: string, sub: boolean)}
   {@const s = sessions.get(sid)}
+  {@const st = liveStatus(sid)}
   <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
   <div
     class="row"
     class:sub
     class:current={tab.id === activeTabId && tab.active === sid}
     class:dragging={dragSid === sid}
-    class:drop-before={dropRow?.sid === sid && !dropRow.after}
-    class:drop-after={dropRow?.sid === sid && dropRow.after}
+    class:drop-before={dropRow?.sid === sid && dropRow.mode === "before"}
+    class:drop-after={dropRow?.sid === sid && dropRow.mode === "after"}
+    class:drop-merge={dropRow?.sid === sid && dropRow.mode === "merge"}
     draggable="true"
     ondragstart={(e) => {
       dragSid = sid;
@@ -1617,14 +2105,16 @@
       if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
     }}
     ondragend={() => { dragSid = null; dropTarget = null; dropRow = null; }}
-    {...reorderzone(sid, sub)}
+    {...paneDropzone(sid, sub)}
     onclick={() => focusPane(tab, sid)}>
     <span class="row-icon">{#if s?.remote.id === "local"}{@render iLaptop()}{:else}{@render iTerminal()}{/if}</span>
     <span class="row-label">{s?.remote.name}{s?.cmd ? ` — ${s.cmd}` : ""}</span>
-    {#if sessStatus[sid]?.status === "connecting"}<span class="row-spin">{@render iSpinner(11)}</span>{/if}
-    {#if paneAttention(sid)}<span class="dot attention"></span>{/if}
+    {#if sessStatus[sid]?.status === "connecting"}<span class="row-spin">{@render iSpinner(11)}</span>
+    {:else if st === "waiting"}<span class="sstat waiting" title="Waiting for your input">{@render iAlert()}</span>
+    {:else if st === "working"}<span class="sstat working" title={activity[sid]?.label ?? "running…"}>{@render iSpinner(11)}</span>
+    {:else if st === "done"}<span class="sstat done" title="Finished">{@render iCheck()}</span>{/if}
     <span class="row-actions">
-      <button class="icon-btn" title="Fermer" onclick={(e) => { e.stopPropagation(); closePane(sid); }}>{@render iClose()}</button>
+      <button class="icon-btn" title="Close" onclick={(e) => { e.stopPropagation(); closePane(sid); }}>{@render iClose()}</button>
     </span>
   </div>
 {/snippet}
@@ -1636,20 +2126,23 @@
     <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
     <div class="pane" class:active={tab.active === node.leaf} class:zoomed={zoomedSid === node.leaf} onclick={() => (tab.active = node.leaf)}>
       <div class="pane-bar">
-        <span class="pane-title">{s?.remote.name}{s?.cmd ? ` — ${s.cmd}` : ""}</span>
+        <span class="pane-left">
+          {@render paneStat(node.leaf)}
+          <span class="pane-title">{s?.remote.name}{s?.cmd ? ` — ${s.cmd}` : ""}</span>
+        </span>
         <span class="pane-btns">
           {#if s && s.remote.id !== "local" && !s.cc}
-            <button class="icon-btn" title="Injecter la config Claude" onclick={() => syncNow(node.leaf)}>{@render iBolt()}</button>
+            <button class="icon-btn" title="Enable Claude tracking (config + Agents dashboard)" onclick={() => syncNow(node.leaf)}>{@render iBolt()}</button>
           {/if}
-          <button class="icon-btn" title="Plein écran (⇧⌘Entrée)" onclick={() => toggleZoom(node.leaf)}>{#if zoomedSid === node.leaf}{@render iZoomOut()}{:else}{@render iZoom()}{/if}</button>
+          <button class="icon-btn" title="Fullscreen (⇧⌘Enter)" onclick={() => toggleZoom(node.leaf)}>{#if zoomedSid === node.leaf}{@render iZoomOut()}{:else}{@render iZoom()}{/if}</button>
           {#if s?.cc}
-            <button class="icon-btn" title="Diviser à droite (tmux)" onclick={() => ccSplit(node.leaf, "h")}>{@render iSplitH()}</button>
-            <button class="icon-btn" title="Diviser en dessous (tmux)" onclick={() => ccSplit(node.leaf, "v")}>{@render iSplitV()}</button>
-            <button class="icon-btn" title="Fermer le panneau (tmux)" onclick={() => ccKill(node.leaf)}>{@render iClose()}</button>
+            <button class="icon-btn" title="Split right (tmux)" onclick={() => ccSplit(node.leaf, "h")}>{@render iSplitH()}</button>
+            <button class="icon-btn" title="Split down (tmux)" onclick={() => ccSplit(node.leaf, "v")}>{@render iSplitV()}</button>
+            <button class="icon-btn" title="Close pane (tmux)" onclick={() => ccKill(node.leaf)}>{@render iClose()}</button>
           {:else}
-            <button class="icon-btn" title="Diviser à droite (⌘D)" onclick={() => openPicker({ tabId: tab.id, sid: node.leaf, dir: "h" })}>{@render iSplitH()}</button>
-            <button class="icon-btn" title="Diviser en dessous (⇧⌘D)" onclick={() => openPicker({ tabId: tab.id, sid: node.leaf, dir: "v" })}>{@render iSplitV()}</button>
-            <button class="icon-btn" title="Fermer (⌘W)" onclick={() => closePane(node.leaf)}>{@render iClose()}</button>
+            <button class="icon-btn" title="Split right (⌘D)" onclick={() => openPicker({ tabId: tab.id, sid: node.leaf, dir: "h" })}>{@render iSplitH()}</button>
+            <button class="icon-btn" title="Split down (⇧⌘D)" onclick={() => openPicker({ tabId: tab.id, sid: node.leaf, dir: "v" })}>{@render iSplitV()}</button>
+            <button class="icon-btn" title="Close (⌘W)" onclick={() => closePane(node.leaf)}>{@render iClose()}</button>
           {/if}
         </span>
       </div>
@@ -1659,7 +2152,7 @@
             <input
               bind:this={searchInput}
               bind:value={searchState.query}
-              placeholder="Rechercher…"
+              placeholder="Search…"
               onkeydown={searchKeydown}
               oninput={() => searchState && sessions.get(searchState.sid)?.search.findNext(searchState.query, { incremental: true })}
             />
@@ -1670,24 +2163,24 @@
           <div class="pane-veil">
             {#if st.status === "connecting"}
               <span class="veil-spin">{@render iSpinner(18)}</span>
-              <span>Connexion à {s?.remote.name}…</span>
+              <span>Connecting to {s?.remote.name}…</span>
             {:else if st.status === "error"}
               <span class="veil-warn">{@render iWarn()}</span>
               <span class="veil-msg">{st.error}</span>
               <div class="veil-actions">
-                <button class="btn" onclick={() => connectSession(node.leaf)}>Réessayer</button>
-                <button class="btn ghost" onclick={() => removeSession(node.leaf)}>Fermer</button>
+                <button class="btn" onclick={() => connectSession(node.leaf)}>Retry</button>
+                <button class="btn ghost" onclick={() => removeSession(node.leaf)}>Close</button>
               </div>
             {:else}
               {#if s && s.remote.id !== "local"}
                 <span class="veil-spin">{@render iSpinner(18)}</span>
-                <span class="veil-msg">Connexion perdue — reconnexion automatique…{s.tmux ? " (la session tmux continue sur le serveur)" : ""}</span>
+                <span class="veil-msg">Connection lost — reconnecting automatically…{s.tmux ? " (the tmux session keeps running on the server)" : ""}</span>
               {:else}
-                <span class="veil-msg">Session terminée</span>
+                <span class="veil-msg">Session ended</span>
               {/if}
               <div class="veil-actions">
-                <button class="btn" onclick={() => connectSession(node.leaf)}>Reconnecter</button>
-                <button class="btn ghost" onclick={() => removeSession(node.leaf)}>Fermer</button>
+                <button class="btn" onclick={() => connectSession(node.leaf)}>Reconnect</button>
+                <button class="btn ghost" onclick={() => removeSession(node.leaf)}>Close</button>
               </div>
             {/if}
           </div>
@@ -1734,73 +2227,54 @@
     <aside class="sidebar">
       <!-- svelte-ignore a11y_no_static_element_interactions -->
       <div class="sb-traffic" data-tauri-drag-region>
-        <button class="icon-btn sb-toggle" title="Masquer la barre latérale (⌘B)" onclick={() => { settings.sidebar = false; save(); }}>{@render iSidebar()}</button>
+        <button class="icon-btn sb-toggle" title="Hide sidebar (⌘B)" onclick={() => { settings.sidebar = false; save(); }}>{@render iSidebar()}</button>
       </div>
       <nav class="sb-scroll">
         {#if loaded}
-          {#if agents.length}
-            <div class="sb-section agents-section">
-              <div class="sb-head"><span>Agents</span>{#if waitingCount}<span class="agent-badge">{waitingCount}</span>{/if}</div>
-              {#each agents as a (a.sid)}
-                <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
-                <div class="row agent" class:current={a.tab.id === activeTabId && a.tab.active === a.sid} onclick={() => focusPane(a.tab, a.sid)} title={a.message}>
-                  <span class="row-icon agent-{a.status}">
-                    {#if a.status === "waiting"}{@render iAlert()}{:else if a.status === "done"}{@render iCheck()}{:else}<span class="agent-dot"></span>{/if}
-                  </span>
-                  <span class="row-label">{a.name}</span>
-                  {#if a.status === "waiting" && a.notif}
-                    <span class="agent-acts">
-                      <button class="att-btn yes" title="Autoriser (envoie 1)" onclick={(e) => { e.stopPropagation(); answerAttention(a.notif!, "1"); }}>✓</button>
-                      <button class="att-btn no" title="Refuser (Échap)" onclick={(e) => { e.stopPropagation(); answerAttention(a.notif!, "\x1b"); }}>✗</button>
-                    </span>
-                  {:else if a.status === "done"}
-                    <span class="agent-meta">fini</span>
-                  {/if}
-                </div>
-              {/each}
-            </div>
-          {/if}
           <!-- svelte-ignore a11y_no_static_element_interactions -->
           <div class="sb-section" class:drop={dropTarget === "standalone"} {...dropzone("standalone")}>
-            {@render sbSection("Terminaux", () => openPicker())}
+            {@render sbSection("Terminals", () => openPicker())}
             {#each tabs.filter((t) => !t.projectId && t.root) as t (t.id)}
               {#each leaves(t.root) as sid (sid)}
                 {@render sessRow(t, sid, false)}
               {/each}
             {:else}
-              <p class="sb-empty">{dragSid ? "Déposer ici pour sortir du projet" : "Aucun terminal — ⌘N"}</p>
+              <p class="sb-empty">{dragSid ? "Drop here to remove from project" : "No terminals — ⌘N"}</p>
             {/each}
           </div>
 
           <div class="sb-section">
-            {@render sbSection("Projets", null)}
+            {@render sbSection("Projects", null)}
             {#each projects as p (p.id)}
-              {@const open = openTabFor(p.id)}
+              {@const ptabs = projectTabs(p.id)}
+              {@const open = ptabs.length > 0}
               <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
               <div
                 class="row"
                 class:drop={dropTarget === p.id}
                 {...dropzone(p.id)}
-                onclick={() => (open ? (activeTabId = open.id) : openProject(p))}>
+                onclick={() => (open ? (activeTabId = ptabs[0].id) : openProject(p))}>
                 <button
                   class="icon-btn chev"
                   class:open={isExpanded(p.id)}
                   onclick={(e) => { e.stopPropagation(); expanded[p.id] = !isExpanded(p.id); }}>{@render iChevronR()}</button>
                 <span class="row-label strong">{p.name}</span>
-                {#if open}<span class="dot live" title="Projet ouvert"></span>{/if}
+                {#if open}<span class="dot live" title="Project open"></span>{/if}
                 <button
                   class="icon-btn row-plus"
-                  title="Ajouter un terminal au projet"
+                  title="Add a terminal to the project"
                   onclick={(e) => { e.stopPropagation(); openPicker({ projectId: p.id }); }}>{@render iPlus()}</button>
                 {@render rowActions(p.id, () => (modal = { type: "project", data: $state.snapshot(p) }), () => deleteProject(p))}
               </div>
               {#if isExpanded(p.id)}
                 {#if open}
-                  {#each leaves(open.root) as sid (sid)}
-                    {@render sessRow(open, sid, true)}
+                  {#each ptabs as ptab (ptab.id)}
+                    {#each leaves(ptab.root) as sid (sid)}
+                      {@render sessRow(ptab, sid, true)}
+                    {/each}
                   {/each}
                 {:else}
-                  {#each projLeaves(p.root) as leaf, n (n)}
+                  {#each projectViews(p).flatMap(projLeaves) as leaf, n (n)}
                     <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
                     <div class="row sub dim" onclick={() => openProject(p)}>
                       <span class="row-icon">{#if leaf.remoteId === "local"}{@render iLaptop()}{:else}{@render iTerminal()}{/if}</span>
@@ -1810,13 +2284,13 @@
                 {/if}
               {/if}
             {:else}
-              <p class="sb-empty">Enregistre un layout via l'icône signet ↗</p>
+              <p class="sb-empty">Save a layout via the bookmark icon ↗</p>
             {/each}
           </div>
         {/if}
       </nav>
       <button class="sb-settings" onclick={() => (modal = { type: "settings" })}>
-        {@render iGear()}<span>Réglages</span>
+        {@render iGear()}<span>Settings</span>
       </button>
     </aside>
   {/if}
@@ -1826,27 +2300,27 @@
     <header class="titlebar" data-tauri-drag-region>
       {#if !settings.sidebar}
         <div class="traffic-pad"></div>
-        <button class="icon-btn" title="Afficher la barre latérale (⌘B)" onclick={() => { settings.sidebar = true; save(); }}>{@render iSidebar()}</button>
+        <button class="icon-btn" title="Show sidebar (⌘B)" onclick={() => { settings.sidebar = true; save(); }}>{@render iSidebar()}</button>
       {/if}
       <span class="tb-title">{activeTab && activeTab.root ? tabTitle(activeTab) : "arabel"}</span>
       <!-- svelte-ignore a11y_no_static_element_interactions -->
       <div class="tb-space" data-tauri-drag-region></div>
       {#if activeMetrics}
         {@render meter("cpu", Math.min(1, activeMetrics.load / activeMetrics.cpus), `${activeMetrics.load.toFixed(1)} / ${activeMetrics.cpus}`)}
-        {@render meter("ram", activeMetrics.memUsed / (activeMetrics.memTotal || 1), `${gb(activeMetrics.memUsed)} / ${gb(activeMetrics.memTotal)} Go`)}
-        {@render meter("dsk", activeMetrics.diskUsed / (activeMetrics.diskTotal || 1), `${gb(activeMetrics.diskUsed)} / ${gb(activeMetrics.diskTotal)} Go`)}
+        {@render meter("ram", activeMetrics.memUsed / (activeMetrics.memTotal || 1), `${gb(activeMetrics.memUsed)} / ${gb(activeMetrics.memTotal)} GB`)}
+        {@render meter("dsk", activeMetrics.diskUsed / (activeMetrics.diskTotal || 1), `${gb(activeMetrics.diskUsed)} / ${gb(activeMetrics.diskTotal)} GB`)}
       {/if}
       {#if activeSshRemote()}
-        <button class="icon-btn" class:active-btn={forwardsOpen} title="Redirections de ports" onclick={() => (forwardsOpen = !forwardsOpen)}>{@render iGlobe()}</button>
-        <button class="icon-btn" class:active-btn={files.open} title="Fichiers du serveur (SFTP)" onclick={toggleFiles}>{@render iFolder()}</button>
+        <button class="icon-btn" class:active-btn={forwardsOpen} title="Port forwards" onclick={() => (forwardsOpen = !forwardsOpen)}>{@render iGlobe()}</button>
+        <button class="icon-btn" class:active-btn={files.open} title="Server files (SFTP)" onclick={toggleFiles}>{@render iFolder()}</button>
       {/if}
       {#if forwards.length}
-        <span class="fwd-count" title="Tunnels actifs">{forwards.length}</span>
+        <span class="fwd-count" title="Active tunnels">{forwards.length}</span>
       {/if}
       {#if activeTab?.root}
         <button
           class="icon-btn"
-          title="Enregistrer comme projet"
+          title="Save as project"
           onclick={() => {
             const proj = activeTab.projectId && projects.find((p) => p.id === activeTab.projectId);
             modal = { type: "saveProject", tabId: activeTab.id, name: proj ? proj.name : "" };
@@ -1862,7 +2336,7 @@
         {:else}
           <div class="welcome">
             <div class="wordmark">arabel</div>
-            <p class="hint">Terminal local &amp; SSH pour piloter tes agents IA</p>
+            <p class="hint">Local &amp; SSH terminal to drive your AI agents</p>
             {#if loaded}
               <div class="welcome-list">
                 {@render remoteRow(LOCAL, (x) => openInTab(t, x), false)}
@@ -1872,7 +2346,7 @@
               </div>
               {#if !remotes.length}
                 <button class="btn" onclick={() => (identities.length ? editRemote() : editIdentity())}>
-                  {identities.length ? "Ajouter un remote SSH" : "Ajouter une identité SSH"}
+                  {identities.length ? "Add an SSH remote" : "Add an SSH identity"}
                 </button>
               {/if}
             {/if}
@@ -1892,8 +2366,8 @@
         <div class="files-head">
           <span class="files-title">{files.remote?.name}</span>
           <span class="files-btns">
-            <button class="icon-btn" title="Actualiser" onclick={() => filesLoad(files.path)}>{@render iRefresh()}</button>
-            <button class="icon-btn" title="Fermer" onclick={() => (files.open = false)}>{@render iClose()}</button>
+            <button class="icon-btn" title="Refresh" onclick={() => filesLoad(files.path)}>{@render iRefresh()}</button>
+            <button class="icon-btn" title="Close" onclick={() => (files.open = false)}>{@render iClose()}</button>
           </span>
         </div>
         <div class="files-path" title={files.path}>{files.path}</div>
@@ -1913,15 +2387,15 @@
               {#if !entry.isDir}
                 <span class="row-meta">{humanSize(entry.size)}</span>
                 <span class="row-actions">
-                  <button class="icon-btn" title="Télécharger dans ~/Downloads" onclick={(e) => { e.stopPropagation(); fileDownload(entry); }}>{@render iDownload()}</button>
+                  <button class="icon-btn" title="Download to ~/Downloads" onclick={(e) => { e.stopPropagation(); fileDownload(entry); }}>{@render iDownload()}</button>
                 </span>
               {/if}
             </div>
           {:else}
-            <p class="sb-empty">Dossier vide</p>
+            <p class="sb-empty">Empty folder</p>
           {/each}
         </div>
-        <div class="files-hint">Dépose des fichiers ici pour les envoyer</div>
+        <div class="files-hint">Drop files here to upload them</div>
         {#if files.busy}
           <div class="files-veil"><span class="veil-spin">{@render iSpinner(16)}</span></div>
         {/if}
@@ -1931,12 +2405,12 @@
     {#if forwardsOpen}
       <aside class="files fwd-panel">
         <div class="files-head">
-          <span class="files-title">Redirections de ports</span>
-          <button class="icon-btn" title="Fermer" onclick={() => (forwardsOpen = false)}>{@render iClose()}</button>
+          <span class="files-title">Port forwards</span>
+          <button class="icon-btn" title="Close" onclick={() => (forwardsOpen = false)}>{@render iClose()}</button>
         </div>
         <form class="fwd-add" onsubmit={(e) => { e.preventDefault(); addForward(); }}>
-          <input placeholder="port distant (ex. 3000)" bind:value={newFwd.remotePort} />
-          <button type="submit" class="btn fwd-go" disabled={!newFwd.remotePort} title="Ouvrir le tunnel">{@render iPlus()}</button>
+          <input placeholder="remote port (e.g. 3000)" bind:value={newFwd.remotePort} />
+          <button type="submit" class="btn fwd-go" disabled={!newFwd.remotePort} title="Open tunnel">{@render iPlus()}</button>
         </form>
         <div class="files-list">
           {#each forwards as f (f.id)}
@@ -1945,28 +2419,28 @@
                 <b>:{f.localPort}</b> <span class="fwd-arrow">→</span> {f.remoteName}:{f.remotePort}
               </span>
               <span class="fwd-btns">
-                <button class="icon-btn" title="Aperçu intégré" onclick={() => openPreview(f)}>{@render iGlobe()}</button>
-                <button class="icon-btn" title="Ouvrir dans le navigateur" onclick={() => openInBrowser(`http://localhost:${f.localPort}`)}>{@render iExternal()}</button>
-                <button class="icon-btn" title="Arrêter le tunnel" onclick={() => stopForward(f)}>{@render iClose()}</button>
+                <button class="icon-btn" title="Built-in preview" onclick={() => openPreview(f)}>{@render iGlobe()}</button>
+                <button class="icon-btn" title="Open in browser" onclick={() => openInBrowser(`http://localhost:${f.localPort}`)}>{@render iExternal()}</button>
+                <button class="icon-btn" title="Stop tunnel" onclick={() => stopForward(f)}>{@render iClose()}</button>
               </span>
             </div>
           {:else}
-            <p class="sb-empty">Aucun tunnel — indique un port distant ↑</p>
+            <p class="sb-empty">No tunnels — enter a remote port ↑</p>
           {/each}
         </div>
-        <div class="files-hint">Le port distant devient accessible sur localhost</div>
+        <div class="files-hint">The remote port becomes reachable on localhost</div>
       </aside>
     {/if}
 
     {#if preview}
       <aside class="preview">
         <div class="preview-bar">
-          <button class="icon-btn" title="Recharger" onclick={reloadPreview}>{@render iRefresh()}</button>
+          <button class="icon-btn" title="Reload" onclick={reloadPreview}>{@render iRefresh()}</button>
           <span class="preview-url">{preview.url}</span>
-          <button class="icon-btn" title="Ouvrir dans le navigateur" onclick={() => openInBrowser(preview!.url)}>{@render iExternal()}</button>
-          <button class="icon-btn" title="Fermer l'aperçu" onclick={() => (preview = null)}>{@render iClose()}</button>
+          <button class="icon-btn" title="Open in browser" onclick={() => openInBrowser(preview!.url)}>{@render iExternal()}</button>
+          <button class="icon-btn" title="Close preview" onclick={() => (preview = null)}>{@render iClose()}</button>
         </div>
-        <iframe class="preview-frame" title="Aperçu" src={preview.url} bind:this={previewFrame}></iframe>
+        <iframe class="preview-frame" title="Preview" src={preview.url} bind:this={previewFrame}></iframe>
       </aside>
     {/if}
     </div>
@@ -1986,18 +2460,22 @@
 {#if attentions.length}
   <div class="attentions">
     {#each attentions.slice(-4) as a (a.id)}
-      <div class="attention" class:stop={a.kind === "stop"}>
-        <button class="att-msg" onclick={() => { gotoAttention(a); dismissAttention(a); }} title="Aller au panneau">
-          {a.message}
-        </button>
-        {#if a.kind === "notif"}
-          <button class="att-btn yes" title="Autoriser (envoie 1)" onclick={() => answerAttention(a, "1")}>✓</button>
-          <button class="att-btn no" title="Refuser (envoie Échap)" onclick={() => answerAttention(a, "\x1b")}>✗</button>
-        {/if}
-        <button class="icon-btn" onclick={() => dismissAttention(a)}>{@render iClose()}</button>
+      <div class="attention" class:stop={a.kind === "stop"} class:hasopts={!!a.options?.length}>
+        <div class="att-head">
+          <span class="att-icon {a.kind}">{#if a.kind === "stop"}{@render iCheck()}{:else}{@render iAlert()}{/if}</span>
+          <button class="att-msg" onclick={() => { gotoAttention(a); dismissAttention(a); }} title="Go to pane">
+            {a.message}
+          </button>
+          {#if a.kind === "notif" && !a.options?.length}
+            <button class="att-btn yes" title="Allow (sends 1)" onclick={() => answerAttention(a, "1")}>✓</button>
+            <button class="att-btn no" title="Deny (sends Esc)" onclick={() => answerAttention(a, "\x1b")}>✗</button>
+          {/if}
+          <button class="icon-btn" onclick={() => dismissAttention(a)}>{@render iClose()}</button>
+        </div>
+        {#if a.options?.length}{@render choiceBtns(a)}{/if}
       </div>
     {/each}
-    {#if attentions.length > 4}<div class="att-more">+{attentions.length - 4} autres</div>{/if}
+    {#if attentions.length > 4}<div class="att-more">+{attentions.length - 4} more</div>{/if}
   </div>
 {/if}
 
@@ -2005,94 +2483,109 @@
 {#if modal}
   <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
   <div class="overlay" onclick={() => (modal = null)}>
-    <div class="sheet" onclick={(e) => e.stopPropagation()}>
+    <div class="sheet" class:wide={modal.type === "settings"} onclick={(e) => e.stopPropagation()}>
       {#if modal.type === "remote"}
-        <h2>{remotes.some((r) => r.id === (modal as any).data.id) ? "Modifier le remote" : "Nouveau remote"}</h2>
+        <h2>{remotes.some((r) => r.id === (modal as any).data.id) ? "Edit remote" : "New remote"}</h2>
         <form onsubmit={(e) => { e.preventDefault(); saveRemote(); }}>
-          <label>{@render field("Nom")}<input bind:value={modal.data.name} placeholder="mon-vps (auto si vide)" use:autofocus /></label>
+          <label>{@render field("Name")}<input bind:value={modal.data.name} placeholder="my-vps (auto if empty)" use:autofocus /></label>
           <div class="f-pair">
-            <label class="grow">{@render field("Hôte")}<input bind:value={modal.data.host} placeholder="vps.exemple.com" required /></label>
+            <label class="grow">{@render field("Host")}<input bind:value={modal.data.host} placeholder="vps.example.com" required /></label>
             <label class="f-port">{@render field("Port")}<input type="number" bind:value={modal.data.port} /></label>
           </div>
-          <label>{@render field("Utilisateur")}<input bind:value={modal.data.user} required /></label>
-          <label>{@render field("Authentification")}
+          <label>{@render field("User")}<input bind:value={modal.data.user} required /></label>
+          <label>{@render field("Authentication")}
             <select bind:value={modal.data.auth}>
-              <option value="key">Clé privée</option>
-              <option value="password">Mot de passe</option>
+              <option value="key">Private key</option>
+              <option value="password">Password</option>
               <option value="agent">ssh-agent</option>
             </select>
           </label>
           {#if (modal.data.auth ?? "key") === "key"}
-            <label>{@render field("Identité")}
+            <label>{@render field("Identity")}
               <select bind:value={modal.data.identityId} required>
                 {#each identities as i (i.id)}<option value={i.id}>{i.name}</option>{/each}
               </select>
             </label>
-            {#if !identities.length}<p class="f-hint">Aucune identité — ajoutes-en une, ou choisis ssh-agent / mot de passe.</p>{/if}
+            {#if !identities.length}<p class="f-hint">No identity — add one, or choose ssh-agent / password.</p>{/if}
           {:else if modal.data.auth === "password"}
-            <label>{@render field("Mot de passe")}
-              <input type="password" bind:value={modal.password} placeholder={remotes.some((x) => x.id === (modal as any).data.id) ? "(inchangé)" : ""} />
+            <label>{@render field("Password")}
+              <input type="password" bind:value={modal.password} placeholder={remotes.some((x) => x.id === (modal as any).data.id) ? "(unchanged)" : ""} />
             </label>
-            <p class="f-hint">Stocké dans le Keychain macOS, jamais sur disque.</p>
+            <p class="f-hint">Stored in {secretStore}, never on disk.</p>
           {:else}
-            <p class="f-hint">Utilise les clés chargées dans ton ssh-agent (<code>ssh-add</code>).</p>
+            <p class="f-hint">Uses the keys loaded in your ssh-agent (<code>ssh-add</code>).</p>
           {/if}
+          <label>{@render field("Working directory (optional)")}
+            <input bind:value={modal.data.dir} placeholder="~/code/my-project — otherwise home directory" />
+          </label>
           <label class="f-check">
             <input type="checkbox" bind:checked={modal.data.claude} />
-            <span>Claude Code — synchroniser la config et lancer <code>claude</code> à la connexion</span>
+            <span>Claude Code — sync config and <b>track the agent</b> (the <code>claude</code> you launch is tracked)</span>
           </label>
+          {#if modal.data.claude}
+            <label class="f-check sub-check">
+              <input type="checkbox" checked={!!modal.data.autoLaunch} onchange={(e) => { if (modal?.type === "remote") modal.data.autoLaunch = e.currentTarget.checked; }} />
+              <span>Launch <code>claude</code> automatically on connect (otherwise: shell, launch it whenever you want)</span>
+            </label>
+          {/if}
           <label class="f-check">
             <input type="checkbox" checked={modal.data.tmux !== false} onchange={(e) => { if (modal?.type === "remote") modal.data.tmux = e.currentTarget.checked; }} />
-            <span>tmux — sessions persistantes (survivent aux déconnexions)</span>
+            <span>tmux — persistent sessions (survive disconnects)</span>
           </label>
+          {#if moshOk && modal.data.auth !== "password"}
+            <label class="f-check">
+              <input type="checkbox" checked={!!modal.data.mosh} onchange={(e) => { if (modal?.type === "remote") modal.data.mosh = e.currentTarget.checked; }} />
+              <span>mosh — near-instant echo &amp; resume after drops (UDP; native tmux splits, not control mode)</span>
+            </label>
+          {/if}
           <div class="sheet-actions">
-            <button type="button" class="btn ghost" onclick={() => (modal = null)}>Annuler</button>
-            <button type="submit" class="btn">Enregistrer</button>
+            <button type="button" class="btn ghost" onclick={() => (modal = null)}>Cancel</button>
+            <button type="submit" class="btn">Save</button>
           </div>
         </form>
       {:else if modal.type === "identity"}
-        <h2>{identities.some((i) => i.id === (modal as any).data.id) ? "Modifier l'identité" : "Nouvelle identité"}</h2>
+        <h2>{identities.some((i) => i.id === (modal as any).data.id) ? "Edit identity" : "New identity"}</h2>
         <form onsubmit={(e) => { e.preventDefault(); saveIdentity(); }}>
-          <label>{@render field("Nom")}<input bind:value={modal.data.name} placeholder="(auto si vide)" use:autofocus /></label>
-          <label>{@render field("Clé privée")}<input bind:value={modal.data.keyPath} required /></label>
+          <label>{@render field("Name")}<input bind:value={modal.data.name} placeholder="(auto if empty)" use:autofocus /></label>
+          <label>{@render field("Private key")}<input bind:value={modal.data.keyPath} required /></label>
           <label>{@render field("Passphrase")}
-            <input type="password" bind:value={modal.passphrase} placeholder={modal.data.hasPassphrase ? "(inchangée)" : "(aucune)"} />
+            <input type="password" bind:value={modal.passphrase} placeholder={modal.data.hasPassphrase ? "(unchanged)" : "(none)"} />
           </label>
-          <p class="f-hint">Stockée dans le Keychain macOS, jamais sur disque.</p>
+          <p class="f-hint">Stored in {secretStore}, never on disk.</p>
           <div class="sheet-actions">
-            <button type="button" class="btn ghost" onclick={() => (modal = null)}>Annuler</button>
-            <button type="submit" class="btn">Enregistrer</button>
+            <button type="button" class="btn ghost" onclick={() => (modal = null)}>Cancel</button>
+            <button type="submit" class="btn">Save</button>
           </div>
         </form>
       {:else if modal.type === "project"}
-        <h2>Modifier le projet</h2>
+        <h2>Edit project</h2>
         <form onsubmit={(e) => { e.preventDefault(); saveProjectEdit(); }}>
-          <label>{@render field("Nom")}<input bind:value={modal.data.name} required use:autofocus /></label>
-          {#each projLeaves(modal.data.root) as leaf, n}
+          <label>{@render field("Name")}<input bind:value={modal.data.name} required use:autofocus /></label>
+          {#each projectViews(modal.data).flatMap(projLeaves) as leaf, n}
             <label>
-              {@render field(`Panneau ${n + 1} · ${remotes.find((r) => r.id === leaf.remoteId)?.name ?? "?"} — commande initiale`)}
-              <input bind:value={leaf.cmd} placeholder="(aucune)" />
+              {@render field(`Terminal ${n + 1} · ${remotes.find((r) => r.id === leaf.remoteId)?.name ?? "?"} — initial command`)}
+              <input bind:value={leaf.cmd} placeholder="(none)" />
             </label>
           {/each}
-          <p class="f-hint">La commande est envoyée au shell à l'ouverture du panneau.</p>
+          <p class="f-hint">The command is sent to the shell when the pane opens.</p>
           <div class="sheet-actions">
-            <button type="button" class="btn ghost" onclick={() => (modal = null)}>Annuler</button>
-            <button type="submit" class="btn">Enregistrer</button>
+            <button type="button" class="btn ghost" onclick={() => (modal = null)}>Cancel</button>
+            <button type="submit" class="btn">Save</button>
           </div>
         </form>
       {:else if modal.type === "saveProject"}
-        <h2>Enregistrer le projet</h2>
+        <h2>Save project</h2>
         <form onsubmit={(e) => { e.preventDefault(); confirmSaveProject(); }}>
-          <label>{@render field("Nom du projet")}<input bind:value={modal.name} required use:autofocus /></label>
+          <label>{@render field("Project name")}<input bind:value={modal.name} required use:autofocus /></label>
           <div class="sheet-actions">
-            <button type="button" class="btn ghost" onclick={() => (modal = null)}>Annuler</button>
-            <button type="submit" class="btn">Enregistrer</button>
+            <button type="button" class="btn ghost" onclick={() => (modal = null)}>Cancel</button>
+            <button type="submit" class="btn">Save</button>
           </div>
         </form>
       {:else if modal.type === "picker"}
-        <h2>{modal.dir ? "Ouvrir dans le nouveau panneau" : "Nouvelle connexion"}</h2>
+        <h2>{modal.dir ? "Open in the new pane" : "New connection"}</h2>
         {#if remotes.length > 6}
-          <input class="split-filter" bind:value={modal.filter} placeholder="Filtrer…" use:autofocus />
+          <input class="split-filter" bind:value={modal.filter} placeholder="Filter…" use:autofocus />
         {/if}
         <div class="split-list">
           {@render remoteRow(LOCAL, doPick, false)}
@@ -2103,32 +2596,32 @@
         {#if !modal.dir && !modal.projectId}
           <label class="f-check cc-check">
             <input type="checkbox" bind:checked={modal.cc} />
-            <span>Mode <b>tmux natif</b> — panneaux miroir des splits tmux (expérimental)</span>
+            <span><b>Native tmux</b> mode — panes mirror tmux splits (experimental)</span>
           </label>
         {/if}
         <div class="sheet-actions spread">
-          <button class="btn ghost" onclick={() => (modal = { type: "connections" })}>Gérer les connexions…</button>
-          <button class="btn ghost" onclick={() => (modal = null)}>Annuler</button>
+          <button class="btn ghost" onclick={() => (modal = { type: "connections" })}>Manage connections…</button>
+          <button class="btn ghost" onclick={() => (modal = null)}>Cancel</button>
         </div>
       {:else if modal.type === "connections"}
-        <h2>Connexions</h2>
+        <h2>Connections</h2>
         <div class="mgr-head">
-          <span>Remotes SSH</span>
+          <span>SSH remotes</span>
           <span class="mgr-btns">
-            <button class="icon-btn" title="Importer depuis ~/.ssh/config" onclick={openSshImport}>{@render iDownload()}</button>
-            <button class="icon-btn" title="Nouveau remote" onclick={() => editRemote(undefined, true)}>{@render iPlus()}</button>
+            <button class="icon-btn" title="Import remotes (SSH / VS Code)" onclick={openSshImport}>{@render iDownload()}</button>
+            <button class="icon-btn" title="New remote" onclick={() => editRemote(undefined, true)}>{@render iPlus()}</button>
           </span>
         </div>
         <div class="split-list">
           {#each remotes as r (r.id)}
             {@render remoteRow(r, (x) => editRemote(x, true), true)}
           {:else}
-            <p class="sb-empty">{identities.length ? "Aucun remote" : "Crée d'abord une identité ↓"}</p>
+            <p class="sb-empty">{identities.length ? "No remotes" : "Create an identity first ↓"}</p>
           {/each}
         </div>
         <div class="mgr-head">
-          <span>Identités SSH</span>
-          <button class="icon-btn" title="Nouvelle identité" onclick={() => editIdentity(undefined, true)}>{@render iPlus()}</button>
+          <span>SSH identities</span>
+          <button class="icon-btn" title="New identity" onclick={() => editIdentity(undefined, true)}>{@render iPlus()}</button>
         </div>
         <div class="split-list">
           {#each identities as i (i.id)}
@@ -2140,27 +2633,28 @@
               {@render rowActions(i.id, () => editIdentity(i, true), () => deleteIdentity(i))}
             </div>
           {:else}
-            <p class="sb-empty">Aucune identité</p>
+            <p class="sb-empty">No identities</p>
           {/each}
         </div>
         <div class="sheet-actions">
-          <button class="btn" onclick={() => (modal = null)}>Fermer</button>
+          <button class="btn" onclick={() => (modal = null)}>Close</button>
         </div>
       {:else if modal.type === "sshImport"}
-        <h2>Importer depuis ~/.ssh/config</h2>
+        <h2>Import SSH / VS Code remotes</h2>
+        <p class="f-hint">From <code>~/.ssh/config</code> (includes resolved) and VS Code's Remote-SSH config.</p>
         <div class="split-list">
           {#each modal.hosts as h (h.host)}
             <div class="row import-row">
               <span class="row-icon">{@render iTerminal()}</span>
               <span class="row-label">{h.host}<span class="row-meta"> · {h.user || "?"}@{h.hostName}:{h.port}</span></span>
-              <button class="btn ghost import-btn" onclick={() => importHost(h)}>Importer</button>
+              <button class="btn ghost import-btn" onclick={() => importHost(h)}>Import</button>
             </div>
           {:else}
-            <p class="sb-empty">Tout est importé ✓</p>
+            <p class="sb-empty">Everything imported ✓</p>
           {/each}
         </div>
         <div class="sheet-actions">
-          <button class="btn" onclick={() => (modal = { type: "connections" })}>Fermer</button>
+          <button class="btn" onclick={() => (modal = { type: "connections" })}>Close</button>
         </div>
       {:else if modal.type === "palette"}
         {@const q = modal.filter.toLowerCase()}
@@ -2168,7 +2662,7 @@
         <input
           class="palette-input"
           bind:value={modal.filter}
-          placeholder="Aller à… (terminal, projet, remote)"
+          placeholder="Go to… (terminal, project, remote)"
           use:autofocus
           onkeydown={(e) => { if (e.key === "Enter") { e.preventDefault(); items[0]?.run(); modal = null; } }} />
         <div class="split-list palette-list">
@@ -2182,74 +2676,136 @@
               <span class="row-meta">{it.sub}</span>
             </div>
           {:else}
-            <p class="sb-empty">Aucun résultat</p>
+            <p class="sb-empty">No results</p>
           {/each}
         </div>
       {:else if modal.type === "settings"}
-        <h2>Réglages</h2>
-        <form onsubmit={(e) => { e.preventDefault(); modal = null; }}>
-          <div class="f-pair">
-            <label class="grow">{@render field("Police du terminal")}
-              <input
-                bind:value={settings.fontFamily}
-                onchange={applySettings}
-                onfocus={() => (fontOpen = true)}
-                oninput={() => (fontOpen = true)}
-                onblur={() => setTimeout(() => (fontOpen = false), 160)}
-                placeholder="Nom de la police" />
-            </label>
-            <label class="f-port">{@render field("Taille")}<input type="number" min="9" max="32" bind:value={settings.fontSize} onchange={applySettings} /></label>
-          </div>
-          {#if fontOpen}
-            {@const q = settings.fontFamily.includes(",") ? "" : settings.fontFamily.toLowerCase().trim()}
-            {@const matches = fontList.filter((f) => f.toLowerCase().includes(q)).slice(0, 60)}
-            <div class="font-list">
-              {#each matches as f (f)}
-                <button type="button" class="font-opt" style="font-family:'{f.replace(/'/g, '')}', monospace" onmousedown={(e) => { e.preventDefault(); settings.fontFamily = f; fontOpen = false; applySettings(); }}>{f}</button>
-              {:else}
-                <div class="font-empty">{fontList.length ? "Aucune correspondance" : "Chargement…"}</div>
-              {/each}
-            </div>
-          {/if}
-          <label>{@render field("Thème du terminal")}
-            <select bind:value={settings.theme} onchange={applySettings}>
-              {#each Object.keys(THEMES) as th}<option value={th}>{th}</option>{/each}
-              <option value="Personnalisé">Personnalisé</option>
-            </select>
-          </label>
-          {#if settings.theme === "Personnalisé"}
-            <div class="theme-editor">
-              <div class="color-row">
-                {@render colorField("Fond", "background")}
-                {@render colorField("Texte", "foreground")}
-                {@render colorField("Curseur", "cursor")}
-                {@render colorField("Sélection", "selectionBackground")}
-              </div>
-              <div class="ansi-line">
-                <span class="f-label">Palette ANSI</span>
-                <div class="ansi-grid">
-                  {#each ANSI_KEYS as k (k)}
-                    <input type="color" class="ansi-dot" title={k} value={(settings.customTheme[k] as string) ?? '#000000'} oninput={(e) => setCustom(k, e.currentTarget.value)} />
-                  {/each}
+        <h2>Settings</h2>
+        <div class="seg">
+          <button type="button" class:on={settingsTab === "appearance"} onclick={() => (settingsTab = "appearance")}>Appearance</button>
+          <button type="button" class:on={settingsTab === "terminal"} onclick={() => (settingsTab = "terminal")}>Terminal</button>
+          <button type="button" class:on={settingsTab === "shortcuts"} onclick={() => (settingsTab = "shortcuts")}>Shortcuts</button>
+        </div>
+
+        {#if settingsTab === "appearance"}
+          <form onsubmit={(e) => { e.preventDefault(); modal = null; }}>
+            <div class="f-pair">
+              <label class="grow">{@render field("Terminal font")}
+                <div class="font-field">
+                  <input
+                    value={fontOpen ? fontQuery : settings.fontFamily}
+                    onfocus={() => { fontQuery = ""; fontOpen = true; }}
+                    oninput={(e) => { fontQuery = e.currentTarget.value; fontOpen = true; }}
+                    onkeydown={(e) => { if (e.key === "Enter") { e.preventDefault(); if (fontQuery.trim()) pickFont(fontQuery.trim()); else fontOpen = false; } else if (e.key === "Escape") { fontOpen = false; e.currentTarget.blur(); } }}
+                    onblur={() => setTimeout(() => (fontOpen = false), 160)}
+                    placeholder="Search for a font…" />
+                  <button type="button" class="icon-btn font-reset" title="Default font" onmousedown={(e) => { e.preventDefault(); pickFont(DEFAULT_FONT); }}>{@render iRefresh()}</button>
                 </div>
+              </label>
+              <label class="f-port">{@render field("Size")}<input type="number" min="9" max="32" bind:value={settings.fontSize} onchange={applySettings} /></label>
+            </div>
+            <button type="button" class="link-btn" onclick={importVscodeFont}>{@render iDownload()}<span>Import VS Code's font</span></button>
+            {#if fontOpen}
+              {@const q = fontQuery.toLowerCase().trim()}
+              {@const matches = fontList.filter((f) => f.toLowerCase().includes(q)).slice(0, 80)}
+              <div class="font-list">
+                {#each matches as f (f)}
+                  <button type="button" class="font-opt" class:cur={f === settings.fontFamily} style="font-family:'{f.replace(/'/g, '')}', monospace" onmousedown={(e) => { e.preventDefault(); pickFont(f); }}>{f}</button>
+                {:else}
+                  <div class="font-empty">{fontList.length ? "No font — type a name then Enter" : "Loading…"}</div>
+                {/each}
               </div>
-              <label class="seed">
-                <span class="f-label">Partir d'un preset</span>
-                <select onchange={(e) => { if (e.currentTarget.value) { settings.customTheme = { ...THEMES[e.currentTarget.value] }; applySettings(); } e.currentTarget.selectedIndex = 0; }}>
-                  <option value="">Choisir…</option>
-                  {#each Object.keys(THEMES) as th}<option value={th}>{th}</option>{/each}
+            {/if}
+            <label>{@render field("Terminal theme")}
+              <select bind:value={settings.theme} onchange={applySettings}>
+                {#each Object.keys(THEMES) as th}<option value={th}>{th}</option>{/each}
+                <option value="Custom">Custom</option>
+              </select>
+            </label>
+            {#if settings.theme === "Custom"}
+              <div class="theme-editor">
+                <div class="color-row">
+                  {@render colorField("Background", "background")}
+                  {@render colorField("Text", "foreground")}
+                  {@render colorField("Cursor", "cursor")}
+                  {@render colorField("Selection", "selectionBackground")}
+                </div>
+                <div class="ansi-line">
+                  <span class="f-label">ANSI palette</span>
+                  <div class="ansi-grid">
+                    {#each ANSI_KEYS as k (k)}
+                      <input type="color" class="ansi-dot" title={k} value={(settings.customTheme[k] as string) ?? '#000000'} oninput={(e) => setCustom(k, e.currentTarget.value)} />
+                    {/each}
+                  </div>
+                </div>
+                <label class="seed">
+                  <span class="f-label">Start from a preset</span>
+                  <select onchange={(e) => { if (e.currentTarget.value) { settings.customTheme = { ...THEMES[e.currentTarget.value] }; applySettings(); } e.currentTarget.selectedIndex = 0; }}>
+                    <option value="">Choose…</option>
+                    {#each Object.keys(THEMES) as th}<option value={th}>{th}</option>{/each}
+                  </select>
+                </label>
+              </div>
+            {/if}
+            <div class="sheet-actions"><button type="submit" class="btn">Close</button></div>
+          </form>
+        {:else if settingsTab === "terminal"}
+          <form onsubmit={(e) => { e.preventDefault(); modal = null; }}>
+            <div class="f-pair">
+              <label class="grow">{@render field("Cursor style")}
+                <select bind:value={settings.cursorStyle} onchange={applySettings}>
+                  <option value="bar">Bar</option>
+                  <option value="block">Block</option>
+                  <option value="underline">Underline</option>
                 </select>
               </label>
+              <label class="f-port">{@render field("Line height")}<input type="number" min="1" max="2" step="0.05" bind:value={settings.lineHeight} onchange={applySettings} /></label>
             </div>
-          {/if}
-          <label class="f-check">
-            <input type="checkbox" bind:checked={settings.copyOnSelect} onchange={applySettings} />
-            <span>Copier automatiquement la sélection</span>
-          </label>
-          <div class="sheet-actions">
-            <button type="submit" class="btn">Fermer</button>
+            <label>{@render field("Scrollback (lines kept in history)")}<input type="number" min="0" max="100000" step="1000" bind:value={settings.scrollback} onchange={applySettings} /></label>
+            <label class="f-check">
+              <input type="checkbox" bind:checked={settings.cursorBlink} onchange={applySettings} />
+              <span>Blinking cursor</span>
+            </label>
+            <label class="f-check">
+              <input type="checkbox" bind:checked={settings.copyOnSelect} onchange={applySettings} />
+              <span>Copy selection automatically</span>
+            </label>
+            <label class="f-check">
+              <input type="checkbox" bind:checked={settings.sounds} onchange={() => save()} />
+              <span>Play a sound on agent events (waiting / finished / denied)</span>
+            </label>
+            <label class="f-check">
+              <input type="checkbox" bind:checked={settings.tmuxStatus} onchange={() => save()} />
+              <span>Show tmux status bar (takes effect on reconnect)</span>
+            </label>
+            <div class="sheet-actions"><button type="submit" class="btn">Close</button></div>
+          </form>
+        {:else}
+          <p class="f-hint">Click a shortcut, then press the new key combination. Esc cancels, and a combo already in use is moved to this action.</p>
+          <div class="keys-list">
+            {#each KEYBINDINGS as b (b.id)}
+              <div class="key-row">
+                <span class="key-label">{b.label}</span>
+                <button type="button" class="key-combo" class:recording={recordingBind === b.id}
+                  onclick={() => (recordingBind = b.id)}
+                  onkeydown={(e) => { if (recordingBind === b.id) recordKey(e, b.id); }}
+                  onblur={() => { if (recordingBind === b.id) recordingBind = null; }}>
+                  {recordingBind === b.id ? "Press keys…" : formatCombo(keyOf(b.id))}
+                </button>
+                <button type="button" class="icon-btn" title="Reset to default" onclick={() => resetKey(b.id)}>{@render iRefresh()}</button>
+              </div>
+            {/each}
+            <div class="key-row static">
+              <span class="key-label">Switch to tab 1–9</span>
+              <span class="key-combo fixed">{isMac ? "⌘1–9" : "Ctrl+Shift+1–9"}</span>
+              <span class="icon-spacer"></span>
+            </div>
           </div>
-        </form>
+          <div class="sheet-actions spread">
+            <button type="button" class="link-btn" onclick={resetAllKeys}>{@render iRefresh()}<span>Reset all to defaults</span></button>
+            <button type="button" class="btn" onclick={() => (modal = null)}>Close</button>
+          </div>
+        {/if}
       {/if}
     </div>
   </div>
@@ -2326,6 +2882,8 @@
     justify-content: flex-end;
     padding: 0 10px;
   }
+  /* Windows/Linux : fenêtre décorée nativement, pas de feux à contourner. */
+  :global(body.win) .sb-traffic { height: 40px; }
   .sb-toggle { opacity: 0; transition: opacity 120ms; }
   .sidebar:hover .sb-toggle { opacity: 1; }
   .sb-scroll { flex: 1; overflow-y: auto; min-height: 0; padding-bottom: 8px; }
@@ -2415,6 +2973,7 @@
   .row.drop { box-shadow: inset 0 0 0 1.5px var(--accent); background: rgba(0, 122, 255, 0.12); }
   .row.drop-before { box-shadow: inset 0 2px 0 var(--accent); }
   .row.drop-after { box-shadow: inset 0 -2px 0 var(--accent); }
+  .row.drop-merge { box-shadow: inset 0 0 0 1.5px var(--accent); background: rgba(0, 122, 255, 0.14); }
   .sb-section.drop { box-shadow: inset 0 0 0 1.5px var(--accent); border-radius: var(--radius-md); }
   .row .row-plus { display: none; flex: none; }
   .row:hover .row-plus { display: inline-flex; }
@@ -2430,22 +2989,22 @@
   .chev { width: 16px; height: 16px; flex: none; transition: transform 150ms var(--ease); }
   .chev.open { transform: rotate(90deg); }
 
-  /* dashboard agents (compact, dans la barre latérale) */
-  .agents-section { margin-top: 8px; }
-  .agent-badge {
-    min-width: 15px; height: 15px; padding: 0 4px;
-    border-radius: 8px; background: var(--attention); color: #201400;
-    font-size: 10px; font-weight: 700; display: flex; align-items: center; justify-content: center;
+  /* question de choix (menu agent) — utilisée dans les notifs */
+  .agent-q { font-size: 10.5px; color: var(--text-secondary); line-height: 1.3; }
+  .choice-row { display: flex; gap: 4px; }
+  .choice-row.wrap { flex-wrap: wrap; }
+  .choice {
+    display: inline-flex; align-items: center; max-width: 100%;
+    padding: 3px 7px; border-radius: 6px; cursor: pointer;
+    font-size: 11px; line-height: 1.2; text-align: left;
+    background: var(--surface-2, rgba(120, 120, 128, 0.16));
+    border: 1px solid transparent; color: var(--text-primary);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
-  .row.agent .row-icon.agent-waiting { color: var(--attention); }
-  .row.agent .row-icon.agent-done { color: var(--success); }
-  .row.agent .row-icon.agent-working { color: var(--accent); }
-  .agent-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; animation: agent-pulse 1.4s ease-in-out infinite; }
-  @keyframes agent-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
-  .agent-acts { display: flex; gap: 2px; flex: none; }
-  .agent-acts .att-btn { width: 20px; height: 20px; font-size: 11px; }
-  .agent-meta { font-size: 10.5px; color: var(--success); flex: none; }
-  .row.agent.current .agent-meta { color: #fff; }
+  .choice:hover { border-color: var(--accent); }
+  .choice b { color: var(--accent); margin-right: 3px; font-weight: 700; }
+  .choice.yes:hover { border-color: var(--success); }
+  .choice.no:hover { border-color: var(--danger, #ff453a); }
 
   .mgr-head {
     display: flex;
@@ -2461,7 +3020,27 @@
   .import-row { margin: 0; }
   .import-btn { height: 22px; padding: 0 10px; font-size: 12px; flex: none; }
   .sheet .row { margin: 0; }
-  .sheet-actions.spread { justify-content: space-between; }
+  .sheet-actions.spread { justify-content: space-between; align-items: center; }
+  .sheet.wide { width: 560px; }
+
+  /* segmented control (onglets de réglages) */
+  .seg { display: flex; gap: 2px; padding: 2px; margin-bottom: 16px; background: var(--surface); border-radius: var(--radius-md); }
+  .seg button { flex: 1; padding: 5px 10px; border: none; background: transparent; color: var(--text-secondary); font: inherit; font-size: 12.5px; border-radius: var(--radius-sm); cursor: pointer; transition: background 120ms var(--ease); }
+  .seg button:hover { color: var(--text-primary); }
+  .seg button.on { background: var(--surface-raised); color: var(--text-primary); box-shadow: 0 1px 2px rgba(0,0,0,0.3); }
+
+  /* liste des raccourcis */
+  .keys-list { display: flex; flex-direction: column; gap: 1px; max-height: 56vh; overflow-y: auto; margin: 0 -4px; }
+  .key-row { display: flex; align-items: center; gap: 10px; padding: 5px 8px; border-radius: var(--radius-sm); }
+  .key-row:hover { background: var(--surface-hover); }
+  .key-row.static:hover { background: transparent; }
+  .key-label { flex: 1; font-size: 12.5px; color: var(--text-primary); }
+  .key-combo { min-width: 92px; padding: 3px 10px; text-align: center; font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: var(--text-primary); background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--radius-sm); cursor: pointer; transition: border-color 120ms var(--ease); }
+  .key-combo:hover { border-color: var(--accent); }
+  .key-combo.recording { border-color: var(--accent); color: var(--accent); background: rgba(0,122,255,0.12); }
+  .key-combo.fixed { cursor: default; color: var(--text-tertiary); border-style: dashed; }
+  .key-combo.fixed:hover { border-color: var(--border-strong); }
+  .icon-spacer { width: 24px; }
 
   /* ─── titlebar + tabs ────────────────────────────────────────────────── */
   .content { display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--bg-app); }
@@ -2475,6 +3054,7 @@
     border-bottom: 1px solid var(--border);
   }
   .traffic-pad { width: 68px; flex: none; }
+  :global(body.win) .traffic-pad { width: 0; }
   .tb-title {
     font-size: 13px;
     font-weight: 600; /* headline */
@@ -2696,7 +3276,25 @@
     color: var(--text-tertiary);
   }
   .pane.active .pane-bar { color: var(--text-secondary); }
+  .pane-left { display: flex; align-items: center; gap: 6px; min-width: 0; flex: 1; }
   .pane-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* statut vivant du pane (working / waiting / done) */
+  .pstat { display: inline-flex; align-items: center; gap: 4px; flex: none; max-width: 55%; }
+  .pstat :global(svg) { flex: none; }
+  .pstat-label {
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    font-family: var(--mono, ui-monospace, monospace); font-size: 10.5px;
+  }
+  .pstat.working { color: var(--accent); }
+  .pstat.waiting { color: var(--attention); }
+  .pstat.done { color: var(--success); animation: stat-fade 4s var(--ease) forwards; }
+  @keyframes stat-fade { 0%, 40% { opacity: 1; } 100% { opacity: 0.45; } }
+  /* statut compact sur les lignes de session */
+  .sstat { display: inline-flex; flex: none; }
+  .sstat.working { color: var(--accent); }
+  .sstat.waiting { color: var(--attention); }
+  .sstat.done { color: var(--success); }
   .pane-btns { display: flex; align-items: center; gap: 1px; opacity: 0; transition: opacity 120ms; }
   .pane:hover .pane-btns { opacity: 1; }
   .pane-btns .icon-btn { width: 20px; height: 20px; }
@@ -2813,6 +3411,7 @@
   .f-pair .grow { flex: 1; }
   .f-port { width: 80px; flex: none; }
   .f-check { flex-direction: row !important; align-items: center; gap: 8px !important; font-size: 12.5px; color: var(--text-secondary); }
+  .f-check.sub-check { margin-left: 22px; margin-top: -4px; font-size: 12px; color: var(--text-tertiary); }
   .f-check code { font-size: 11px; background: var(--surface); border-radius: 3px; padding: 0 4px; }
   .f-hint { margin: -4px 0 0; font-size: 11.5px; color: var(--text-tertiary); }
   .sheet-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 6px; }
@@ -2843,7 +3442,18 @@
     font-family: inherit;
   }
   .font-opt:hover { background: var(--accent); color: #fff; }
+  .font-opt.cur { color: var(--accent); }
+  .font-opt.cur:hover { color: #fff; }
   .font-empty { padding: 8px 10px; font-size: 12px; color: var(--text-tertiary); }
+  .font-field { display: flex; gap: 4px; align-items: center; }
+  .font-field input { flex: 1; }
+  .font-reset { flex: none; }
+  .link-btn {
+    display: inline-flex; align-items: center; gap: 5px; align-self: flex-start;
+    margin: -4px 0 0; padding: 2px 0; background: none; border: none;
+    color: var(--accent); font-size: 12px; font-family: inherit;
+  }
+  .link-btn:hover { text-decoration: underline; }
 
   /* éditeur de thème personnalisé */
   .theme-editor { display: flex; flex-direction: column; gap: 10px; padding: 10px; background: var(--surface); border-radius: var(--radius-sm); }
@@ -2896,19 +3506,23 @@
   }
   .attention {
     display: flex;
-    align-items: center;
-    gap: 4px;
+    flex-direction: column;
+    gap: 6px;
     background: rgba(50, 50, 50, 0.85);
     backdrop-filter: blur(30px) saturate(180%);
     border: 1px solid rgba(255, 255, 255, 0.12);
-    border-left: 2px solid var(--attention);
     border-radius: var(--radius-lg);
     padding: 7px 8px;
     font-size: 12.5px;
     box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
     animation: toast-in 150ms var(--ease);
   }
-  .attention.stop { border-left-color: var(--success); }
+  .attention.hasopts { min-width: 260px; }
+  .att-head { display: flex; align-items: center; gap: 6px; }
+  .att-icon { display: inline-flex; flex: none; color: var(--attention); }
+  .att-icon.stop { color: var(--success); }
+  .attention .choice { background: rgba(255, 255, 255, 0.1); color: var(--text-primary); }
+  .attention .agent-q { color: var(--text-secondary); padding: 0 4px; }
   .att-msg {
     flex: 1;
     background: none;
