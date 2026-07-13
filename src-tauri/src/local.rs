@@ -120,7 +120,18 @@ pub async fn local_connect(
 ) -> Result<(), String> {
     // Windows n'a pas de $SHELL ni de flag `-l` : PowerShell, présent partout.
     #[cfg(windows)]
-    let mut cmd = CommandBuilder::new("powershell.exe");
+    let mut cmd = {
+        let mut c = CommandBuilder::new("powershell.exe");
+        // portable-pty démarre avec un environnement VIDE. Sans PATH, le chemin
+        // relatif "powershell.exe" est introuvable → le terminal local ne
+        // démarrait pas sous Windows. On hérite de l'env du process parent
+        // (comme un vrai terminal), ce qui fournit aussi USERPROFILE, APPDATA,
+        // PSModulePath… nécessaires au bon fonctionnement de PowerShell.
+        for (k, v) in std::env::vars_os() {
+            c.env(k, v);
+        }
+        c
+    };
     #[cfg(not(windows))]
     let mut cmd = {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
@@ -132,6 +143,56 @@ pub async fn local_connect(
     if let Some(home) = dirs::home_dir() {
         cmd.cwd(home);
     }
+    spawn_in_pty(app, &state, session_id, cols, rows, cmd).await
+}
+
+/// Transport « ssh système » : lance le binaire `ssh` d'OpenSSH dans un PTY, au
+/// lieu de la pile russh interne. On délègue TOUT à OpenSSH → compatibilité
+/// parfaite (tous formats de clé, ~/.ssh/config, ssh-agent, ProxyJump,
+/// known_hosts, passphrase saisie dans le terminal). En échange : pas de SFTP /
+/// forwards / métriques / tmux -CC (qui vivent sur le canal de contrôle russh).
+#[tauri::command]
+pub async fn ssh_pty_connect(
+    app: AppHandle,
+    state: State<'_, SshState>,
+    session_id: String,
+    cols: u32,
+    rows: u32,
+    host: String,
+    port: u16,
+    user: String,
+    key_path: String,
+    auth: Option<String>,
+    exec_cmd: Option<String>,
+) -> Result<(), String> {
+    let mut cmd = CommandBuilder::new("ssh");
+    // hériter l'env : PATH (trouver ssh), SSH_AUTH_SOCK (agent), HOME (~/.ssh/config)
+    for (k, v) in std::env::vars_os() {
+        cmd.env(k, v);
+    }
+    cmd.arg("-p");
+    cmd.arg(port.to_string());
+    cmd.arg("-t"); // force un PTY distant (nécessaire pour tmux / TUI même avec une commande)
+    // TOFU auto (comme russh) + keepalive pour détecter les coupures
+    for o in [
+        "StrictHostKeyChecking=accept-new",
+        "ServerAliveInterval=15",
+        "ServerAliveCountMax=3",
+    ] {
+        cmd.arg("-o");
+        cmd.arg(o);
+    }
+    if auth.as_deref() == Some("key") && !key_path.is_empty() {
+        cmd.arg("-i");
+        cmd.arg(crate::ssh::expand_tilde(&key_path));
+        cmd.arg("-o");
+        cmd.arg("IdentitiesOnly=yes");
+    }
+    cmd.arg(format!("{user}@{host}"));
+    if let Some(c) = exec_cmd.filter(|c| !c.is_empty()) {
+        cmd.arg(c); // commande distante (snippet tmux) exécutée via le shell distant
+    }
+    cmd.env("TERM", "xterm-256color");
     spawn_in_pty(app, &state, session_id, cols, rows, cmd).await
 }
 

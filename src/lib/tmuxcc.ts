@@ -61,6 +61,15 @@ export function layPanes(lay: Lay): string[] {
   return lay.paneId ? [lay.paneId] : lay.children!.flatMap(layPanes);
 }
 
+/** Taille (colonnes×lignes) de chaque panneau, telle que tmux la découpe. La
+ *  grille xterm doit s'y caler EXACTEMENT, sinon le TUI se réécrit par-dessus. */
+export function layPaneSizes(lay: Lay): Record<string, { w: number; h: number }> {
+  const out: Record<string, { w: number; h: number }> = {};
+  const walk = (l: Lay) => (l.paneId != null ? (out[l.paneId] = { w: l.w, h: l.h }) : l.children!.forEach(walk));
+  walk(lay);
+  return out;
+}
+
 /** Encode une saisie (string xterm) en octets hex pour `send-keys -H`. */
 export function toHexKeys(data: string): string {
   return Array.from(new TextEncoder().encode(data), (b) => b.toString(16).padStart(2, "0")).join(" ");
@@ -146,6 +155,7 @@ export function demo() {
   const lh = parseLayout("e9b4,80x24,0,0{40x24,0,0,1,39x24,41,0,2}");
   eq(lh.dir, "h", "layout h");
   eq(layPanes(lh), ["1", "2"], "layout panes");
+  eq(layPaneSizes(lh), { "1": { w: 40, h: 24 }, "2": { w: 39, h: 24 } }, "layout pane sizes");
   eq(layToTree(lh, (p) => ({ leaf: p })), { dir: "h", ratio: 40 / 79, a: { leaf: "1" }, b: { leaf: "2" } }, "toTree");
   eq(toHexKeys("hi"), "68 69", "hex");
 

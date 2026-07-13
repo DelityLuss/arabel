@@ -11,8 +11,11 @@
   import { WebLinksAddon } from "@xterm/addon-web-links";
   import { WebglAddon } from "@xterm/addon-webgl";
   import "@xterm/xterm/css/xterm.css";
-  import { onDestroy } from "svelte";
-  import { TmuxControl, parseLayout, layToTree, layPanes, toHexKeys, demo as tmuxccDemo, type Lay } from "$lib/tmuxcc";
+  import { onDestroy, type Snippet } from "svelte";
+  import { fade, fly, scale } from "svelte/transition";
+  import { flip } from "svelte/animate";
+  import { TmuxControl, parseLayout, layToTree, layPanes, layPaneSizes, toHexKeys, demo as tmuxccDemo, type Lay } from "$lib/tmuxcc";
+  import { version as appVersion } from "../../package.json";
 
   // ─── mode démo (aperçu navigateur sans Tauri) ─────────────────────────────
   const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -23,8 +26,8 @@
   // Modificateur applicatif : ⌘ sur macOS, Ctrl+Maj ailleurs. Ctrl seul reste au
   // terminal (^C, ^F, ^K…), donc on ne le capture jamais côté Windows/Linux.
   const appMod = (e: KeyboardEvent) => (isMac ? e.metaKey : e.ctrlKey && e.shiftKey);
-  // Coffre système où keyring range les secrets (libellé UI selon l'OS).
-  const secretStore = isMac ? "the macOS Keychain" : "the system credential manager";
+  // Libellé UI du coffre où arabel range les secrets (fichier chiffré local).
+  const secretStore = "Arabel's encrypted vault";
   // Sans les feux macOS (fenêtre décorée nativement sur Windows), on récupère
   // l'espace réservé en haut de la barre latérale / titlebar.
   if (typeof document !== "undefined") document.body.classList.toggle("win", !isMac);
@@ -81,7 +84,7 @@
   // ─── types ────────────────────────────────────────────────────────────────
   type Identity = { id: string; name: string; keyPath: string; hasPassphrase: boolean };
   type AuthKind = "key" | "password" | "agent";
-  type Remote = { id: string; name: string; host: string; port: number; user: string; identityId: string; auth?: AuthKind; claude?: boolean; autoLaunch?: boolean; dir?: string; tmux?: boolean; mosh?: boolean };
+  type Remote = { id: string; name: string; host: string; port: number; user: string; identityId: string; auth?: AuthKind; claude?: boolean; autoLaunch?: boolean; dir?: string; tmux?: boolean; mosh?: boolean; sysSsh?: boolean };
   type ImportHost = { host: string; hostName: string; user: string; port: number; identityFile: string };
   type PaneNode = { leaf: string } | { dir: "h" | "v"; ratio: number; a: PaneNode; b: PaneNode };
   type Tab = { id: string; root: PaneNode | null; active: string | null; projectId: string | null; cc?: string };
@@ -101,10 +104,11 @@
     | { type: "connections" }
     | { type: "settings" }
     | { type: "palette"; filter: string }
+    | { type: "configImport"; text: string }
     | null;
 
   // pseudo-remote pour le terminal local
-  const LOCAL: Remote = { id: "local", name: "This Mac", host: "", port: 0, user: "", identityId: "" };
+  const LOCAL: Remote = { id: "local", name: isMac ? "This Mac" : "This PC", host: "", port: 0, user: "", identityId: "" };
 
   // ─── thèmes terminal ──────────────────────────────────────────────────────
   const THEMES: Record<string, ITheme> = {
@@ -234,18 +238,59 @@
     remotes = data.remotes ?? [];
     projects = data.projects ?? [];
     settings = { ...settings, ...data.settings };
+    savedTitles = data.titles ?? {}; // noms de terminaux (avant restore : sessLabel les relira par key)
     restoreWorkspace(data.workspace);
     loaded = true;
   });
 
   async function save() {
+    // purge les noms de terminaux fermés : on ne garde que les keys encore
+    // référencées — sessions ouvertes + vues de projet (fermées mais persistées).
+    const keep = new Set<string>();
+    for (const s of sessions.values()) keep.add(s.key);
+    for (const p of projects) for (const v of projectViews(p)) for (const leaf of projLeaves(v)) if (leaf.id) keep.add(leaf.id);
+    const pruned = Object.fromEntries(Object.entries(savedTitles).filter(([k]) => keep.has(k)));
+    if (Object.keys(pruned).length !== Object.keys(savedTitles).length) savedTitles = pruned;
     await rpc("store_save", {
       data: JSON.stringify({
         identities, remotes, projects,
         settings: $state.snapshot(settings),
         workspace: snapshotWorkspace(),
+        titles: $state.snapshot(savedTitles),
       }),
     });
+  }
+
+  // ─── partage de config entre postes (Mac ↔ Windows…) ─────────────────────
+  // Copie/colle un instantané de la config via le presse-papiers. AUCUN secret
+  // dedans : mots de passe & passphrases restent dans le coffre chiffré local
+  // (à ressaisir sur l'autre poste, ou utiliser ssh-agent qui ne stocke rien côté arabel).
+  function exportConfig() {
+    const json = JSON.stringify({ v: 1, remotes, identities, projects, settings: $state.snapshot(settings) }, null, 2);
+    const done = () => toast("Config copied — paste it on your other PC to import", "success");
+    if (inTauri) writeText(json).then(done).catch((e) => toast(String(e), "error"));
+    else navigator.clipboard?.writeText(json).then(done).catch(() => toast("Copy failed", "error"));
+  }
+  function importConfig(json: string) {
+    let data: any;
+    try { data = JSON.parse(json); } catch { return toast("Invalid config — not valid JSON", "error"); }
+    if (!data || typeof data !== "object") return toast("Invalid config", "error");
+    // union par id, la version importée gagne ; les entrées propres au poste restent.
+    const mergeById = <T extends { id: string }>(cur: T[], inc: unknown): T[] => {
+      if (!Array.isArray(inc)) return cur;
+      const m = new Map(cur.map((x) => [x.id, x]));
+      for (const x of inc as T[]) if (x && x.id) m.set(x.id, x);
+      return [...m.values()];
+    };
+    const n = Array.isArray(data.remotes) ? data.remotes.length : 0;
+    remotes = mergeById(remotes, data.remotes);
+    identities = mergeById(identities, data.identities);
+    projects = mergeById(projects, data.projects);
+    if (data.settings && typeof data.settings === "object") settings = { ...settings, ...data.settings };
+    save();
+    applySettings();
+    modal = null;
+    toast(`Imported ${n} remote${n === 1 ? "" : "s"} + identities, projects & settings`, "success");
   }
 
   // ré-ouvre les onglets tels qu'ils étaient à la fermeture (les sessions tmux
@@ -298,7 +343,7 @@
     const proj = t.projectId && projects.find((p) => p.id === t.projectId);
     if (proj) return proj.name;
     const sid = firstLeaf(t.root);
-    return (sid && sessions.get(sid)?.remote.name) || "new tab";
+    return (sid && sessLabel(sid)) || "new tab";
   }
   function newTab() {
     const t: Tab = { id: crypto.randomUUID(), root: null, active: null, projectId: null };
@@ -317,7 +362,14 @@
   $effect(() => {
     const t = tabs.find((x) => x.id === activeTabId);
     if (!t) return;
-    if (t.cc) { const cc = ccSessions.get(t.cc); if (cc) requestAnimationFrame(() => ccResize(cc)); }
+    if (t.cc) {
+      // onglet tmux -CC : on réapplique le layout tmux courant (re-cale chaque
+      // xterm sur la grille tmux + renvoie la taille client), pas de fit conteneur.
+      const cc = ccSessions.get(t.cc);
+      const lay = cc?.activeWindow ? cc.windows.get(cc.activeWindow) : null;
+      if (cc && cc.activeWindow && lay) requestAnimationFrame(() => ccApplyLayout(cc, cc.activeWindow!, lay));
+      return;
+    }
     requestAnimationFrame(() => leaves(t.root).forEach((sid) => sessions.get(sid)?.fit.fit()));
   });
   function onWindowResize() {
@@ -381,6 +433,7 @@
     tmux?: boolean;
     unlisteners: UnlistenFn[];
     webgl: boolean;
+    webglTries?: number; // tentatives de récupération du renderer GPU après perte de contexte
     cc?: { ctrlSid: string; paneId: string }; // panneau piloté en mode contrôle tmux
   };
   const sessions = new Map<string, Sess>();
@@ -399,6 +452,10 @@
       macOptionClickForcesSelection: true,
       scrollback: settings.scrollback,
       lineHeight: settings.lineHeight,
+      allowProposedApi: true, // parité Terax
+      // PAS de smoothScrollDuration/scrollSensitivity : on garde les défauts xterm
+      // = scroll NATIF du navigateur (inertie), le plus fluide (comme Terax). Les
+      // définir fait intercepter/animer la molette par xterm → saccades.
       theme: activeTheme(),
     };
   }
@@ -423,10 +480,17 @@
     // options tmux scoppées à CETTE session (-t, pas -g, pour ne pas toucher les
     // autres sessions de l'utilisateur), appliquées à chaque (ré)attache :
     //  - status : barre de statut (masquée par défaut)
-    //  - mouse on : molette = défilement de l'historique tmux (sinon = flèches → historique de commandes)
+    //  - mouse on : molette = défilement de l'historique tmux (copy-mode)
+    //  - molette rebindée à 2 lignes/cran (défaut tmux = 5) → fini le « 5 par 5 »
+    //    saccadé. Le scroll tmux reste un redraw distant (pas aussi lisse que le
+    //    scrollback natif d'xterm), mais nettement plus fin.
     const sopt =
       `tmux set -t ${n} status ${settings.tmuxStatus ? "on" : "off"} 2>/dev/null; ` +
-      `tmux set -t ${n} mouse on 2>/dev/null; `;
+      `tmux set -t ${n} mouse on 2>/dev/null; ` +
+      `tmux bind -T copy-mode WheelUpPane send -N2 -X scroll-up 2>/dev/null; ` +
+      `tmux bind -T copy-mode WheelDownPane send -N2 -X scroll-down 2>/dev/null; ` +
+      `tmux bind -T copy-mode-vi WheelUpPane send -N2 -X scroll-up 2>/dev/null; ` +
+      `tmux bind -T copy-mode-vi WheelDownPane send -N2 -X scroll-down 2>/dev/null; `;
     return (
       `export PATH="$PATH:/usr/local/bin:/opt/homebrew/bin"; ` + // exec SSH non-interactif = PATH minimal
       `if command -v tmux >/dev/null 2>&1; then ` +
@@ -473,12 +537,24 @@
       return true;
     });
     term.onData(send);
+    // titre auto : le shell/programme peut émettre un titre (OSC 0/2), souvent le
+    // cwd ou la commande — plus parlant que « vps-snpx » répété. Le renommage
+    // manuel reste prioritaire (voir sessLabel).
+    term.onTitleChange((t) => { const v = t.trim(); if (v) autoTitles[sid] = v; });
     return { term, fit, search };
   }
 
   function newSession(remote: Remote, cmd = "", key?: string): string {
     const sid = crypto.randomUUID();
-    const { term, fit, search } = setupTerm(sid, (data) => { lastInput[sid] = Date.now(); onClaudeInput(sid); rpc("ssh_write", { sessionId: sid, data }); });
+    const { term, fit, search } = setupTerm(sid, (data) => {
+      lastInput[sid] = Date.now();
+      // « il repart » : SEULEMENT sur une vraie soumission (Entrée = \r), pas à
+      // chaque frappe ni sur les séquences (focus \x1b[I, Maj+Entrée \x1b\r…),
+      // sinon cliquer/écrire affichait « running » à tort.
+      if (data.includes("\r") && !data.includes("\x1b")) lastSubmit[sid] = Date.now();
+      onClaudeInput(sid);
+      rpc("ssh_write", { sessionId: sid, data });
+    });
     term.onResize(({ cols, rows }) => rpc("ssh_resize", { sessionId: sid, cols, rows }));
     sessions.set(sid, { term, fit, search, remote, cmd, key: key ?? sid, unlisteners: [], webgl: false });
     sessStatus[sid] = { status: "connecting", error: "" };
@@ -531,7 +607,21 @@
         execCmd = tmuxCmd(`arabel-${s.key.slice(0, 8)}`, init.join("; "), s.remote.claude ? sid : null);
       }
       try {
-        if (s.remote.mosh) {
+        if (s.remote.sysSsh) {
+          // transport « ssh système » : délègue à OpenSSH (compat parfaite des clés).
+          // pas de metrics/hooks/SFTP (ils vivent sur le canal de contrôle russh).
+          await rpc("ssh_pty_connect", {
+            sessionId: sid,
+            cols: s.term.cols,
+            rows: s.term.rows,
+            host: s.remote.host,
+            port: Number(s.remote.port),
+            user: s.remote.user,
+            keyPath,
+            auth: authKind,
+            execCmd,
+          });
+        } else if (s.remote.mosh) {
           // transport mosh : UDP, écho prédictif, reprise après coupure (Unix).
           // metrics/hooks/SFTP restent sur russh (canaux indépendants).
           await rpc("mosh_connect", {
@@ -581,14 +671,18 @@
     s.fit.fit();
     rpc("ssh_resize", { sessionId: sid, cols: s.term.cols, rows: s.term.rows });
     if (s.remote.id !== "local") {
-      rpc("metrics_watch", { remoteId: s.remote.id, ...remoteParams(s.remote) }).catch(() => {});
-      if (s.remote.claude) rpc("events_watch", { remoteId: s.remote.id, ...remoteParams(s.remote) }).catch(() => {});
+      // métriques & hooks passent par des canaux russh indépendants → indisponibles
+      // en transport « ssh système » (compromis assumé pour la compat des clés).
+      if (!s.remote.sysSsh) {
+        rpc("metrics_watch", { remoteId: s.remote.id, ...remoteParams(s.remote) }).catch(() => {});
+        if (s.remote.claude) rpc("events_watch", { remoteId: s.remote.id, ...remoteParams(s.remote) }).catch(() => {});
+      }
       if (!s.tmux) {
         // sans tmux : init envoyé dans le shell après connexion (comportement historique)
         if (s.remote.dir) await rpc("ssh_write", { sessionId: sid, data: `cd ${shq(s.remote.dir)} 2>/dev/null\n` });
-        if (s.remote.claude) await rpc("ssh_write", { sessionId: sid, data: `export ARABEL_PANE=${sid}\n` });
+        if (s.remote.claude && !s.remote.sysSsh) await rpc("ssh_write", { sessionId: sid, data: `export ARABEL_PANE=${sid}\n` });
         if (s.cmd) await rpc("ssh_write", { sessionId: sid, data: s.cmd + "\n" });
-        else if (s.remote.claude && s.remote.autoLaunch) claudeSetup(sid, s.remote);
+        else if (s.remote.claude && s.remote.autoLaunch && !s.remote.sysSsh) claudeSetup(sid, s.remote);
       }
     } else {
       if (!inTauri) {
@@ -653,6 +747,7 @@
   }
 
   async function closePane(sid: string) {
+    if (isBrowser(sid)) return closeBrowser(sid); // panneau navigateur : pas de session SSH
     if (sessions.get(sid)?.cc) return ccKill(sid); // panneau tmux : kill-pane
     const st = sessStatus[sid]?.status;
     if (st === "open") {
@@ -688,6 +783,7 @@
     ctrlSid: string; remote: Remote; tabId: string; ctrl: TmuxControl;
     unlisteners: UnlistenFn[]; pending: ((lines: string[], error: boolean) => void)[];
     windows: Map<string, Lay>; activeWindow: string | null; winName: Record<string, string>;
+    lastSize?: { c: number; r: number }; // dernière taille client envoyée (évite une boucle de layout)
   };
   const ccSessions = new Map<string, CcSession>();
   const ccSid = (ctrlSid: string, paneId: string) => `cc:${ctrlSid}:${paneId}`;
@@ -738,14 +834,45 @@
       tab.root = root;
       if (!tab.active || !leaves(root).includes(tab.active)) tab.active = firstLeaf(root);
     }
-    requestAnimationFrame(() => leaves(root).forEach((s) => sessions.get(s)?.fit.fit()));
+    // xterm AUTORITAIRE = tmux : chaque panneau adopte EXACTEMENT la grille que
+    // tmux lui donne dans le layout (et non un fit au conteneur qui divergerait).
+    // C'est ce qui aligne rendu et curseur — y compris en splits multi-panneaux.
+    const sizes = layPaneSizes(lay);
+    requestAnimationFrame(() => {
+      for (const [paneId, { w, h }] of Object.entries(sizes)) {
+        const t = sessions.get(ccSid(cc.ctrlSid, paneId))?.term;
+        if (t && (t.cols !== w || t.rows !== h)) t.resize(w, h);
+      }
+      ccResize(cc); // le conteneur a pu changer → renvoie la taille client à tmux
+    });
   }
+  /** Taille de cellule RÉELLE de la police du terminal (px). Mesurée dans le DOM
+   *  pour ne pas dépendre de constantes fausses : c'est ça qui désalignait tmux
+   *  et le rendu xterm (le TUI se réécrivait par-dessus). */
+  function cellPx(): { w: number; h: number } {
+    const probe = document.createElement("span");
+    probe.textContent = "0".repeat(80);
+    probe.style.cssText = "position:absolute;top:-9999px;white-space:pre;visibility:hidden";
+    probe.style.fontFamily = fontStack(settings.fontFamily);
+    probe.style.fontSize = settings.fontSize + "px";
+    document.body.appendChild(probe);
+    const w = probe.getBoundingClientRect().width / 80;
+    probe.remove();
+    return { w: w || 8, h: Math.round(settings.fontSize * settings.lineHeight) || 16 };
+  }
+  /** Annonce à tmux la taille du CLIENT (en cellules) = l'espace pixel réellement
+   *  dispo ÷ cellule réelle. tmux découpe ensuite les panneaux ; chaque xterm
+   *  adopte la grille annoncée (voir ccApplyLayout). On NE fit PAS ici : xterm est
+   *  piloté par tmux, pas par le conteneur. Le chrome d'un panneau (barre + marges)
+   *  est retiré pour que les panneaux tiennent dans leur conteneur. */
   function ccResize(cc: CcSession) {
     const el = document.querySelector(`[data-tab="${cc.tabId}"]`) as HTMLElement | null;
     if (!el || !el.clientWidth) return;
-    // taille client approximative en cellules → tmux relaie un %layout-change
-    const cols = Math.max(20, Math.floor(el.clientWidth / 8));
-    const rows = Math.max(5, Math.floor(el.clientHeight / 18));
+    const { w, h } = cellPx();
+    const cols = Math.max(20, Math.floor((el.clientWidth - 20) / w)); // -20 : marges G/D du pane-term
+    const rows = Math.max(5, Math.floor((el.clientHeight - 34) / h)); // -34 : barre du panneau (26) + marge bas (8)
+    if (cc.lastSize?.c === cols && cc.lastSize?.r === rows) return; // même taille → pas de refresh (évite une boucle de %layout-change)
+    cc.lastSize = { c: cols, r: rows };
     rpc("ssh_write", { sessionId: cc.ctrlSid, data: `refresh-client -C ${cols}x${rows}\n` });
   }
   async function openTmuxNative(remote: Remote) {
@@ -831,33 +958,80 @@
   function openPicker(opts: { tabId?: string | null; sid?: string | null; dir?: "h" | "v" | null; projectId?: string | null } = {}) {
     modal = { type: "picker", tabId: opts.tabId ?? null, sid: opts.sid ?? null, dir: opts.dir ?? null, projectId: opts.projectId ?? null, filter: "" };
   }
-  function doPick(remote: Remote) {
+  function openLeaf(sid: string) {
+    const tab = activeTab && !activeTab.root ? activeTab : null;
+    if (tab) { tab.root = { leaf: sid }; tab.active = sid; }
+    else { newTab(); const t = tabs[tabs.length - 1]; t.root = { leaf: sid }; t.active = sid; }
+  }
+  /** Insère un panneau (terminal OU navigateur) selon le mode du picker. */
+  function placeLeaf(makeSid: () => string) {
     if (modal?.type !== "picker") return;
     const m = modal;
     modal = null;
-    if (m.cc && !m.dir && !m.projectId && remote.id !== "local") {
-      openTmuxNative(remote);
-      return;
-    }
     if (m.projectId) {
       const p = projects.find((x) => x.id === m.projectId);
       if (!p) return;
-      // vue séparée (nouvel onglet), pas de split auto
-      addProjectTerminal(p, newSession(remote));
+      addProjectTerminal(p, makeSid()); // vue séparée (nouvel onglet), pas de split auto
       persistProject(p);
     } else if (m.dir && m.sid && m.tabId) {
       const tab = tabs.find((t) => t.id === m.tabId);
       if (!tab?.root) return;
-      const newSid = newSession(remote);
+      const newSid = makeSid();
       tab.root = withSplit(tab.root, m.sid, m.dir, newSid);
       tab.active = newSid;
       if (tab.projectId) persistProject(projects.find((p) => p.id === tab.projectId)!);
     } else if (m.tabId) {
       const tab = tabs.find((t) => t.id === m.tabId);
-      if (tab && !tab.root) openInTab(tab, remote);
-      else openRemote(remote);
+      if (tab && !tab.root) { const sid = makeSid(); tab.root = { leaf: sid }; tab.active = sid; }
+      else openLeaf(makeSid());
     } else {
-      openRemote(remote);
+      openLeaf(makeSid());
+    }
+  }
+  function doPick(remote: Remote) {
+    if (modal?.type !== "picker") return;
+    if (modal.cc && !modal.dir && !modal.projectId && remote.id !== "local") {
+      modal = null;
+      openTmuxNative(remote);
+      return;
+    }
+    placeLeaf(() => newSession(remote));
+  }
+
+  // ─── panneaux navigateur (aperçu web intégré à la grille) ────────────────
+  function newBrowser(url = ""): string {
+    const sid = crypto.randomUUID();
+    browsers[sid] = { url, bar: url, reloadKey: 0 };
+    return sid;
+  }
+  function doPickBrowser() { placeLeaf(() => newBrowser()); }
+  function normUrl(u: string): string {
+    u = u.trim();
+    if (!u) return "";
+    if (/^https?:\/\//i.test(u)) return u;
+    // localhost / IP / :port → http (cas dev) ; sinon https
+    const local = /localhost|127\.0\.0\.1|0\.0\.0\.0|^\d{1,3}(\.\d{1,3}){3}|^:\d/.test(u);
+    return (local ? "http://" : "https://") + u;
+  }
+  function browserGo(sid: string) {
+    const b = browsers[sid];
+    if (!b) return;
+    const u = normUrl(b.bar);
+    if (u) browsers[sid] = { ...b, url: u, bar: u };
+  }
+  function reloadBrowser(sid: string) {
+    const b = browsers[sid];
+    if (b) browsers[sid] = { ...b, reloadKey: b.reloadKey + 1 };
+  }
+  function closeBrowser(sid: string) {
+    delete browsers[sid];
+    if (zoomedSid === sid) zoomedSid = null;
+    for (const t of tabs) {
+      if (t.root && leaves(t.root).includes(sid)) {
+        t.root = withoutLeaf(t.root, sid);
+        if (t.active === sid) t.active = firstLeaf(t.root);
+        if (!t.root && tabs.length > 1) closeTab(t);
+      }
     }
   }
 
@@ -1276,6 +1450,52 @@
   // frappe au clavier ne doit PAS le refaire passer en « working » — sinon un
   // agent qui a fini réaffiche « travaille » dès qu'on touche le terminal.
   let paneStatus = $state<Record<string, "working" | "waiting" | "done">>({});
+  // noms de terminaux : renommage manuel (prioritaire) + titre émis par le shell
+  // (séquence OSC, ex. cwd/commande) en repli. Sinon → nom du remote (+ cmd).
+  // savedTitles est indexé par la key STABLE du panneau (nom tmux, persistée dans
+  // le workspace via serializeTree.id) → les noms survivent aux redémarrages.
+  let savedTitles = $state<Record<string, string>>({});
+  let autoTitles = $state<Record<string, string>>({});
+  let renamingSid = $state<string | null>(null);
+  let renameValue = $state("");
+  // panneaux navigateur (iframe) : vivent dans l'arbre de splits comme un terminal
+  let browsers = $state<Record<string, { url: string; bar: string; reloadKey: number }>>({});
+  const isBrowser = (sid: string) => sid in browsers;
+  function sessLabel(sid: string): string {
+    if (isBrowser(sid)) {
+      const u = browsers[sid]?.url;
+      if (!u) return "New tab";
+      try { return new URL(u).host || u; } catch { return u; }
+    }
+    const s = sessions.get(sid);
+    if (!s) return "";
+    return savedTitles[s.key] || autoTitles[sid] || s.remote.name + (s.cmd ? ` — ${s.cmd}` : "");
+  }
+  function startRename(sid: string) {
+    if (isBrowser(sid)) return; // un navigateur s'intitule par son URL
+    renamingSid = sid;
+    renameValue = sessLabel(sid); // pré-rempli avec le nom affiché, éditable
+  }
+  function commitRename() {
+    if (!renamingSid) return;
+    const s = sessions.get(renamingSid);
+    const v = renameValue.trim();
+    if (s) {
+      if (v) savedTitles[s.key] = v;
+      else delete savedTitles[s.key]; // vide → repli sur titre auto / nom du remote
+      save(); // persiste le nom tout de suite (un renommage ne change pas la structure)
+    }
+    renamingSid = null;
+  }
+  // valide au blur, mais ignore un blur transitoire (re-render) : on ne conclut
+  // qu'au frame suivant, si aucun champ de renommage n'a repris le focus.
+  function renameBlur() {
+    requestAnimationFrame(() => {
+      const a = document.activeElement;
+      const stillEditing = a instanceof HTMLInputElement && (a.classList.contains("row-rename") || a.classList.contains("pane-rename"));
+      if (renamingSid && !stillEditing) commitRename();
+    });
+  }
   // horloge de rafraîchissement : le buffer xterm change sans passer par notre
   // code, donc on ré-évalue le statut visuel du terminal toutes les 500 ms.
   let liveTick = $state(0);
@@ -1288,6 +1508,7 @@
   // générique (process qui tourne) et à tuer le faux « done » après un envoi.
   const lastOut: Record<string, number> = {};
   const lastInput: Record<string, number> = {};
+  const lastSubmit: Record<string, number> = {}; // dernière vraie soumission (Entrée)
   let notifOk = false;
   if (inTauri) {
     (async () => {
@@ -1372,7 +1593,7 @@
       // pane Claude : PAS de détection par volume de sortie — sa TUI se redessine
       // en continu (curseur, footer), ce qui faisait clignoter « running » en
       // permanence. On s'appuie sur les marqueurs ci-dessus + les hooks.
-      if (now - (lastInput[sid] ?? 0) < 2000) return "working"; // tu viens d'envoyer → il repart (pas « done »)
+      if (now - (lastSubmit[sid] ?? 0) < 2000) return "working"; // tu viens d'envoyer (Entrée) → il repart (pas « done »)
       const h = paneStatus[sid];
       if (h === "waiting") return "waiting";
       if (h === "working" && activity[sid] && now - activity[sid].at < 15000) return "working"; // hook d'outil récent
@@ -1547,7 +1768,9 @@
   function activeSshRemote(): Remote | null {
     const sid = activeTab?.active;
     const r = sid ? sessions.get(sid)?.remote : null;
-    return r && r.id !== "local" ? r : null;
+    // sysSsh : SFTP / forwards / métriques passent par russh, indisponibles → on
+    // masque ces affordances pour ces remotes.
+    return r && r.id !== "local" && !r.sysSsh ? r : null;
   }
   function joinPath(p: string, n: string): string {
     return p === "/" ? `/${n}` : `${p}/${n}`;
@@ -1770,6 +1993,17 @@
     sessions.get(sid)?.term.focus();
   }
 
+  /** Coupe le menu contextuel natif du webview (Recharger, Inspecter…) : look
+   *  d'app native. On garde le menu natif dans les champs de formulaire (hors
+   *  terminal) pour le copier/coller ; le terminal gère son propre clic droit. */
+  function globalContextMenu(e: MouseEvent) {
+    const t = e.target as HTMLElement | null;
+    if (t && !t.closest(".pane-term")) {
+      if (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable) return;
+    }
+    e.preventDefault();
+  }
+
   // ─── menu natif + raccourcis ─────────────────────────────────────────────
   listen<string>("menu", (ev) => {
     const sid = activeTab?.active;
@@ -1819,7 +2053,7 @@
   }
   type Binding = { id: string; label: string; scope: "window" | "term"; run: (sid: string | null) => void };
   const KEYBINDINGS: Binding[] = [
-    { id: "palette", label: "Command palette", scope: "window", run: () => (modal = modal?.type === "palette" ? null : { type: "palette", filter: "" }) },
+    { id: "palette", label: "Command palette", scope: "window", run: () => { modal = modal?.type === "palette" ? null : { type: "palette", filter: "" }; paletteSel = 0; } },
     { id: "new-connection", label: "New terminal / connection", scope: "window", run: () => openPicker() },
     { id: "close-pane", label: "Close pane", scope: "window", run: () => { const sid = activeTab?.active; if (sid) closePane(sid); else if (activeTab) closeTab(activeTab); } },
     { id: "split-h", label: "Split right", scope: "window", run: () => { const sid = activeTab?.active; if (sid && activeTab) openPicker({ tabId: activeTab.id, sid, dir: "h" }); } },
@@ -1909,8 +2143,9 @@
     requestAnimationFrame(() => sessions.get(sid)?.fit.fit());
   }
 
-  // palette ⌘P : panneaux ouverts, projets, remotes
-  type PaletteItem = { icon: "remote" | "project" | "pane" | "local"; label: string; sub: string; run: () => void };
+  // palette ⌘P : panneaux ouverts, projets, remotes, commandes
+  let paletteSel = $state(0);
+  type PaletteItem = { icon: "remote" | "project" | "pane" | "local" | "action"; label: string; sub: string; run: () => void; kbd?: string };
   function paletteItems(): PaletteItem[] {
     const items: PaletteItem[] = [];
     for (const t of tabs) {
@@ -1930,8 +2165,30 @@
     items.push({ icon: "local", label: LOCAL.name, sub: "new terminal", run: () => openRemote(LOCAL) });
     for (const r of remotes)
       items.push({ icon: "remote", label: r.name, sub: `${r.user}@${r.host}`, run: () => openRemote(r) });
+    for (const b of KEYBINDINGS)
+      if (b.scope === "window" && b.id !== "palette")
+        items.push({ icon: "action", label: b.label, sub: "command", kbd: formatCombo(keyOf(b.id)), run: () => b.run(activeTab?.active ?? null) });
     return items;
   }
+  function filteredPalette(filter: string): PaletteItem[] {
+    const q = filter.toLowerCase();
+    return paletteItems().filter((it) => (it.label + " " + it.sub).toLowerCase().includes(q)).slice(0, 40);
+  }
+  // ferme la palette AVANT d'exécuter : l'action peut rouvrir sa propre modale (picker, réglages)
+  function runPalette(it: PaletteItem) { modal = null; it.run(); }
+  function paletteNav(e: KeyboardEvent, filter: string) {
+    const items = filteredPalette(filter);
+    const n = items.length;
+    if (e.key === "ArrowDown") { e.preventDefault(); paletteSel = n ? (paletteSel + 1) % n : 0; }
+    else if (e.key === "ArrowUp") { e.preventDefault(); paletteSel = n ? (paletteSel - 1 + n) % n : 0; }
+    else if (e.key === "Enter") { e.preventDefault(); const it = items[paletteSel] ?? items[0]; if (it) runPalette(it); }
+  }
+  // garde la ligne sélectionnée visible quand on navigue au clavier
+  $effect(() => {
+    if (modal?.type !== "palette") return;
+    paletteSel;
+    requestAnimationFrame(() => document.querySelector(".palette-list .row.sel")?.scrollIntoView({ block: "nearest" }));
+  });
   // ─── montage xterm ────────────────────────────────────────────────────────
   function b64ToBytes(b64: string): Uint8Array {
     const bin = atob(b64);
@@ -1946,24 +2203,45 @@
     if (s.term.element) node.appendChild(s.term.element);
     else {
       s.term.open(node);
-      if (!s.webgl) {
-        try {
-          const webgl = new WebglAddon();
-          webgl.onContextLoss(() => webgl.dispose());
-          s.term.loadAddon(webgl);
-          s.webgl = true;
-        } catch {
-          /* renderer DOM en secours */
-        }
-      }
+      attachWebgl(s);
     }
     s.fit.fit();
     s.term.focus();
   }
+  /** Branche le renderer GPU (WebGL) et, en cas de perte de contexte, le
+   *  RE-CRÉE au lieu de rester bloqué sur le renderer DOM (lent au scroll) —
+   *  c'est ce qui manquait vs Terax. Cap à 3 tentatives pour éviter la boucle. */
+  function attachWebgl(s: Sess) {
+    if (s.webgl || !s.term.element) return;
+    try {
+      const webgl = new WebglAddon();
+      webgl.onContextLoss(() => {
+        webgl.dispose();
+        s.webgl = false;
+        if ((s.webglTries ?? 0) < 3) {
+          s.webglTries = (s.webglTries ?? 0) + 1;
+          setTimeout(() => attachWebgl(s), 400); // récupère le renderer GPU
+        } else {
+          console.warn("[arabel] WebGL keeps losing its context → staying on the DOM renderer (scroll less smooth)");
+        }
+      });
+      s.term.loadAddon(webgl);
+      s.webgl = true;
+    } catch (e) {
+      // WebGL indisponible (ex. WKWebView capricieux) → renderer DOM, scroll moins fluide
+      console.warn("[arabel] WebGL renderer unavailable → DOM renderer (scroll may be less smooth):", e);
+    }
+  }
   function mountTerm(node: HTMLElement, sid: string) {
     attach(node, sid);
     let current = sid;
-    const ro = new ResizeObserver(() => sessions.get(current)?.fit.fit());
+    const ro = new ResizeObserver(() => {
+      const s = sessions.get(current);
+      // panneau tmux -CC : xterm est piloté par tmux → on prévient tmux (il
+      // redécoupe et renvoie un layout), on ne fit PAS au conteneur.
+      if (s?.cc) { const cc = ccSessions.get(s.cc.ctrlSid); if (cc) ccResize(cc); }
+      else s?.fit.fit();
+    });
     ro.observe(node);
     return {
       update(newSid: string) {
@@ -1990,7 +2268,7 @@
 </script>
 
 <!-- empêche le webview de « naviguer » vers un fichier déposé hors zone -->
-<svelte:window onkeydown={globalKeydown} onresize={onWindowResize} ondragover={(e) => e.preventDefault()} ondrop={(e) => e.preventDefault()} />
+<svelte:window onkeydown={globalKeydown} oncontextmenu={globalContextMenu} onresize={onWindowResize} ondragover={(e) => e.preventDefault()} ondrop={(e) => e.preventDefault()} />
 
 <!-- ─── icônes ─────────────────────────────────────────────────────────── -->
 {#snippet choiceBtns(att: Attention)}
@@ -2029,6 +2307,9 @@
 {#snippet iAlert()}<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><circle cx="8" cy="8" r="6"/><path d="M8 5v3.5M8 10.8v.2"/></svg>{/snippet}
 {#snippet iCheck()}<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></svg>{/snippet}
 {#snippet iSearch()}<svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5 14 14"/></svg>{/snippet}
+{#snippet iLogo()}<svg width="18" height="18" viewBox="0 0 20 20" fill="none"><rect x="1" y="1" width="18" height="18" rx="5.5" fill="var(--accent)"/><path d="M6 7l3 3-3 3M11 13.5h3.5" stroke="#fff" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>{/snippet}
+{#snippet iCopy()}<svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M10.5 5.5V4a1.5 1.5 0 0 0-1.5-1.5H4A1.5 1.5 0 0 0 2.5 4v5A1.5 1.5 0 0 0 4 10.5h1.5"/></svg>{/snippet}
+{#snippet iClipboard()}<svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"><rect x="3.5" y="3" width="9" height="11" rx="1.5"/><path d="M6 3V2.2c0-.4.3-.7.7-.7h2.6c.4 0 .7.3.7.7V3"/></svg>{/snippet}
 
 <!-- icône par outil : « ce que l'agent fait » d'un coup d'œil -->
 {#snippet toolIcon(tool: string)}
@@ -2076,10 +2357,19 @@
 {/snippet}
 
 {#snippet remoteRow(r: Remote, onPick: (r: Remote) => void, withActions: boolean)}
+  {@const auth = r.auth ?? "key"}
+  {@const sub = auth === "key" ? (identities.find((i) => i.id === r.identityId)?.name ?? "no key") : auth}
   <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
-  <div class="row" onclick={() => onPick(r)} title={r.id === "local" ? "Local shell" : `${r.user}@${r.host}:${r.port}`}>
+  <div class="row" class:mgr={withActions} onclick={() => onPick(r)} title={r.id === "local" ? "Local shell" : `${r.user}@${r.host}:${r.port}`}>
     <span class="row-icon">{#if r.id === "local"}{@render iLaptop()}{:else}{@render iTerminal()}{/if}</span>
-    <span class="row-label">{r.name}</span>
+    {#if withActions}
+      <span class="row-main">
+        <span class="row-label">{r.name}</span>
+        <span class="row-sub">{r.user}@{r.host}:{r.port} · {sub}</span>
+      </span>
+    {:else}
+      <span class="row-label">{r.name}</span>
+    {/if}
     {#if r.claude}<span class="row-tag">claude</span>{/if}
     {#if remoteAttention(r.id)}<span class="dot attention"></span>{/if}
     {#if withActions}{@render rowActions(r.id, () => editRemote(r, true), () => deleteRemote(r))}{/if}
@@ -2098,7 +2388,7 @@
     class:drop-before={dropRow?.sid === sid && dropRow.mode === "before"}
     class:drop-after={dropRow?.sid === sid && dropRow.mode === "after"}
     class:drop-merge={dropRow?.sid === sid && dropRow.mode === "merge"}
-    draggable="true"
+    draggable={renamingSid !== sid}
     ondragstart={(e) => {
       dragSid = sid;
       e.dataTransfer?.setData("text/plain", sid);
@@ -2107,20 +2397,67 @@
     ondragend={() => { dragSid = null; dropTarget = null; dropRow = null; }}
     {...paneDropzone(sid, sub)}
     onclick={() => focusPane(tab, sid)}>
-    <span class="row-icon">{#if s?.remote.id === "local"}{@render iLaptop()}{:else}{@render iTerminal()}{/if}</span>
-    <span class="row-label">{s?.remote.name}{s?.cmd ? ` — ${s.cmd}` : ""}</span>
-    {#if sessStatus[sid]?.status === "connecting"}<span class="row-spin">{@render iSpinner(11)}</span>
+    <span class="row-icon">{#if isBrowser(sid)}{@render iGlobe()}{:else if s?.remote.id === "local"}{@render iLaptop()}{:else}{@render iTerminal()}{/if}</span>
+    {#if renamingSid === sid}
+      <input class="row-rename" bind:value={renameValue} use:autofocus
+        onclick={(e) => e.stopPropagation()}
+        onkeydown={(e) => { e.stopPropagation(); if (e.key === "Enter") commitRename(); else if (e.key === "Escape") renamingSid = null; }}
+        onblur={renameBlur} />
+    {:else}
+      <span class="row-label" ondblclick={(e) => { e.stopPropagation(); startRename(sid); }} title="Double-click to rename">{sessLabel(sid)}</span>
+    {/if}
+    {#if isBrowser(sid)}<!-- navigateur : pas de statut -->
+    {:else if sessStatus[sid]?.status === "connecting"}<span class="row-spin">{@render iSpinner(11)}</span>
+    {:else if sessStatus[sid]?.status === "error" || sessStatus[sid]?.status === "closed"}<span class="sstat error" title="Disconnected — reconnecting">{@render iAlert()}</span>
     {:else if st === "waiting"}<span class="sstat waiting" title="Waiting for your input">{@render iAlert()}</span>
     {:else if st === "working"}<span class="sstat working" title={activity[sid]?.label ?? "running…"}>{@render iSpinner(11)}</span>
     {:else if st === "done"}<span class="sstat done" title="Finished">{@render iCheck()}</span>{/if}
     <span class="row-actions">
+      {#if !isBrowser(sid)}<button class="icon-btn" title="Rename (or double-click)" onclick={(e) => { e.stopPropagation(); startRename(sid); }}>{@render iPencil()}</button>{/if}
       <button class="icon-btn" title="Close" onclick={(e) => { e.stopPropagation(); closePane(sid); }}>{@render iClose()}</button>
     </span>
   </div>
 {/snippet}
 
+{#snippet browserPane(tab: Tab, sid: string)}
+  {@const b = browsers[sid]}
+  <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
+  <div class="pane" class:active={tab.active === sid} class:zoomed={zoomedSid === sid} onclick={() => (tab.active = sid)}>
+    <div class="pane-bar">
+      <span class="pane-left">
+        <span class="browser-ico">{@render iGlobe()}</span>
+        <input
+          class="url-input"
+          bind:value={b.bar}
+          placeholder="localhost:5173 — type a URL, ⏎ to go"
+          onclick={(e) => e.stopPropagation()}
+          onkeydown={(e) => { e.stopPropagation(); if (e.key === "Enter") browserGo(sid); }} />
+      </span>
+      <span class="pane-btns">
+        <button class="icon-btn" title="Reload" onclick={() => reloadBrowser(sid)}>{@render iRefresh()}</button>
+        <button class="icon-btn" title="Open in system browser" onclick={() => b.url && openInBrowser(b.url)}>{@render iExternal()}</button>
+        <button class="icon-btn" title="Fullscreen (⇧⌘Enter)" onclick={() => toggleZoom(sid)}>{#if zoomedSid === sid}{@render iZoomOut()}{:else}{@render iZoom()}{/if}</button>
+        <button class="icon-btn" title="Split right (⌘D)" onclick={() => openPicker({ tabId: tab.id, sid, dir: "h" })}>{@render iSplitH()}</button>
+        <button class="icon-btn" title="Split down (⇧⌘D)" onclick={() => openPicker({ tabId: tab.id, sid, dir: "v" })}>{@render iSplitV()}</button>
+        <button class="icon-btn" title="Close (⌘W)" onclick={() => closePane(sid)}>{@render iClose()}</button>
+      </span>
+    </div>
+    <div class="browser-body">
+      {#if b.url}
+        {#key b.reloadKey}
+          <iframe class="browser-frame" title="In-app browser" src={b.url}></iframe>
+        {/key}
+      {:else}
+        <div class="browser-empty">{@render iGlobe()}<span>Type a URL above to preview — e.g. <code>localhost:5173</code></span></div>
+      {/if}
+    </div>
+  </div>
+{/snippet}
+
 {#snippet paneTree(tab: Tab, node: PaneNode)}
-  {#if "leaf" in node}
+  {#if "leaf" in node && isBrowser(node.leaf)}
+    {@render browserPane(tab, node.leaf)}
+  {:else if "leaf" in node}
     {@const s = sessions.get(node.leaf)}
     {@const st = sessStatus[node.leaf]}
     <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
@@ -2128,7 +2465,14 @@
       <div class="pane-bar">
         <span class="pane-left">
           {@render paneStat(node.leaf)}
-          <span class="pane-title">{s?.remote.name}{s?.cmd ? ` — ${s.cmd}` : ""}</span>
+          {#if renamingSid === node.leaf}
+            <input class="pane-rename" bind:value={renameValue} use:autofocus
+              onclick={(e) => e.stopPropagation()}
+              onkeydown={(e) => { e.stopPropagation(); if (e.key === "Enter") commitRename(); else if (e.key === "Escape") renamingSid = null; }}
+              onblur={renameBlur} />
+          {:else}
+            <span class="pane-title" ondblclick={(e) => { e.stopPropagation(); startRename(node.leaf); }} title="Double-click to rename">{sessLabel(node.leaf)}</span>
+          {/if}
         </span>
         <span class="pane-btns">
           {#if s && s.remote.id !== "local" && !s.cc}
@@ -2148,7 +2492,7 @@
       </div>
       <div class="pane-term" use:mountTerm={node.leaf} oncontextmenu={(e) => pasteInto(node.leaf, e)}>
         {#if searchState?.sid === node.leaf}
-          <div class="search-bar">
+          <div class="search-bar" transition:fly={{ y: -4, duration: 120 }}>
             <input
               bind:this={searchInput}
               bind:value={searchState.query}
@@ -2164,9 +2508,11 @@
             {#if st.status === "connecting"}
               <span class="veil-spin">{@render iSpinner(18)}</span>
               <span>Connecting to {s?.remote.name}…</span>
+              {#if s && s.remote.id !== "local"}<span class="veil-target">{s.remote.user}@{s.remote.host}:{s.remote.port}</span>{/if}
             {:else if st.status === "error"}
               <span class="veil-warn">{@render iWarn()}</span>
               <span class="veil-msg">{st.error}</span>
+              {#if s && s.remote.id !== "local"}<span class="veil-target">{s.remote.user}@{s.remote.host}:{s.remote.port}{s.remote.auth ? ` · ${s.remote.auth}` : ""}</span>{/if}
               <div class="veil-actions">
                 <button class="btn" onclick={() => connectSession(node.leaf)}>Retry</button>
                 <button class="btn ghost" onclick={() => removeSession(node.leaf)}>Close</button>
@@ -2222,6 +2568,15 @@
   </div>
 {/snippet}
 
+{#snippet emptyState(icon: Snippet, title: string, hint: string, action: { label: string; run: () => void } | null)}
+  <div class="empty">
+    <span class="empty-icon">{@render icon()}</span>
+    <p class="empty-title">{title}</p>
+    {#if hint}<p class="empty-hint">{hint}</p>{/if}
+    {#if action}<button class="btn ghost empty-btn" onclick={action.run}>{action.label}</button>{/if}
+  </div>
+{/snippet}
+
 <main class:no-sidebar={!settings.sidebar}>
   {#if settings.sidebar}
     <aside class="sidebar">
@@ -2239,7 +2594,12 @@
                 {@render sessRow(t, sid, false)}
               {/each}
             {:else}
-              <p class="sb-empty">{dragSid ? "Drop here to remove from project" : "No terminals — ⌘N"}</p>
+              {#if dragSid}
+                <p class="sb-empty">Drop here to remove from project</p>
+              {:else if !tabs.some((t) => t.root)}
+                <!-- rien nulle part (1er lancement) : on guide ; sinon la section reste compacte -->
+                {@render emptyState(iTerminal, "No terminals", "Open a local or SSH session to get started.", { label: "New terminal", run: () => openPicker() })}
+              {/if}
             {/each}
           </div>
 
@@ -2284,14 +2644,24 @@
                 {/if}
               {/if}
             {:else}
-              <p class="sb-empty">Save a layout via the bookmark icon ↗</p>
+              {@render emptyState(iBookmark, "No projects", "Open some terminals, then save the layout with the bookmark button.", null)}
             {/each}
           </div>
         {/if}
       </nav>
-      <button class="sb-settings" onclick={() => (modal = { type: "settings" })}>
-        {@render iGear()}<span>Settings</span>
-      </button>
+      <div class="sb-foot">
+        <button class="sb-settings" onclick={() => (modal = { type: "connections" })}>
+          {@render iTerminal()}<span>Connections</span>
+        </button>
+        <button class="sb-settings" onclick={() => (modal = { type: "settings" })}>
+          {@render iGear()}<span>Settings</span>
+        </button>
+        <div class="sb-brand">
+          <span class="sb-logo">{@render iLogo()}</span>
+          <span class="sb-wordmark">arabel</span>
+          <span class="sb-ver">v{appVersion}</span>
+        </div>
+      </div>
     </aside>
   {/if}
 
@@ -2451,7 +2821,7 @@
 {#if toasts.length}
   <div class="toasts">
     {#each toasts as t (t.id)}
-      <div class="toast {t.kind}">{t.msg}</div>
+      <div class="toast {t.kind}" transition:fly={{ y: 8, duration: 150 }} animate:flip={{ duration: 150 }}>{t.msg}</div>
     {/each}
   </div>
 {/if}
@@ -2460,7 +2830,7 @@
 {#if attentions.length}
   <div class="attentions">
     {#each attentions.slice(-4) as a (a.id)}
-      <div class="attention" class:stop={a.kind === "stop"} class:hasopts={!!a.options?.length}>
+      <div class="attention" class:stop={a.kind === "stop"} class:hasopts={!!a.options?.length} transition:fly={{ y: 8, duration: 150 }} animate:flip={{ duration: 150 }}>
         <div class="att-head">
           <span class="att-icon {a.kind}">{#if a.kind === "stop"}{@render iCheck()}{:else}{@render iAlert()}{/if}</span>
           <button class="att-msg" onclick={() => { gotoAttention(a); dismissAttention(a); }} title="Go to pane">
@@ -2482,8 +2852,8 @@
 <!-- ─── modales ────────────────────────────────────────────────────────── -->
 {#if modal}
   <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
-  <div class="overlay" onclick={() => (modal = null)}>
-    <div class="sheet" class:wide={modal.type === "settings"} onclick={(e) => e.stopPropagation()}>
+  <div class="overlay" onclick={() => (modal = null)} transition:fade={{ duration: 120 }}>
+    <div class="sheet" class:wide={modal.type === "settings"} onclick={(e) => e.stopPropagation()} transition:scale={{ start: 0.96, opacity: 0, duration: 160 }}>
       {#if modal.type === "remote"}
         <h2>{remotes.some((r) => r.id === (modal as any).data.id) ? "Edit remote" : "New remote"}</h2>
         <form onsubmit={(e) => { e.preventDefault(); saveRemote(); }}>
@@ -2511,7 +2881,7 @@
             <label>{@render field("Password")}
               <input type="password" bind:value={modal.password} placeholder={remotes.some((x) => x.id === (modal as any).data.id) ? "(unchanged)" : ""} />
             </label>
-            <p class="f-hint">Stored in {secretStore}, never on disk.</p>
+            <p class="f-hint">Stored encrypted in {secretStore}, on this machine only.</p>
           {:else}
             <p class="f-hint">Uses the keys loaded in your ssh-agent (<code>ssh-add</code>).</p>
           {/if}
@@ -2532,12 +2902,16 @@
             <input type="checkbox" checked={modal.data.tmux !== false} onchange={(e) => { if (modal?.type === "remote") modal.data.tmux = e.currentTarget.checked; }} />
             <span>tmux — persistent sessions (survive disconnects)</span>
           </label>
-          {#if moshOk && modal.data.auth !== "password"}
+          {#if moshOk && modal.data.auth !== "password" && !modal.data.sysSsh}
             <label class="f-check">
               <input type="checkbox" checked={!!modal.data.mosh} onchange={(e) => { if (modal?.type === "remote") modal.data.mosh = e.currentTarget.checked; }} />
               <span>mosh — near-instant echo &amp; resume after drops (UDP; native tmux splits, not control mode)</span>
             </label>
           {/if}
+          <label class="f-check">
+            <input type="checkbox" checked={!!modal.data.sysSsh} onchange={(e) => { if (modal?.type === "remote") modal.data.sysSsh = e.currentTarget.checked; }} />
+            <span>System ssh — use the OpenSSH binary (any key format, ssh-agent, ~/.ssh/config). No SFTP / port-forwarding / metrics.</span>
+          </label>
           <div class="sheet-actions">
             <button type="button" class="btn ghost" onclick={() => (modal = null)}>Cancel</button>
             <button type="submit" class="btn">Save</button>
@@ -2588,6 +2962,12 @@
           <input class="split-filter" bind:value={modal.filter} placeholder="Filter…" use:autofocus />
         {/if}
         <div class="split-list">
+          <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
+          <div class="row" onclick={doPickBrowser} title="Open an in-app web browser pane">
+            <span class="row-icon">{@render iGlobe()}</span>
+            <span class="row-label">Web browser</span>
+            <span class="row-meta">preview localhost / a site</span>
+          </div>
           {@render remoteRow(LOCAL, doPick, false)}
           {#each remotes.filter((r) => r.name.toLowerCase().includes((modal as any).filter.toLowerCase())) as r (r.id)}
             {@render remoteRow(r, doPick, false)}
@@ -2608,36 +2988,58 @@
         <div class="mgr-head">
           <span>SSH remotes</span>
           <span class="mgr-btns">
-            <button class="icon-btn" title="Import remotes (SSH / VS Code)" onclick={openSshImport}>{@render iDownload()}</button>
-            <button class="icon-btn" title="New remote" onclick={() => editRemote(undefined, true)}>{@render iPlus()}</button>
+            <button class="btn ghost sm" title="Import from ~/.ssh/config and VS Code" onclick={openSshImport}>{@render iDownload()}Import</button>
+            <button class="btn ghost sm" onclick={() => editRemote(undefined, true)}>{@render iPlus()}New remote</button>
           </span>
         </div>
         <div class="split-list">
           {#each remotes as r (r.id)}
             {@render remoteRow(r, (x) => editRemote(x, true), true)}
           {:else}
-            <p class="sb-empty">{identities.length ? "No remotes" : "Create an identity first ↓"}</p>
+            {#if identities.length}
+              {@render emptyState(iTerminal, "No remotes", "Add an SSH remote to connect to a server.", { label: "Add a remote", run: () => editRemote(undefined, true) })}
+            {:else}
+              {@render emptyState(iKey, "Add an identity first", "You need an SSH key before you can add a remote.", { label: "Add an identity", run: () => editIdentity(undefined, true) })}
+            {/if}
           {/each}
         </div>
         <div class="mgr-head">
           <span>SSH identities</span>
-          <button class="icon-btn" title="New identity" onclick={() => editIdentity(undefined, true)}>{@render iPlus()}</button>
+          <button class="btn ghost sm" onclick={() => editIdentity(undefined, true)}>{@render iPlus()}New identity</button>
         </div>
         <div class="split-list">
           {#each identities as i (i.id)}
+            {@const uses = remotes.filter((r) => (r.auth ?? "key") === "key" && r.identityId === i.id).length}
             <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
-            <div class="row" onclick={() => editIdentity(i, true)} title={i.keyPath}>
+            <div class="row mgr" onclick={() => editIdentity(i, true)} title={i.keyPath}>
               <span class="row-icon">{@render iKey()}</span>
-              <span class="row-label">{i.name}</span>
-              {#if i.hasPassphrase}<span class="row-meta">🔒</span>{/if}
+              <span class="row-main">
+                <span class="row-label">{i.name}{#if i.hasPassphrase}<span class="row-lock" title="Passphrase protected"> 🔒</span>{/if}</span>
+                <span class="row-sub">{i.keyPath}</span>
+              </span>
+              <span class="row-meta">{uses ? `used by ${uses}` : "unused"}</span>
               {@render rowActions(i.id, () => editIdentity(i, true), () => deleteIdentity(i))}
             </div>
           {:else}
-            <p class="sb-empty">No identities</p>
+            {@render emptyState(iKey, "No identities", "Add an SSH key to authenticate your connections.", { label: "Add an identity", run: () => editIdentity(undefined, true) })}
           {/each}
         </div>
+        <div class="mgr-head"><span>Backup &amp; sync</span></div>
+        <div class="sync-row">
+          <button type="button" class="btn ghost" onclick={exportConfig}>{@render iCopy()}Copy config</button>
+          <button type="button" class="btn ghost" onclick={() => (modal = { type: "configImport", text: "" })}>{@render iClipboard()}Paste config…</button>
+        </div>
+        <p class="f-hint">Moves your remotes, projects &amp; settings to another PC — never passwords or keys.</p>
         <div class="sheet-actions">
           <button class="btn" onclick={() => (modal = null)}>Close</button>
+        </div>
+      {:else if modal.type === "configImport"}
+        <h2>Import config</h2>
+        <p class="f-hint">Paste the config you copied from your other PC, then Import. Existing entries with the same id are updated; the rest is added.</p>
+        <textarea class="config-paste" bind:value={modal.text} spellcheck="false" placeholder={'{ "v": 1, "remotes": [ … ] }'} use:autofocus></textarea>
+        <div class="sheet-actions">
+          <button type="button" class="btn ghost" onclick={() => (modal = { type: "connections" })}>Cancel</button>
+          <button type="button" class="btn" onclick={() => modal?.type === "configImport" && importConfig(modal.text)}>Import</button>
         </div>
       {:else if modal.type === "sshImport"}
         <h2>Import SSH / VS Code remotes</h2>
@@ -2657,23 +3059,23 @@
           <button class="btn" onclick={() => (modal = { type: "connections" })}>Close</button>
         </div>
       {:else if modal.type === "palette"}
-        {@const q = modal.filter.toLowerCase()}
-        {@const items = paletteItems().filter((it) => (it.label + " " + it.sub).toLowerCase().includes(q))}
+        {@const items = filteredPalette(modal.filter)}
         <input
           class="palette-input"
           bind:value={modal.filter}
-          placeholder="Go to… (terminal, project, remote)"
+          placeholder="Go to… or run a command"
           use:autofocus
-          onkeydown={(e) => { if (e.key === "Enter") { e.preventDefault(); items[0]?.run(); modal = null; } }} />
+          oninput={() => (paletteSel = 0)}
+          onkeydown={(e) => paletteNav(e, (modal as { filter: string }).filter)} />
         <div class="split-list palette-list">
-          {#each items.slice(0, 40) as it, i (i)}
+          {#each items as it, i (i)}
             <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
-            <div class="row" onclick={() => { it.run(); modal = null; }}>
+            <div class="row" class:sel={i === paletteSel} onmousemove={() => (paletteSel = i)} onclick={() => runPalette(it)}>
               <span class="row-icon">
-                {#if it.icon === "local"}{@render iLaptop()}{:else if it.icon === "project"}{@render iBookmark()}{:else}{@render iTerminal()}{/if}
+                {#if it.icon === "local"}{@render iLaptop()}{:else if it.icon === "project"}{@render iBookmark()}{:else if it.icon === "action"}{@render iBolt()}{:else}{@render iTerminal()}{/if}
               </span>
               <span class="row-label">{it.label}</span>
-              <span class="row-meta">{it.sub}</span>
+              {#if it.kbd && it.kbd !== "—"}<span class="kbd">{it.kbd}</span>{:else}<span class="row-meta">{it.sub}</span>{/if}
             </div>
           {:else}
             <p class="sb-empty">No results</p>
@@ -2875,19 +3277,41 @@
     min-height: 0;
   }
   .sb-traffic {
-    height: 52px;
+    height: 38px; /* calé sur la titlebar du contenu ; dégage les feux macOS (y=20) */
     flex: none;
     display: flex;
     align-items: center;
     justify-content: flex-end;
     padding: 0 10px;
   }
-  /* Windows/Linux : fenêtre décorée nativement, pas de feux à contourner. */
-  :global(body.win) .sb-traffic { height: 40px; }
+  /* marque de l'app : logo + nom, en pied de sidebar (au-dessus de Settings) —
+     loin des feux macOS, identique sur Windows/Linux */
+  .sb-foot { flex: none; }
+  /* marque discrète (« fantôme ») sous Settings, avec la version */
+  .sb-brand {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    margin: 0 8px 8px;
+    padding: 2px 10px;
+  }
+  .sb-logo { display: flex; flex: none; width: 15px; }
+  .sb-logo :global(svg) { width: 15px; height: 15px; }
+  .sb-wordmark {
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    color: var(--text-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .sb-ver { font-size: 11px; color: var(--text-tertiary); font-variant-numeric: tabular-nums; }
   .sb-toggle { opacity: 0; transition: opacity 120ms; }
   .sidebar:hover .sb-toggle { opacity: 1; }
   .sb-scroll { flex: 1; overflow-y: auto; min-height: 0; padding-bottom: 8px; }
   .sb-section { margin-top: 10px; }
+  .sb-scroll .sb-section:first-child { margin-top: 2px; } /* colle « Terminals » près du haut */
   .sb-head {
     display: flex;
     align-items: center;
@@ -2905,6 +3329,29 @@
     font-style: italic;
     color: var(--text-tertiary);
   }
+  /* état vide : icône + titre + hint + action (sidebar comme modales) */
+  .empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+    gap: 5px;
+    padding: 20px 12px;
+  }
+  .empty-icon {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 36px;
+    height: 36px;
+    margin-bottom: 3px;
+    border-radius: 9px;
+    background: var(--surface-hover);
+    color: var(--text-tertiary);
+  }
+  .empty-title { margin: 0; font-size: 12.5px; font-weight: 500; color: var(--text-secondary); }
+  .empty-hint { margin: 0; font-size: 11.5px; line-height: 1.4; color: var(--text-tertiary); max-width: 230px; }
+  .empty-btn { margin-top: 7px; height: 26px; padding: 0 12px; font-size: 12px; }
   .sb-settings {
     flex: none;
     display: flex;
@@ -2921,6 +3368,7 @@
     transition: background 100ms;
   }
   .sb-settings:hover { background: var(--surface-hover); color: var(--text-primary); }
+  .sb-settings + .sb-settings { margin-top: 0; }
 
   /* rows */
   .row {
@@ -2939,6 +3387,14 @@
   .row:hover { background: var(--surface-hover); }
   .row-icon { display: flex; color: var(--accent); flex: none; } /* icônes teintées accent, comme Finder/Music */
   .row-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+  /* champ de renommage inline (sidebar + barre de pane) */
+  .row-rename, .pane-rename {
+    flex: 1; min-width: 0; width: auto; height: 20px; padding: 0 6px;
+    font-size: 13px; border-radius: 4px; border: 1px solid var(--accent);
+    background: var(--bg-app); color: var(--text-primary);
+  }
+  .pane-rename { flex: none; width: 170px; height: 18px; font-size: 11px; }
+  .row-rename:focus, .pane-rename:focus { box-shadow: none; border-color: var(--accent); }
   .row-meta { font-size: 11px; color: var(--text-tertiary); flex: none; }
   .row-tag {
     flex: none;
@@ -2954,6 +3410,14 @@
   .row-actions { display: none; align-items: center; gap: 2px; flex: none; }
   .row:hover .row-actions { display: flex; }
   .row:hover .row-tag, .row:hover .row-meta { display: none; }
+  /* variante « manager » (modale Connections) : 2 lignes, détails + actions toujours visibles */
+  .row.mgr { height: auto; min-height: 44px; padding-top: 5px; padding-bottom: 5px; }
+  .row-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; overflow: hidden; }
+  .row-main .row-label { flex: none; }
+  .row-lock { font-size: 10px; }
+  .row-sub { font-size: 11px; color: var(--text-tertiary); font-family: ui-monospace, Menlo, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .row.mgr .row-actions { display: flex; }
+  .row.mgr:hover .row-tag, .row.mgr:hover .row-meta { display: inline-flex; }
   .confirm-del {
     background: rgba(229, 83, 75, 0.15);
     color: var(--danger);
@@ -3018,6 +3482,17 @@
   .mgr-head:first-of-type { margin-top: 0; }
   .mgr-btns { display: flex; gap: 2px; }
   .import-row { margin: 0; }
+  .sync-row { display: flex; gap: 8px; }
+  .sync-row .btn { display: inline-flex; align-items: center; gap: 6px; flex: 1; justify-content: center; }
+  .config-paste {
+    width: 100%; height: 160px; box-sizing: border-box; resize: vertical;
+    background: var(--bg-app); border: 1px solid var(--border-strong); border-radius: var(--radius-md);
+    padding: 8px 10px; color: var(--text-primary);
+    font-family: ui-monospace, Menlo, monospace; font-size: 12px; line-height: 1.4;
+    transition: box-shadow 120ms, border-color 120ms;
+  }
+  .config-paste:focus { border-color: var(--accent); box-shadow: var(--focus-ring); outline: none; }
+  .config-paste::placeholder { color: var(--text-tertiary); }
   .import-btn { height: 22px; padding: 0 10px; font-size: 12px; flex: none; }
   .sheet .row { margin: 0; }
   .sheet-actions.spread { justify-content: space-between; align-items: center; }
@@ -3045,12 +3520,12 @@
   /* ─── titlebar + tabs ────────────────────────────────────────────────── */
   .content { display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--bg-app); }
   .titlebar {
-    height: 48px; /* toolbar unifiée, style Music */
+    height: 38px; /* toolbar unifiée compacte */
     flex: none;
     display: flex;
     align-items: center;
     gap: 6px;
-    padding: 0 10px;
+    padding: 0 8px;
     border-bottom: 1px solid var(--border);
   }
   .traffic-pad { width: 68px; flex: none; }
@@ -3119,6 +3594,7 @@
     transition: background 100ms, color 100ms, opacity 120ms;
   }
   .icon-btn:hover:not(:disabled) { background: var(--surface-hover); color: var(--text-primary); }
+  .icon-btn:active:not(:disabled) { background: var(--surface-active); }
   .icon-btn:disabled { opacity: 0.4; }
 
   /* ─── panes ──────────────────────────────────────────────────────────── */
@@ -3264,7 +3740,7 @@
     flex-direction: column;
     background: var(--bg-app);
   }
-  .pane.active { box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.1); }
+  .pane.active { box-shadow: inset 0 0 0 1px var(--border-strong); }
   .pane-bar {
     height: 26px;
     flex: none;
@@ -3274,8 +3750,16 @@
     padding: 0 8px;
     font-size: 11px;
     color: var(--text-tertiary);
+    /* liseré latéral : marque le panneau focalisé sans toucher au contenu */
+    border-left: 2px solid transparent;
+    transition: background 100ms, border-color 100ms;
   }
-  .pane.active .pane-bar { color: var(--text-secondary); }
+  /* panneau focalisé : barre teintée accent + texte plein (façon iTerm) */
+  .pane.active .pane-bar {
+    color: var(--text-primary);
+    background: color-mix(in srgb, var(--accent) 9%, transparent);
+    border-left-color: var(--accent);
+  }
   .pane-left { display: flex; align-items: center; gap: 6px; min-width: 0; flex: 1; }
   .pane-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
@@ -3295,10 +3779,33 @@
   .sstat.working { color: var(--accent); }
   .sstat.waiting { color: var(--attention); }
   .sstat.done { color: var(--success); }
+  .sstat.error { color: var(--danger); }
   .pane-btns { display: flex; align-items: center; gap: 1px; opacity: 0; transition: opacity 120ms; }
   .pane:hover .pane-btns { opacity: 1; }
   .pane-btns .icon-btn { width: 20px; height: 20px; }
   .pane-term { flex: 1; min-height: 0; padding: 0 10px 8px 10px; position: relative; }
+
+  /* ─── panneau navigateur ─────────────────────────────────────────────── */
+  .browser-ico { display: flex; flex: none; color: var(--text-tertiary); }
+  .url-input {
+    flex: 1; min-width: 0; height: 18px; padding: 0 8px;
+    font-size: 11px; border-radius: 4px;
+    border: 1px solid var(--border); background: var(--bg-app);
+    color: var(--text-primary); font-family: inherit;
+  }
+  .url-input:focus { border-color: var(--accent); box-shadow: none; }
+  .browser-body {
+    flex: 1; min-height: 0; position: relative;
+    margin: 0 8px 8px; border-radius: 6px; overflow: hidden; background: #fff;
+  }
+  .browser-frame { width: 100%; height: 100%; border: none; background: #fff; }
+  .browser-empty {
+    position: absolute; inset: 0;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 8px; background: var(--bg-app); color: var(--text-tertiary); font-size: 12px;
+  }
+  .browser-empty :global(svg) { width: 22px; height: 22px; opacity: 0.5; }
+  .browser-empty code { font-size: 11px; background: var(--surface); padding: 1px 5px; border-radius: 3px; }
 
   .pane-veil {
     position: absolute;
@@ -3319,6 +3826,7 @@
   .veil-spin { color: var(--text-tertiary); display: flex; }
   .veil-warn { color: var(--danger); display: flex; }
   .veil-msg { max-width: 420px; user-select: text; }
+  .veil-target { font-family: ui-monospace, Menlo, monospace; font-size: 11px; color: var(--text-tertiary); user-select: text; }
   .veil-actions { display: flex; gap: 8px; margin-top: 4px; }
   :global(.spin) { animation: rot 800ms linear infinite; }
   @keyframes rot { to { transform: rotate(360deg); } }
@@ -3339,8 +3847,8 @@
   /* ─── boutons / formulaires ──────────────────────────────────────────── */
   /* push buttons macOS : accent plein / bezel gris */
   .btn {
-    height: 26px;
-    padding: 0 14px;
+    height: 30px;
+    padding: 0 16px;
     background: var(--accent);
     color: #fff;
     border: none;
@@ -3359,22 +3867,24 @@
     box-shadow: inset 0 0.5px 0 rgba(255, 255, 255, 0.12);
   }
   .btn.ghost:hover { background: rgba(255, 255, 255, 0.17); }
+  .btn.sm { height: 24px; padding: 0 10px; font-size: 11.5px; border-radius: var(--radius-sm); display: inline-flex; align-items: center; gap: 5px; }
 
   input, select {
-    height: 26px;
+    height: 30px;
     box-sizing: border-box;
     width: 100%;
     background: var(--bg-app); /* textBackgroundColor */
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    border-radius: var(--radius-sm);
-    padding: 0 8px;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-md);
+    padding: 0 10px;
     color: var(--text-primary);
     font-size: 13px;
     font-family: inherit;
-    transition: box-shadow 120ms;
+    transition: box-shadow 120ms, border-color 120ms;
   }
+  input:hover, select:hover { border-color: rgba(255, 255, 255, 0.22); }
   input::placeholder { color: var(--text-tertiary); }
-  input:focus, select:focus { box-shadow: var(--focus-ring); outline: none; }
+  input:focus, select:focus { border-color: var(--accent); box-shadow: var(--focus-ring); outline: none; }
   input[type="checkbox"] { width: auto; height: auto; accent-color: var(--accent); }
   input[type="number"] { appearance: textfield; }
 
@@ -3382,44 +3892,78 @@
   .overlay {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.45);
-    backdrop-filter: blur(2px);
+    background: rgba(0, 0, 0, 0.5);
+    backdrop-filter: blur(8px) saturate(120%);
     display: flex;
     align-items: center;
     justify-content: center;
     z-index: 30;
-    animation: fade 150ms var(--ease);
   }
-  @keyframes fade { from { opacity: 0; } }
   .sheet {
-    width: 420px;
-    max-height: 80vh;
+    width: 440px;
+    max-height: 82vh;
     overflow-y: auto;
     background: var(--surface-raised); /* windowBackgroundColor */
-    border: 1px solid rgba(255, 255, 255, 0.12);
-    border-radius: var(--radius-lg);
-    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.55), 0 0 0 0.5px rgba(0, 0, 0, 0.4);
-    padding: 20px;
-    animation: sheet-in 150ms var(--ease);
+    border: 0.5px solid rgba(255, 255, 255, 0.14);
+    border-radius: 14px;
+    box-shadow: 0 24px 70px rgba(0, 0, 0, 0.6), inset 0 0.5px 0 rgba(255, 255, 255, 0.08);
+    padding: 22px 24px;
   }
-  @keyframes sheet-in { from { opacity: 0; transform: scale(0.97); } }
-  .sheet h2 { margin: 0 0 16px; font-size: 15px; font-weight: 600; } /* Title 3 emphasized */
-  .sheet form { display: flex; flex-direction: column; gap: 12px; }
-  .sheet label { display: flex; flex-direction: column; gap: 4px; }
-  .f-label { font-size: 12px; color: var(--text-secondary); }
+  .sheet h2 { margin: 0 0 18px; font-size: 16px; font-weight: 600; letter-spacing: -0.01em; } /* Title 3 emphasized */
+  .sheet form { display: flex; flex-direction: column; gap: 14px; }
+  .sheet label { display: flex; flex-direction: column; gap: 5px; }
+  .f-label { font-size: 11.5px; font-weight: 500; letter-spacing: 0.01em; color: var(--text-secondary); }
   .f-pair { display: flex; gap: 10px; }
   .f-pair .grow { flex: 1; }
   .f-port { width: 80px; flex: none; }
-  .f-check { flex-direction: row !important; align-items: center; gap: 8px !important; font-size: 12.5px; color: var(--text-secondary); }
-  .f-check.sub-check { margin-left: 22px; margin-top: -4px; font-size: 12px; color: var(--text-tertiary); }
+  .f-check { flex-direction: row !important; align-items: center; gap: 12px !important; font-size: 12.5px; color: var(--text-secondary); }
+  .f-check span { flex: 1; line-height: 1.35; } /* texte à gauche, interrupteur poussé à droite */
+  .f-check.sub-check { margin-left: 22px; margin-top: -6px; font-size: 12px; color: var(--text-tertiary); }
   .f-check code { font-size: 11px; background: var(--surface); border-radius: 3px; padding: 0 4px; }
-  .f-hint { margin: -4px 0 0; font-size: 11.5px; color: var(--text-tertiary); }
-  .sheet-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 6px; }
+  /* interrupteur iOS pour les options des modales (remplace la case native) */
+  .f-check input[type="checkbox"] {
+    appearance: none; -webkit-appearance: none;
+    order: 2; flex: none;
+    width: 34px; height: 20px; border-radius: 20px; border: none;
+    background: var(--surface-active);
+    position: relative; cursor: pointer; padding: 0;
+    transition: background 160ms var(--ease);
+  }
+  .f-check input[type="checkbox"]::after {
+    content: ""; position: absolute; top: 2px; left: 2px;
+    width: 16px; height: 16px; border-radius: 50%;
+    background: #fff; box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+    transition: transform 160ms var(--ease);
+  }
+  .f-check input[type="checkbox"]:checked { background: var(--accent); }
+  .f-check input[type="checkbox"]:checked::after { transform: translateX(14px); }
+  .f-check input[type="checkbox"]:hover { border: none; }
+  .f-check input[type="checkbox"]:focus { box-shadow: none; }
+  .f-check input[type="checkbox"]:focus-visible { box-shadow: var(--focus-ring); }
+  .f-hint { margin: -4px 0 0; font-size: 11.5px; line-height: 1.4; color: var(--text-tertiary); }
+  .sheet-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px; }
   .split-list { display: flex; flex-direction: column; gap: 1px; margin: 0 -8px; }
   .split-filter { margin-bottom: 10px; }
   .palette-input { margin-bottom: 10px; }
   .palette-list { max-height: 52vh; overflow-y: auto; }
   .palette-list .row { cursor: pointer; }
+  /* ligne active (clavier ↑/↓ ou survol) : accent plein, façon source list */
+  .palette-list .row.sel { background: var(--accent); }
+  .palette-list .row.sel .row-label,
+  .palette-list .row.sel .row-icon,
+  .palette-list .row.sel .row-meta { color: #fff; }
+  .palette-list .row:hover { background: transparent; } /* la sélection suit la souris, pas le hover natif */
+  .kbd {
+    flex: none;
+    font-family: ui-monospace, Menlo, monospace;
+    font-size: 11px;
+    color: var(--text-tertiary);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1px 6px;
+  }
+  .palette-list .row.sel .kbd { color: #fff; background: rgba(255, 255, 255, 0.16); border-color: rgba(255, 255, 255, 0.3); }
 
   /* combobox fontes */
   .font-list {
@@ -3486,12 +4030,10 @@
     padding: 9px 14px;
     font-size: 13px;
     box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
-    animation: toast-in 150ms var(--ease);
     max-width: 480px;
   }
   .toast.error { border-left: 2px solid var(--danger); }
   .toast.success { border-left: 2px solid var(--success); }
-  @keyframes toast-in { from { opacity: 0; transform: translateY(8px); } }
 
   /* ─── attentions ─────────────────────────────────────────────────────── */
   .attentions {
@@ -3515,7 +4057,6 @@
     padding: 7px 8px;
     font-size: 12.5px;
     box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
-    animation: toast-in 150ms var(--ease);
   }
   .attention.hasopts { min-width: 260px; }
   .att-head { display: flex; align-items: center; gap: 6px; }
@@ -3563,11 +4104,17 @@
     border-radius: var(--radius-md);
     padding: 4px 6px;
     box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
-    animation: search-in 120ms var(--ease);
   }
-  @keyframes search-in { from { opacity: 0; transform: translateY(-4px); } }
   .search-bar input { width: 170px; height: 24px; }
 
   /* terminal : sélection de texte autorisée */
   .pane-term :global(.xterm) { user-select: text; }
+
+  /* respecte « réduire les animations » du système (accessibilité) */
+  @media (prefers-reduced-motion: reduce) {
+    :global(*), :global(*::before), :global(*::after) {
+      animation-duration: 0.01ms !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
 </style>

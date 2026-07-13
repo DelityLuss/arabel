@@ -1,5 +1,9 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use tauri::{AppHandle, Manager};
+
+use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit, Nonce};
 
 fn store_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(app
@@ -21,36 +25,140 @@ pub fn store_save(app: AppHandle, data: String) -> Result<(), String> {
     std::fs::write(path, data).map_err(|e| e.to_string())
 }
 
+// ─── coffre local des secrets (passphrases de clés, mots de passe) ────────────
+// On ne passe PLUS par le trousseau OS : sur un macOS non signé (pas de certificat
+// Apple à 100 €/an), le trousseau redemandait le mot de passe à CHAQUE lancement,
+// « Toujours autoriser » ne tenant jamais. À la place : un fichier chiffré.
+//
+// Sécurité, honnêtement : chaque installation génère une clé aléatoire (vault.key,
+// 0600) posée à côté du fichier chiffré. Partager le binaire Arabel ne fuit donc
+// aucun secret, et rien n'est en clair sur le disque (sauvegardes/sync/partage
+// d'écran). Plafond : qui a un accès complet à CETTE machine (les deux fichiers)
+// peut déchiffrer — même niveau qu'un « retenir mon mot de passe » d'app.
+
+/// Identifiant de l'app (= `identifier` de tauri.conf.json). Sert à retrouver le
+/// dossier de config sans AppHandle, depuis les fonctions non-commande de ssh.rs.
+/// ponytail: doit rester synchro avec tauri.conf.json ; un seul champ, changé rarement.
+const APP_ID: &str = "com.luss.arabel";
+
+/// Dossier de config, calculé comme Tauri (`app_config_dir`) mais sans AppHandle :
+/// `dirs::config_dir()` donne la même base par OS (Application Support / %APPDATA% / .config).
+fn config_dir() -> Result<PathBuf, String> {
+    dirs::config_dir()
+        .map(|d| d.join(APP_ID))
+        .ok_or_else(|| "no config dir".into())
+}
+
+/// Charge la clé du coffre, ou la crée (32 octets aléatoires) au premier appel.
+fn vault_key() -> Result<[u8; 32], String> {
+    let dir = config_dir()?;
+    let path = dir.join("vault.key");
+    match std::fs::read(&path) {
+        Ok(b) if b.len() == 32 => Ok(b.try_into().unwrap()),
+        _ => {
+            let mut raw = [0u8; 32];
+            getrandom::getrandom(&mut raw).map_err(|e| e.to_string())?;
+            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            std::fs::write(&path, raw).map_err(|e| e.to_string())?;
+            restrict(&path);
+            Ok(raw)
+        }
+    }
+}
+
+/// Permissions 0600 sur Unix (clé lisible par le seul propriétaire). No-op ailleurs.
+fn restrict(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+fn secrets_path() -> Result<PathBuf, String> {
+    Ok(config_dir()?.join("secrets.json"))
+}
+
+fn load_secrets() -> HashMap<String, String> {
+    secrets_path()
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+fn save_secrets(map: &HashMap<String, String>) -> Result<(), String> {
+    let path = secrets_path()?;
+    std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
+    std::fs::write(&path, serde_json::to_string(map).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    restrict(&path);
+    Ok(())
+}
+
+/// nonce(12) aléatoire préfixé au texte chiffré, le tout en base64.
+fn encrypt(key: &[u8; 32], plain: &str) -> Result<String, String> {
+    let mut nonce = [0u8; 12];
+    getrandom::getrandom(&mut nonce).map_err(|e| e.to_string())?;
+    let ct = ChaCha20Poly1305::new_from_slice(key)
+        .unwrap()
+        .encrypt(&Nonce::from(nonce), plain.as_bytes())
+        .map_err(|e| e.to_string())?;
+    let mut out = nonce.to_vec();
+    out.extend_from_slice(&ct);
+    Ok(B64.encode(out))
+}
+
+fn decrypt(key: &[u8; 32], blob: &str) -> Option<String> {
+    let raw = B64.decode(blob).ok()?;
+    let (nonce, ct) = raw.split_at_checked(12)?;
+    let nonce: [u8; 12] = nonce.try_into().ok()?;
+    let pt = ChaCha20Poly1305::new_from_slice(key)
+        .unwrap()
+        .decrypt(&Nonce::from(nonce), ct)
+        .ok()?;
+    String::from_utf8(pt).ok()
+}
+
 #[tauri::command]
 pub fn passphrase_set(identity_id: String, passphrase: String) -> Result<(), String> {
-    keyring::Entry::new("arabel", &identity_id)
-        .and_then(|e| e.set_password(&passphrase))
-        .map_err(|e| e.to_string())
+    let key = vault_key()?;
+    let mut map = load_secrets();
+    map.insert(identity_id, encrypt(&key, &passphrase)?);
+    save_secrets(&map)
 }
 
 #[tauri::command]
 pub fn passphrase_delete(identity_id: String) -> Result<(), String> {
-    // absente = déjà supprimée, pas une erreur
-    match keyring::Entry::new("arabel", &identity_id).and_then(|e| e.delete_credential()) {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(e.to_string()),
+    let mut map = load_secrets();
+    if map.remove(&identity_id).is_some() {
+        save_secrets(&map)?;
     }
+    Ok(())
 }
 
 pub fn passphrase_get(identity_id: &str) -> Option<String> {
-    keyring::Entry::new("arabel", identity_id)
-        .ok()
-        .and_then(|e| e.get_password().ok())
+    let key = vault_key().ok()?;
+    decrypt(&key, load_secrets().get(identity_id)?)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     #[test]
-    fn keychain_roundtrip() {
-        let e = keyring::Entry::new("arabel-test", "test-id").unwrap();
-        e.set_password("s3cret").unwrap();
-        assert_eq!(e.get_password().unwrap(), "s3cret");
-        e.delete_credential().unwrap();
-        assert!(e.get_password().is_err());
+    fn roundtrip() {
+        let mut key = [0u8; 32];
+        getrandom::getrandom(&mut key).unwrap();
+        let blob = encrypt(&key, "s3cret").unwrap();
+        assert_ne!(blob, "s3cret"); // bien chiffré, pas du clair encodé
+        assert_eq!(decrypt(&key, &blob).as_deref(), Some("s3cret"));
+        // mauvaise clé → refus (AEAD authentifié), pas de déchiffrement silencieux
+        let mut other = [0u8; 32];
+        getrandom::getrandom(&mut other).unwrap();
+        assert_eq!(decrypt(&other, &blob), None);
+        // deux chiffrements du même texte diffèrent (nonce aléatoire)
+        assert_ne!(encrypt(&key, "s3cret").unwrap(), blob);
     }
 }

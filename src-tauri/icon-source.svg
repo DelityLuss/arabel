@@ -1,0 +1,13 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <!-- Icône app = marque in-app (iLogo) en plein cadre : carré arrondi accent + prompt ›_ blanc.
+       NB régénération : rendre via ImageMagick (fond transparent), PAS QuickLook (qui aplatit en blanc) :
+       magick -size 1024x1024 xc:none \
+         -draw "fill #007aff stroke none roundrectangle 48,48 976,976 208,208" \
+         -draw "fill none stroke white stroke-width 88 stroke-linecap round stroke-linejoin round polyline 306,357 460,512 306,667" \
+         -draw "fill none stroke white stroke-width 88 stroke-linecap round polyline 564,692 744,692" \
+         icon-source.png
+       puis : npm run tauri -- icon src-tauri/icon-source.png -->
+  <rect x="48" y="48" width="928" height="928" rx="208" fill="#007aff"/>
+  <path d="M306 357 L460 512 L306 667 M564 692 H744"
+        stroke="#ffffff" stroke-width="88" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+</svg>

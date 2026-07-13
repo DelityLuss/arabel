@@ -1,6 +1,6 @@
 [package]
 name = "arabel"
-version = "0.1.0"
+version = "0.2.0"
 description = "Terminal SSH pour piloter des agents IA"
 authors = ["you"]
 edition = "2021"
@@ -25,7 +25,11 @@ serde_json = "1"
 russh = "0.62.2"
 tokio = { version = "1.52.3", features = ["full"] }
 base64 = "0.22.1"
-keyring = "4.1.4"
+# Coffre local chiffré pour les passphrases/mots de passe (voir store.rs) : clé
+# aléatoire par installation, AEAD ChaCha20-Poly1305. Remplace le trousseau OS
+# (keyring) qui, sur macOS non signé, redemandait le mot de passe à chaque lancement.
+chacha20poly1305 = "0.10"
+getrandom = "0.2"
 tauri-plugin-clipboard-manager = "2.3.2"
 tauri-plugin-notification = "2.3.3"
 tauri-plugin-window-state = "2.4.1"

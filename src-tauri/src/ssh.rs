@@ -4,7 +4,9 @@ use russh::{client, ChannelMsg};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, State};
+use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
+use tokio::time::{timeout, Duration};
 
 pub struct SshState(pub Mutex<HashMap<String, mpsc::Sender<Cmd>>>);
 
@@ -40,12 +42,62 @@ impl client::Handler for Handler {
     }
 }
 
-fn expand_tilde(path: &str) -> String {
+pub fn expand_tilde(path: &str) -> String {
     match path.strip_prefix("~/") {
         Some(rest) => dirs::home_dir()
             .map(|h| h.join(rest).to_string_lossy().into_owned())
             .unwrap_or_else(|| path.to_string()),
         None => path.to_string(),
+    }
+}
+
+/// Le parseur de clé (russh/ssh-key) ne lit que le format OpenSSH (+ PKCS#8).
+/// Une clé PuTTY, une clé PEM « legacy » (RSA/EC/DSA), ou un fichier de clé
+/// PUBLIQUE échouent avec des erreurs cryptiques (« Der: trailing data… »). On
+/// regarde l'entête du fichier pour rendre un message que l'utilisateur peut agir.
+fn explain_key_error(path: &str, e: impl std::fmt::Display) -> String {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    classify_key_error(&text, path, &e.to_string())
+}
+fn classify_key_error(text: &str, path: &str, e: &str) -> String {
+    let head = text.trim_start();
+    let first = head.lines().next().unwrap_or("");
+    if first.starts_with("PuTTY-User-Key-File") {
+        format!("This is a PuTTY key. Convert it to OpenSSH: puttygen \"{path}\" -O private-openssh -o id_arabel — then point the identity to id_arabel.")
+    } else if first.starts_with("ssh-") || first.starts_with("ecdsa-") || first.starts_with("sk-") {
+        "That's a PUBLIC key. Point the identity to the PRIVATE key — the same file WITHOUT the .pub extension.".into()
+    } else if head.contains("Proc-Type:")
+        || head.contains("BEGIN RSA PRIVATE KEY")
+        || head.contains("BEGIN EC PRIVATE KEY")
+        || head.contains("BEGIN DSA PRIVATE KEY")
+    {
+        format!("This key is in the old PEM format, which isn't supported. Convert it in place (keeps the same key & passphrase): ssh-keygen -p -f \"{path}\" — or add it to ssh-agent (ssh-add) and use ssh-agent auth.")
+    } else if head.contains("BEGIN ENCRYPTED PRIVATE KEY") {
+        "This key needs its passphrase — set it on the identity in arabel, or use ssh-agent.".into()
+    } else if !head.contains("BEGIN") {
+        format!("Not a valid private key file: {path}")
+    } else {
+        format!("Couldn't read the key ({path}). If it has a passphrase, set it on the identity — or use ssh-agent. [{e}]")
+    }
+}
+
+/// Traduit une erreur d'E/S réseau (résolution DNS / connexion TCP) en message
+/// clair indiquant l'étape qui a échoué et une piste, plutôt qu'un `tokio io …`.
+fn net_error(host: &str, port: u16, e: &std::io::Error) -> String {
+    use std::io::ErrorKind::*;
+    let m = e.to_string().to_lowercase();
+    if m.contains("resolve")
+        || m.contains("nodename")
+        || m.contains("not known")
+        || m.contains("name or service")
+        || m.contains("failed to lookup")
+    {
+        return format!("Can't resolve host \"{host}\" — check the hostname (DNS).");
+    }
+    match e.kind() {
+        ConnectionRefused => format!("Connection refused by {host}:{port} — nothing is listening there (wrong port, or the SSH server is down)."),
+        TimedOut => format!("Timed out reaching {host}:{port} — host down, wrong address, or a firewall is blocking the port."),
+        _ => format!("Can't reach {host}:{port} — {e}."),
     }
 }
 
@@ -70,13 +122,25 @@ pub async fn connect_auth(
         host: host.to_string(),
         port,
     };
-    let mut handle = client::connect(config, (host, port), handler)
+    // Étape 1 — résolution DNS + connexion TCP, avec timeout (12 s) pour ne pas
+    // pendre sur un hôte injoignable. Erreurs réseau précises via net_error().
+    let stream = match timeout(Duration::from_secs(12), TcpStream::connect((host, port))).await {
+        Err(_) => {
+            return Err(format!(
+                "Timed out connecting to {host}:{port} — host unreachable, wrong address, or a firewall is blocking the port."
+            ))
+        }
+        Ok(Err(e)) => return Err(net_error(host, port, &e)),
+        Ok(Ok(s)) => s,
+    };
+    // Étape 2 — handshake SSH sur la connexion établie (protocole, clé serveur).
+    let mut handle = client::connect_stream(config, stream, handler)
         .await
         .map_err(|e| match e {
             russh::Error::UnknownKey => {
-                "the server key changed (MITM risk) — check ~/.ssh/known_hosts".to_string()
+                "The server's key changed since last time (possible MITM) — verify the host, then remove its line from ~/.ssh/known_hosts.".to_string()
             }
-            e => format!("connection: {e}"),
+            e => format!("SSH handshake failed with {host}:{port} — {e}. Is this really an SSH server?"),
         })?;
 
     match auth.as_deref() {
@@ -92,7 +156,7 @@ pub async fn connect_auth(
                 .await
                 .map_err(|e| format!("auth: {e}"))?;
             if !res.success() {
-                return Err("password rejected".into());
+                return Err(format!("Wrong password for \"{user}\" (or the server doesn't allow password login)."));
             }
         }
         _ => {
@@ -100,8 +164,9 @@ pub async fn connect_auth(
             let passphrase = passphrase
                 .filter(|p| !p.is_empty())
                 .or_else(|| identity_id.as_deref().and_then(crate::store::passphrase_get));
-            let key = load_secret_key(expand_tilde(key_path), passphrase.as_deref())
-                .map_err(|e| format!("key: {e}"))?;
+            let path = expand_tilde(key_path);
+            let key = load_secret_key(&path, passphrase.as_deref())
+                .map_err(|e| explain_key_error(&path, e))?;
             let hash = handle
                 .best_supported_rsa_hash()
                 .await
@@ -112,7 +177,7 @@ pub async fn connect_auth(
                 .await
                 .map_err(|e| format!("auth: {e}"))?;
             if !res.success() {
-                return Err("authentication refused".into());
+                return Err(format!("Server rejected the key for \"{user}\" — check the username, and that this key's public part is in ~/.ssh/authorized_keys on the server."));
             }
         }
     }
@@ -963,4 +1028,32 @@ pub async fn ssh_disconnect(
     session_id: String,
 ) -> Result<(), String> {
     send(&state, &session_id, Cmd::Close).await
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::{classify_key_error, net_error};
+    fn msg(text: &str) -> String {
+        classify_key_error(text, "/k", "Der: trailing data")
+    }
+    #[test]
+    fn classifies_network_errors() {
+        use std::io::{Error, ErrorKind};
+        assert!(net_error("h", 22, &Error::new(ErrorKind::ConnectionRefused, "x")).contains("refused"));
+        assert!(net_error("h", 22, &Error::new(ErrorKind::TimedOut, "x")).contains("Timed out"));
+        assert!(net_error("bad", 22, &Error::new(ErrorKind::Other, "failed to lookup address information")).contains("resolve"));
+        assert!(net_error("h", 2222, &Error::new(ErrorKind::Other, "weird")).contains("2222"));
+    }
+    #[test]
+    fn classifies_key_formats() {
+        assert!(msg("ssh-ed25519 AAAAC3Nz... user@host").contains("PUBLIC key"));
+        assert!(msg("PuTTY-User-Key-File-3: ssh-ed25519").contains("PuTTY"));
+        assert!(msg("-----BEGIN RSA PRIVATE KEY-----\n...").contains("old PEM"));
+        assert!(msg("-----BEGIN EC PRIVATE KEY-----\n...").contains("old PEM"));
+        assert!(msg("Proc-Type: 4,ENCRYPTED\n...").contains("old PEM"));
+        assert!(msg("-----BEGIN ENCRYPTED PRIVATE KEY-----").contains("passphrase"));
+        assert!(msg("garbage not a key").contains("Not a valid private key"));
+        // format OpenSSH (chiffré, passphrase manquante) → repli, on ne mésclassifie pas
+        assert!(msg("-----BEGIN OPENSSH PRIVATE KEY-----\n...").contains("passphrase"));
+    }
 }

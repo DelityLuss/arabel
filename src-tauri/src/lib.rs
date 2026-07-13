@@ -21,6 +21,13 @@ pub fn home_dir() -> Result<String, String> {
 }
 
 fn build_menu(app: &tauri::App) -> tauri::Result<()> {
+    // Windows : aucune barre de menu dans la fenêtre. Le bandeau
+    // Fichier/Shell/View/Window s'afficherait sous notre titlebar custom et fait
+    // doublon avec la sidebar (Réglages) + les raccourcis clavier.
+    if cfg!(target_os = "windows") {
+        return Ok(());
+    }
+
     let h = app.handle();
 
     // Les accélérateurs des actions applicatives (nouveaux panneaux, splits,
@@ -153,6 +160,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             local::local_connect,
+            local::ssh_pty_connect,
             local::local_metrics,
             local::mosh_connect,
             local::mosh_available,
