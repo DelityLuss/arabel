@@ -123,7 +123,15 @@ pub async fn connect_auth(
 async fn auth_agent(handle: &mut client::Handle<Handler>, user: &str) -> Result<(), String> {
     use russh::keys::agent::client::AgentClient;
     use russh::keys::agent::AgentIdentity;
+    // Unix : socket pointé par SSH_AUTH_SOCK. Windows : l'agent OpenSSH vit sur un
+    // named pipe fixe (connect_env n'existe pas côté Windows dans russh).
+    // ponytail: chemin de pipe fixe ; ajouter fallback SSH_AUTH_SOCK/Pageant si un user Windows le réclame.
+    #[cfg(unix)]
     let mut agent = AgentClient::connect_env()
+        .await
+        .map_err(|e| format!("ssh-agent: {e}"))?;
+    #[cfg(windows)]
+    let mut agent = AgentClient::connect_named_pipe(r"\\.\pipe\openssh-ssh-agent")
         .await
         .map_err(|e| format!("ssh-agent: {e}"))?;
     let ids = agent.request_identities().await.map_err(|e| e.to_string())?;
