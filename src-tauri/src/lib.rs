@@ -183,6 +183,7 @@ pub fn run() {
             sftp::sftp_download,
             sftp::sftp_upload,
             sftp::sftp_paste_image,
+            sftp::git_run,
             store::store_load,
             store::store_save,
             store::passphrase_set,

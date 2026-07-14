@@ -15,11 +15,13 @@
   import { fade, fly, scale } from "svelte/transition";
   import { flip } from "svelte/animate";
   import { TmuxControl, parseLayout, layToTree, layPanes, layPaneSizes, toHexKeys, demo as tmuxccDemo, type Lay } from "$lib/tmuxcc";
+  import Tgs from "$lib/Tgs.svelte";
   import { version as appVersion } from "../../package.json";
 
   // ─── mode démo (aperçu navigateur sans Tauri) ─────────────────────────────
   const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
   if (!inTauri) try { tmuxccDemo(); } catch (e) { console.error("tmuxcc:", e); } // auto-test parseur en dev
+  if (!inTauri) try { gitStatusDemo(); } catch (e) { console.error("git:", e); }
 
   // ─── plateforme : macOS vs Windows/Linux ──────────────────────────────────
   const isMac = typeof navigator !== "undefined" && /Mac/i.test(navigator.platform || navigator.userAgent || "");
@@ -57,6 +59,7 @@
     "\x1b[33m●\x1b[0m \x1b[1mBash\x1b[0m npm test\r\n" +
     "  \x1b[90m⎿ Waiting for permission…\x1b[0m\r\n";
 
+  let demoFetched = false; // démo seulement : le fetch a-t-il déjà tourné (voir git_run)
   async function rpc<T = unknown>(cmd: string, args?: Record<string, unknown>): Promise<T> {
     if (inTauri) return invoke<T>(cmd, args);
     // démo : réponses factices
@@ -75,6 +78,33 @@
         { name: "deploy.log", isDir: false, size: 482133 },
       ] as T;
     if (cmd === "sftp_download") return "/Users/luss/Downloads/fichier" as T;
+    if (cmd === "sftp_upload") return (args?.path as string).split("/").pop() as T;
+    if (cmd === "git_run") {
+      // on saute les « -c core.x=y » de tête pour matcher la sous-commande
+      const raw = (args?.args as string[]) ?? [];
+      const j = raw.filter((x, i) => x !== "-c" && raw[i - 1] !== "-c").join(" ");
+      // démo : le fetch révèle du retard (que le status seul ne peut pas voir), le pull le résorbe
+      if (j.startsWith("fetch")) { demoFetched = true; return [0, ""] as T; }
+      if (j.startsWith("pull")) { demoFetched = false; return [0, "Fast-forward\n 2 files changed, 18 insertions(+)"] as T; }
+      if (j.startsWith("diff"))
+        return [0, j.includes("--no-index")
+          ? "diff --git a/notes.txt b/notes.txt\nnew file mode 100644\nindex 0000000..d5c8467\n--- /dev/null\n+++ b/notes.txt\n@@ -0,0 +1,2 @@\n+relancer le déploiement après la migration\n+vérifier les quotas côté API\n"
+          : j.includes("réglages")
+            ? "diff --cc src/config/réglages.ts\nindex ba2906d,e45c9c2..0000000\n--- a/src/config/réglages.ts\n+++ b/src/config/réglages.ts\n@@@ -8,1 -8,1 +8,5 @@@ export const config = {\n++<<<<<<< HEAD\n +  timeout: 30_000,\n++=======\n+   timeout: 5_000,\n++>>>>>>> origin/master\n"
+            : "diff --git a/src/lib/api.ts b/src/lib/api.ts\nindex 22a7af1..f489e8f 100644\n--- a/src/lib/api.ts\n+++ b/src/lib/api.ts\n@@ -12,7 +12,7 @@ export async function fetchUser(id: string) {\n   const res = await fetch(`/api/users/${id}`);\n-  if (!res.ok) throw new Error(\"failed\");\n+  if (!res.ok) throw new Error(`user ${id}: ${res.status}`);\n   return res.json();\n }\n@@ -30,3 +30,6 @@ export function logout() {\n   session.clear();\n }\n+\n+/** Purge le cache local — appelé après un changement de rôle. */\n+export const purge = () => cache.clear();\n"] as T;
+      if (j.startsWith("rev-parse")) return [0, "/home/deploy/synaptyx"] as T;
+      if (j.startsWith("status"))
+        return [0,
+          // ab : le fetch de démo « découvre » 2 commits distants (voir plus bas)
+          `# branch.oid abc123\n# branch.head master\n# branch.upstream origin/master\n# branch.ab +1 -${demoFetched ? 2 : 0}\n` +
+          "1 .M N... 100644 100644 100644 aaa bbb frontend/package-lock.json\n" +
+          "1 M. N... 100644 100644 100644 ccc ddd src/lib/api.ts\n" +
+          "u UU N... 100644 100644 100644 100644 aaa bbb ccc src/config/réglages.ts\n" +
+          "? notes.txt\n"] as T;
+      if (j.startsWith("branch")) return [0, "master\ndevelop\nfeat/auth\nfeat/billing\nhotfix/1\nrelease/2\nstaging"] as T;
+      if (j.startsWith("log")) return [0, "a1b2c3d (HEAD -> master) Fix billing rounding\ne4f5g6h Add auth guard\ni7j8k9l Release v0.2.0"] as T;
+      return [0, ""] as T;
+    }
     return undefined as T;
   }
   const listen: typeof tauriListen = inTauri
@@ -92,7 +122,7 @@
   type ProjNode = ProjLeaf | { dir: "h" | "v"; ratio?: number; a: ProjNode; b: ProjNode };
   // un projet = plusieurs vues (chaque vue = un onglet ; une vue peut être un split).
   // `root` (legacy, une seule vue) est migré à la lecture via projectViews().
-  type Project = { id: string; name: string; views?: ProjNode[]; root?: ProjNode };
+  type Project = { id: string; name: string; emoji?: string; views?: ProjNode[]; root?: ProjNode };
   type SessStatus = { status: "connecting" | "open" | "closed" | "error"; error: string };
   type Modal =
     | { type: "remote"; data: Remote; password: string; back?: boolean }
@@ -105,6 +135,7 @@
     | { type: "settings" }
     | { type: "palette"; filter: string }
     | { type: "configImport"; text: string }
+    | { type: "diff"; path: string; mode: string; text: string; loading: boolean }
     | null;
 
   // pseudo-remote pour le terminal local
@@ -114,6 +145,15 @@
   const THEMES: Record<string, ITheme> = {
     "Arabel Dark": {
       background: "#1e1e1e", foreground: "#d8d8dc", cursor: "#0a84ff", cursorAccent: "#1e1e1e",
+      selectionBackground: "#33467c",
+      black: "#15161e", red: "#f7768e", green: "#9ece6a", yellow: "#e0af68",
+      blue: "#7aa2f7", magenta: "#bb9af7", cyan: "#7dcfff", white: "#a9b1d6",
+      brightBlack: "#414868", brightRed: "#ff899d", brightGreen: "#9fe044", brightYellow: "#faba4a",
+      brightBlue: "#8db0ff", brightMagenta: "#c7a9ff", brightCyan: "#a4daff", brightWhite: "#c0caf5",
+    },
+    // OLED : fond #000 pur (pixels éteints). L'ANSI black reste relevé, sinon le texte noir disparaît.
+    "Arabel OLED": {
+      background: "#000000", foreground: "#d8d8dc", cursor: "#0a84ff", cursorAccent: "#000000",
       selectionBackground: "#33467c",
       black: "#15161e", red: "#f7768e", green: "#9ece6a", yellow: "#e0af68",
       blue: "#7aa2f7", magenta: "#bb9af7", cyan: "#7dcfff", white: "#a9b1d6",
@@ -150,6 +190,9 @@
   let identities = $state<Identity[]>([]);
   let remotes = $state<Remote[]>([]);
   let projects = $state<Project[]>([]);
+  // ponytail: pack NewsEmoji = static/emoji/001..100.tgs, numérotation figée, pas d'index à maintenir.
+  const EMOJI = Array.from({ length: 100 }, (_, i) => String(i + 1).padStart(3, "0"));
+  let hoverEmoji = $state<string | null>(null);
   const ANSI_KEYS = ["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white", "brightBlack", "brightRed", "brightGreen", "brightYellow", "brightBlue", "brightMagenta", "brightCyan", "brightWhite"] as const;
 
   // ─── raccourcis clavier configurables ─────────────────────────────────────
@@ -171,6 +214,8 @@
     paste: `${KMOD}+V`,
     "next-tab": isMac ? "Meta+Shift+BracketRight" : "Ctrl+Alt+BracketRight",
     "prev-tab": isMac ? "Meta+Shift+BracketLeft" : "Ctrl+Alt+BracketLeft",
+    "next-pane": isMac ? "Meta+Ctrl+ArrowDown" : "Ctrl+Alt+ArrowDown",
+    "prev-pane": isMac ? "Meta+Ctrl+ArrowUp" : "Ctrl+Alt+ArrowUp",
   };
 
   let settings = $state({
@@ -180,7 +225,9 @@
     copyOnSelect: true,
     sidebar: true,
     sounds: true, // sons d'événements agent (validation demandée / terminé / refus)
+    notifications: true, // notifications système sur les mêmes événements
     tmuxStatus: false, // barre de statut tmux masquée par défaut (doublon de la sidebar)
+    emojiAnim: true, // emojis de projet animés en continu ; décoché = figés sur la 1re frame
     cursorStyle: "bar" as "bar" | "block" | "underline",
     cursorBlink: true,
     scrollback: 10000,
@@ -233,7 +280,9 @@
   rpc<boolean>("mosh_available").then((v) => (moshOk = v)).catch(() => {});
 
   rpc<string>("store_load").then((json) => {
-    const data = JSON.parse(json || "{}");
+    let data: any;
+    try { data = JSON.parse(json || "{}"); }
+    catch { toast("Config illisible — sauvegarde suspendue pour ne pas l'écraser", "error", 12000); return; }
     identities = data.identities ?? [];
     remotes = data.remotes ?? [];
     projects = data.projects ?? [];
@@ -244,6 +293,7 @@
   });
 
   async function save() {
+    if (!loaded) return; // pas encore chargé (ou config illisible) : ne jamais écraser
     // purge les noms de terminaux fermés : on ne garde que les keys encore
     // référencées — sessions ouvertes + vues de projet (fermées mais persistées).
     const keep = new Set<string>();
@@ -266,7 +316,10 @@
   // dedans : mots de passe & passphrases restent dans le coffre chiffré local
   // (à ressaisir sur l'autre poste, ou utiliser ssh-agent qui ne stocke rien côté arabel).
   function exportConfig() {
-    const json = JSON.stringify({ v: 1, remotes, identities, projects, settings: $state.snapshot(settings) }, null, 2);
+    // le keymap est spécifique au poste (Meta = ⌘ sur Mac, touche Windows ailleurs) :
+    // le partager casserait tous les raccourcis sur l'autre plateforme.
+    const { keymap, ...shared } = $state.snapshot(settings);
+    const json = JSON.stringify({ v: 1, remotes, identities, projects, settings: shared }, null, 2);
     const done = () => toast("Config copied — paste it on your other PC to import", "success");
     if (inTauri) writeText(json).then(done).catch((e) => toast(String(e), "error"));
     else navigator.clipboard?.writeText(json).then(done).catch(() => toast("Copy failed", "error"));
@@ -286,7 +339,10 @@
     remotes = mergeById(remotes, data.remotes);
     identities = mergeById(identities, data.identities);
     projects = mergeById(projects, data.projects);
-    if (data.settings && typeof data.settings === "object") settings = { ...settings, ...data.settings };
+    if (data.settings && typeof data.settings === "object") {
+      const { keymap, ...s } = data.settings; // jamais le keymap d'un autre poste (compat vieux exports)
+      settings = { ...settings, ...s };
+    }
     save();
     applySettings();
     modal = null;
@@ -487,6 +543,12 @@
     const sopt =
       `tmux set -t ${n} status ${settings.tmuxStatus ? "on" : "off"} 2>/dev/null; ` +
       `tmux set -t ${n} mouse on 2>/dev/null; ` +
+      // mouse on = tmux capte le glisser → la sélection est la SIENNE, xterm n'en a
+      // aucune. set-clipboard fait émettre OSC 52 à tmux quand il copie ; le
+      // handler OSC 52 côté xterm (setupTerm) le pousse dans le presse-papier macOS.
+      // Options serveur (donc -s / -as) : appliquées aussi aux sessions réattachées.
+      `tmux set -s set-clipboard on 2>/dev/null; ` +
+      `tmux set -as terminal-features 'xterm*:clipboard' 2>/dev/null; ` +
       `tmux bind -T copy-mode WheelUpPane send -N2 -X scroll-up 2>/dev/null; ` +
       `tmux bind -T copy-mode WheelDownPane send -N2 -X scroll-down 2>/dev/null; ` +
       `tmux bind -T copy-mode-vi WheelUpPane send -N2 -X scroll-up 2>/dev/null; ` +
@@ -511,6 +573,18 @@
     term.onSelectionChange(() => {
       const sel = term.getSelection();
       if (sel && settings.copyOnSelect && inTauri) writeText(sel).catch(() => {});
+    });
+    // OSC 52 = « mets ça dans le presse-papier », émis par tmux (set-clipboard on),
+    // vim, etc. xterm.js ne le gère pas nativement. C'est LA voie de copie quand une
+    // appli capte la souris : sans ça, la sélection reste dans le buffer tmux.
+    term.parser.registerOscHandler(52, (data) => {
+      const b64 = data.slice(data.indexOf(";") + 1);
+      if (b64 === "?" || !b64 || !inTauri) return true; // lecture (?) non supportée
+      try {
+        const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+        writeText(new TextDecoder().decode(bytes)).catch(() => {});
+      } catch { /* base64 invalide */ }
+      return true;
     });
     term.attachCustomKeyEventHandler((e) => {
       if (e.type !== "keydown") return true;
@@ -971,8 +1045,10 @@
     if (m.projectId) {
       const p = projects.find((x) => x.id === m.projectId);
       if (!p) return;
-      addProjectTerminal(p, makeSid()); // vue séparée (nouvel onglet), pas de split auto
-      persistProject(p);
+      const wasOpen = projectTabs(p.id).length > 0;
+      const sid = makeSid();
+      addProjectTerminal(p, sid); // vue séparée (nouvel onglet), pas de split auto
+      if (wasOpen) persistProject(p); else appendProjectView(p, sid);
     } else if (m.dir && m.sid && m.tabId) {
       const tab = tabs.find((t) => t.id === m.tabId);
       if (!tab?.root) return;
@@ -1063,7 +1139,11 @@
     tabs.push(tab);
     activeTabId = tab.id;
   }
-  /** Ré-enregistre les vues ouvertes d'un projet dans sa définition. */
+  /** Ré-enregistre les vues ouvertes d'un projet dans sa définition. À n'appeler
+   *  QUE si le projet est réellement ouvert : sinon les onglets ouverts ne
+   *  représentent pas toutes ses vues et on effacerait celles restées fermées.
+   *  ponytail: ne reconcilie pas une ouverture PARTIELLE (projet ouvert puis un de
+   *  ses onglets fermé, puis modifié) ; cas rare, à traiter si ça mord. */
   function persistProject(p: Project) {
     const views = projectTabs(p.id)
       .map((t) => (t.root ? serializeTree(t.root) : null))
@@ -1074,14 +1154,24 @@
     }
     save();
   }
+  /** Ajoute un pane comme NOUVELLE vue sans reserialiser : à utiliser quand le
+   *  projet n'est pas ouvert (persistProject ne verrait que ce pane et écraserait
+   *  les vues sauvegardées — glisser un pane sur un projet fermé les perdait). */
+  function appendProjectView(p: Project, sid: string) {
+    const view = serializeTree({ leaf: sid });
+    if (view) { p.views = [...projectViews(p), view]; delete p.root; }
+    save();
+  }
   function movePaneToProject(sid: string, p: Project) {
     const from = tabs.find((t) => leaves(t.root).includes(sid));
     if (from?.projectId === p.id) return; // déjà dans ce projet
     const fromProject = from?.projectId ? projects.find((x) => x.id === from.projectId) : null;
+    const wasOpen = projectTabs(p.id).length > 0;
     extractPane(sid);
     addProjectTerminal(p, sid); // devient une vue séparée du projet
     if (fromProject) persistProject(fromProject);
-    persistProject(p);
+    // projet fermé : ne pas reserialiser (écraserait ses vues), ajouter la vue.
+    if (wasOpen) persistProject(p); else appendProjectView(p, sid);
   }
   function movePaneToStandalone(sid: string) {
     const from = tabs.find((t) => leaves(t.root).includes(sid));
@@ -1282,7 +1372,7 @@
   async function deleteRemote(r: Remote) {
     if (r.auth === "password") await rpc("passphrase_delete", { identityId: r.id }).catch(() => {});
     remotes = remotes.filter((x) => x.id !== r.id);
-    projects = projects.filter((p) => projectViews(p).flatMap(projLeaves).some((l) => remotes.some((x) => x.id === l.remoteId)));
+    projects = projects.filter((p) => projectViews(p).flatMap(projLeaves).some((l) => l.remoteId === "local" || remotes.some((x) => x.id === l.remoteId)));
     confirmDeleteId = null;
     await save();
   }
@@ -1348,7 +1438,7 @@
   async function saveProjectEdit() {
     if (modal?.type !== "project") return;
     const p = modal.data;
-    projects = [...projects.filter((x) => x.id !== p.id), p];
+    projects = projects.map((x) => (x.id === p.id ? p : x)); // remplace sur place : garde l'ordre du sidebar
     modal = null;
     await save();
   }
@@ -1541,7 +1631,6 @@
     if (name !== "Stop" && name !== "Notification") return; // PostToolUse & co : ignorés
 
     const kind: "stop" | "notif" = name === "Stop" ? "stop" : "notif";
-    const remoteName = remotes.find((r) => r.id === remoteId)?.name ?? "remote";
     const message = hook.message ?? (kind === "stop" ? "Claude finished" : "Claude is waiting for a response");
     // le même événement peut arriver en double (tail relancé, listener HMR) → on ignore les répétitions
     const dsig = `${remoteId}|${sid}|${kind}|${message}`;
@@ -1562,8 +1651,7 @@
     // question à choix : on lit les options dans le terminal (léger différé, le
     // temps que la TUI ait fini de rendre le menu).
     if (kind === "notif" && sid) setTimeout(() => patchMenu(att.id, sid), 140);
-    if (notifOk) sendNotification({ title: `Arabel — ${remoteName}`, body: message });
-    playSound(kind === "stop" ? "done" : "waiting");
+    // notif système + son : pas ici, dans l'effet lié à liveStatus (plus bas)
   });
 
   // ─── statut vivant dérivé du terminal (indépendant des hooks) ────────────
@@ -1632,6 +1720,30 @@
       }
     } catch { /* audio indispo : silencieux */ }
   }
+
+  // ─── alerte (notif système + son) ────────────────────────────────────────
+  // Branchée sur liveStatus, PAS sur les hooks : les hooks ne tombent que si le
+  // remote a été synchronisé, alors que l'indicateur du pane vient du buffer
+  // xterm. C'est ce décalage qui donnait un badge « waiting » muet et sans notif.
+  const alerted: Record<string, string> = {};
+  $effect(() => {
+    void liveTick; // ré-évalué avec l'indicateur
+    for (const [sid, s] of sessions) {
+      if (!s.remote.claude) continue;
+      const st = liveStatus(sid) ?? "idle";
+      const prev = alerted[sid];
+      if (prev === st) continue;
+      alerted[sid] = st;
+      if (prev === undefined) continue; // premier passage : pas d'alerte au montage
+      if (st !== "waiting" && st !== "done") continue;
+      // tu regardes déjà ce panneau → tu vois l'indicateur, l'alerte n'apprend rien
+      if (visiblePane(sid)) continue;
+      const body = attentions.find((a) => a.sid === sid)?.message
+        ?? (st === "done" ? "Claude finished" : "Claude is waiting for a response");
+      if (notifOk && settings.notifications) sendNotification({ title: `Arabel — ${sessLabel(sid)}`, body });
+      playSound(st);
+    }
+  });
 
   /** Résumé court de l'outil en cours (PreToolUse) pour le dashboard. */
   function toolLabel(tool?: string, input?: any): string {
@@ -1850,13 +1962,249 @@
     for (const f of dropped) {
       try {
         const b64 = await fileToB64(f);
-        await rpc("sftp_upload", { remoteId: r.id, ...remoteParams(r), path: joinPath(files.path, f.name), dataB64: b64 });
-        toast(`${f.name} sent to ${r.name}`, "success");
+        const sent = await rpc<string>("sftp_upload", { remoteId: r.id, ...remoteParams(r), path: joinPath(files.path, f.name), dataB64: b64 });
+        toast(sent && sent !== f.name ? `${f.name} sent as ${sent} (name existed)` : `${f.name} sent to ${r.name}`, "success");
       } catch (err) {
         toast(`${f.name} : ${err}`, "error");
       }
     }
     filesLoad(files.path);
+  }
+
+  // ─── panneau source control (git sur le remote) ──────────────────────────
+  type GEntry = { path: string; name: string; sub: string; staged: boolean; conflict: boolean; untracked: boolean };
+  type GStatus = { branch: string; upstream: string; ahead: number; behind: number; entries: GEntry[] };
+  type DLine = { t: "add" | "del" | "hunk" | "meta" | "ctx"; s: string };
+  let git = $state<{
+    open: boolean; remote: Remote | null; root: string; busy: boolean; isRepo: boolean;
+    branch: string; upstream: string; ahead: number; behind: number;
+    entries: GEntry[]; msg: string; branches: string[]; showBranches: boolean;
+    log: string[]; showLog: boolean; fetching: boolean;
+  }>({
+    open: false, remote: null, root: "", busy: false, isRepo: true,
+    branch: "", upstream: "", ahead: 0, behind: 0,
+    entries: [], msg: "", branches: [], showBranches: false, log: [], showLog: false, fetching: false,
+  });
+  const gitStagedCount = $derived(git.entries.filter((e) => e.staged).length);
+
+  async function gitRun(args: string[]): Promise<[number, string]> {
+    const r = git.remote;
+    if (!r) return [1, ""];
+    // ne jette JAMAIS : les appelants finissent tous par gitRefresh() pour remettre
+    // busy à false. Une coupure SSH qui rejette ici laisserait le panneau voilé à vie.
+    return rpc<[number, string]>("git_run", { remoteId: r.id, ...remoteParams(r), cwd: git.root, args })
+      .catch((e) => [1, String(e)] as [number, string]);
+  }
+  /** Parse `git status --porcelain=v2 --branch`. Pur → testable (voir gitStatusDemo). */
+  function parseStatus(out: string): GStatus {
+    const s: GStatus = { branch: "", upstream: "", ahead: 0, behind: 0, entries: [] };
+    for (const line of out.split("\n")) {
+      if (line.startsWith("# branch.head ")) s.branch = line.slice(14).trim();
+      else if (line.startsWith("# branch.upstream ")) s.upstream = line.slice(18).trim();
+      else if (line.startsWith("# branch.ab ")) {
+        const [a, b] = line.slice(12).trim().split(" ");
+        s.ahead = Math.abs(parseInt(a, 10)) || 0;
+        s.behind = Math.abs(parseInt(b, 10)) || 0;
+      } else if (line[0] === "1" || line[0] === "2" || line[0] === "u") {
+        const sp = line.split(" ");
+        // champs avant le chemin : 8 (type 1), 9 (type 2 = +score), 10 (u = +modes/hash de fusion)
+        const skip = line[0] === "1" ? 8 : line[0] === "2" ? 9 : 10;
+        // type 2 (renommage) : "path\torig" → on garde la destination
+        const path = sp.slice(skip).join(" ").split("\t")[0];
+        // « u » = conflit de fusion : jamais staged, cliquer doit faire `git add` (= résoudre)
+        const conflict = line[0] === "u";
+        s.entries.push({ path, ...splitPath(path), staged: !conflict && (sp[1] ?? "..")[0] !== ".", conflict, untracked: false });
+      } else if (line[0] === "?") {
+        const path = line.slice(2);
+        s.entries.push({ path, ...splitPath(path), staged: false, conflict: false, untracked: true });
+      }
+    }
+    s.entries.sort((a, b) => a.path.localeCompare(b.path));
+    return s;
+  }
+  // auto-test du parseur (dev) : les 3 cas qui mordaient — chemin accentué (git le
+  // « quote » en octal sans core.quotePath=false), espace dans le nom, ligne « u ».
+  function gitStatusDemo() {
+    const eq = (a: unknown, b: unknown, m: string) => {
+      if (JSON.stringify(a) !== JSON.stringify(b)) throw new Error(`git status: ${m} → ${JSON.stringify(a)}`);
+    };
+    const s = parseStatus(
+      "# branch.head main\n# branch.upstream origin/main\n# branch.ab +2 -1\n" +
+        "1 M. N... 100644 100644 100644 aaa bbb src/a.ts\n" +
+        "1 .M N... 100644 100644 100644 aaa bbb mon fichier.txt\n" +
+        "2 R. N... 100644 100644 100644 aaa bbb R100 new.ts\told.ts\n" +
+        "u UU N... 100644 100644 100644 100644 aaa bbb ccc café.txt\n" +
+        "? untracked.txt\n",
+    );
+    eq([s.branch, s.upstream, s.ahead, s.behind], ["main", "origin/main", 2, 1], "branche");
+    eq(s.entries.map((e) => e.path), ["café.txt", "mon fichier.txt", "new.ts", "src/a.ts", "untracked.txt"], "chemins");
+    eq(s.entries.filter((e) => e.staged).map((e) => e.path), ["new.ts", "src/a.ts"], "staged");
+    eq(s.entries.find((e) => e.conflict)?.path, "café.txt", "conflit");
+    eq(s.entries.filter((e) => e.untracked).map((e) => e.path), ["untracked.txt"], "untracked");
+
+    // parseDiff : une ligne supprimée « -- » ne doit PAS passer pour l'en-tête « --- »
+    const d = parseDiff(
+      "diff --git a/a.txt b/a.txt\nindex 111..222 100644\n--- a/a.txt\n+++ b/a.txt\n" +
+        "@@ -1,3 +1,3 @@\n ctx\n-- \n+ajout\n",
+    );
+    eq(d.map((l) => l.t), ["meta", "meta", "meta", "meta", "hunk", "ctx", "del", "add"], "diff");
+    eq(parseDiff("diff --git a/b b/b\nBinary files a/b and b/b differ\n").map((l) => l.t), ["meta", "meta"], "diff binaire");
+    // conflit (--cc) : préfixe 2 colonnes → les deux côtés comptent comme des ajouts
+    const cc = parseDiff("diff --cc f.txt\n@@@ -1,1 -1,1 +1,5 @@@\n++<<<<<<< HEAD\n +main\n++=======\n+ other\n++>>>>>>> other\n");
+    eq(cc.map((l) => l.t), ["meta", "hunk", "add", "add", "add", "add", "add"], "diff conflit");
+  }
+  function splitPath(p: string): { name: string; sub: string } {
+    const i = p.lastIndexOf("/");
+    return i < 0 ? { name: p, sub: "" } : { name: p.slice(i + 1), sub: p.slice(0, i) };
+  }
+  const GIT_STATUS = ["-c", "core.quotePath=false", "status", "--porcelain=v2", "--branch"];
+  /** `fetch` : rafraîchit aussi origin/* (voir gitFetch). Réservé à l'ouverture du
+   *  panneau et au bouton ↻ — stage/commit/push n'ont pas besoin du réseau. */
+  async function gitRefresh(fetch = false) {
+    const r = git.remote;
+    if (!r) return;
+    git.busy = true;
+    try {
+      const [rc, top] = await gitRun(["rev-parse", "--show-toplevel"]);
+      if (rc !== 0) { git.isRepo = false; git.entries = []; git.busy = false; return; }
+      git.isRepo = true;
+      git.root = top.trim();
+      // quotePath=false : sinon git rend « café.txt » en "caf\303\251.txt" (guillemets
+      // inclus) → nom illisible ET `git add` derrière échoue sur le pathspec.
+      const [, st] = await gitRun(GIT_STATUS);
+      Object.assign(git, parseStatus(st));
+      const [, br] = await gitRun(["branch", "--format=%(refname:short)"]);
+      git.branches = br.split("\n").map((s) => s.trim()).filter(Boolean);
+      if (git.showLog) await gitLoadLog();
+    } catch (e) {
+      toast(String(e), "error");
+    }
+    git.busy = false;
+    if (fetch) gitFetch(r); // hors du voile : la liste s'affiche sans attendre le réseau
+  }
+  /** « ↓ behind » se calcule sur origin/*, qui n'avance QUE sur un fetch. Sans ça le
+   *  compteur affiche 0 en permanence, même à 10 commits derrière — mensonge poli. */
+  async function gitFetch(r: Remote) {
+    git.fetching = true;
+    const [rc] = await gitRun(["fetch", "--quiet"]);
+    git.fetching = false;
+    // origin injoignable : compteur périmé, pas de quoi alerter l'utilisateur
+    if (rc !== 0) return;
+    // le panneau a pu changer de remote / se fermer pendant l'aller-retour
+    if (!git.open || git.remote?.id !== r.id) return;
+    const [, st] = await gitRun(GIT_STATUS);
+    if (git.remote?.id === r.id) Object.assign(git, parseStatus(st));
+  }
+  async function gitPointTo(r: Remote) {
+    git.remote = r; git.showBranches = false; git.showLog = false;
+    const home = await rpc<string>("sftp_home", { remoteId: r.id, ...remoteParams(r) }).catch(() => "~");
+    git.root = r.dir ? (r.dir.startsWith("/") ? r.dir : joinPath(home, r.dir)) : home;
+    gitRefresh(true);
+  }
+  function toggleGit() {
+    if (git.open) { git.open = false; return; }
+    const r = activeSshRemote();
+    if (!r) return;
+    git.open = true;
+    gitPointTo(r);
+  }
+  // suit le remote du panneau actif
+  $effect(() => {
+    const r = activeSshRemote();
+    if (git.open && r && r.id !== git.remote?.id) gitPointTo(r);
+  });
+  async function gitToggleEntry(entry: GEntry) {
+    git.busy = true;
+    await gitRun(entry.staged ? ["restore", "--staged", "--", entry.path] : ["add", "--", entry.path]);
+    await gitRefresh();
+  }
+  async function gitStageAll() {
+    git.busy = true;
+    const anyUnstaged = git.entries.some((e) => !e.staged);
+    await gitRun(anyUnstaged ? ["add", "-A"] : ["reset"]);
+    await gitRefresh();
+  }
+  async function gitCommit() {
+    if (!git.msg.trim()) return;
+    if (!gitStagedCount) { toast("Nothing staged", "info"); return; }
+    git.busy = true;
+    const [rc, out] = await gitRun(["commit", "-m", git.msg]);
+    if (rc === 0) { git.msg = ""; toast("Committed", "success"); }
+    else toast(gitErr(out, "commit failed"), "error");
+    await gitRefresh();
+  }
+  async function gitPush() {
+    git.busy = true;
+    const args = git.upstream ? ["push"] : ["push", "-u", "origin", "HEAD"];
+    const [rc, out] = await gitRun(args);
+    toast(rc === 0 ? "Pushed" : gitErr(out, "push failed"), rc === 0 ? "success" : "error");
+    await gitRefresh();
+  }
+  /** Git noie l'essentiel sous des « hint: » (10 lignes pour un pull refusé) :
+   *  on garde la ligne fatal/error, seule utile dans un toast. */
+  function gitErr(out: string, fallback: string): string {
+    const ls = out.split("\n").map((l) => l.trim()).filter(Boolean);
+    return [...ls].reverse().find((l) => /^(fatal|error):/.test(l)) ?? ls.at(-1) ?? fallback;
+  }
+  async function gitPull() {
+    git.busy = true;
+    // --ff-only : un clic ne doit jamais fabriquer un commit de merge ni un conflit
+    // en douce. Branches divergentes → échec net, et ça se règle au terminal.
+    const [rc, out] = await gitRun(["pull", "--ff-only"]);
+    toast(rc === 0 ? "Pulled" : gitErr(out, "pull failed"), rc === 0 ? "success" : "error");
+    await gitRefresh();
+  }
+  async function gitCheckout(name: string) {
+    git.showBranches = false;
+    git.busy = true;
+    const [rc, out] = await gitRun(["checkout", name]);
+    if (rc !== 0) toast(gitErr(out, "checkout failed"), "error");
+    await gitRefresh();
+  }
+  /** Découpe un diff unifié. Tout ce qui précède le 1er « @@ » est de l'en-tête :
+   *  ça évite de prendre une ligne supprimée « -- » pour l'en-tête « --- a/x ».
+   *  Un diff de conflit (--cc) préfixe sur 1 colonne PAR parent — largeur lue sur le
+   *  « @@@ » — sinon le côté HEAD passerait pour du contexte. */
+  function parseDiff(out: string): DLine[] {
+    const lines: DLine[] = [];
+    let w = 0; // largeur du préfixe ; 0 = pas encore dans un hunk (donc en-tête)
+    for (const l of out.split("\n")) {
+      if (l.startsWith("diff ")) { w = 0; lines.push({ t: "meta", s: l }); }
+      else if (l.startsWith("@@")) { w = (/^@+/.exec(l)?.[0].length ?? 2) - 1; lines.push({ t: "hunk", s: l }); }
+      else if (!w) lines.push({ t: "meta", s: l }); // index, ---, +++, new file, Binary files…
+      else {
+        const p = l.slice(0, w);
+        lines.push({ t: p.includes("+") ? "add" : p.includes("-") ? "del" : "ctx", s: l });
+      }
+    }
+    while (lines.length && !lines[lines.length - 1].s) lines.pop();
+    return lines;
+  }
+  async function gitShowDiff(entry: GEntry) {
+    const mode = entry.conflict ? "conflict" : entry.untracked ? "new file" : entry.staged ? "staged" : "working tree";
+    modal = { type: "diff", path: entry.path, mode, text: "", loading: true };
+    // le diff suit ce que dit la case : stagée → --cached, sinon l'arbre de travail.
+    // untracked : absent de l'index, seul --no-index le montre (et sort rc=1 quand il
+    // y a des différences → surtout ne pas traiter le rc comme une erreur ici).
+    const args = entry.untracked
+      ? ["diff", "--no-index", "--", "/dev/null", entry.path]
+      : entry.staged
+        ? ["diff", "--cached", "--", entry.path]
+        : ["diff", "--", entry.path];
+    const [, out] = await gitRun(["-c", "core.quotePath=false", ...args]);
+    // l'utilisateur a pu cliquer ailleurs / fermer pendant l'aller-retour SSH
+    if (modal?.type === "diff" && modal.path === entry.path) { modal.text = out; modal.loading = false; }
+  }
+  async function gitLoadLog() {
+    const [, out] = await gitRun(["log", "--oneline", "--decorate", "-40"]);
+    git.log = out.split("\n").filter(Boolean);
+  }
+  async function toggleGitLog() {
+    if (git.showLog) { git.showLog = false; return; }
+    git.busy = true;
+    await gitLoadLog();
+    git.showLog = true;
+    git.busy = false;
   }
 
   // ─── redirections de ports + aperçu navigateur ───────────────────────────
@@ -2051,6 +2399,21 @@
     const i = tabs.findIndex((t) => t.id === activeTabId);
     if (i >= 0) activeTabId = tabs[(i + delta + tabs.length) % tabs.length].id;
   }
+  /** Tous les panneaux dans l'ordre de la sidebar — terminaux libres, puis les
+   *  projets. PAS l'ordre du tableau `tabs` : la sidebar regroupe par projet, et
+   *  une flèche doit aller là où l'œil l'attend. */
+  function paneOrder(): { tab: Tab; sid: string }[] {
+    const ordered = [...tabs.filter((t) => !t.projectId), ...projects.flatMap((p) => projectTabs(p.id))];
+    return ordered.flatMap((t) => leaves(t.root).map((sid) => ({ tab: t, sid })));
+  }
+  /** Panneau suivant / précédent, en traversant les projets et en bouclant. */
+  function cyclePane(delta: number) {
+    const all = paneOrder();
+    if (all.length < 2) return;
+    const i = all.findIndex((p) => p.tab.id === activeTabId && p.sid === activeTab?.active);
+    const next = all[i < 0 ? 0 : (i + delta + all.length) % all.length];
+    focusPane(next.tab, next.sid);
+  }
   type Binding = { id: string; label: string; scope: "window" | "term"; run: (sid: string | null) => void };
   const KEYBINDINGS: Binding[] = [
     { id: "palette", label: "Command palette", scope: "window", run: () => { modal = modal?.type === "palette" ? null : { type: "palette", filter: "" }; paletteSel = 0; } },
@@ -2060,6 +2423,8 @@
     { id: "split-v", label: "Split down", scope: "window", run: () => { const sid = activeTab?.active; if (sid && activeTab) openPicker({ tabId: activeTab.id, sid, dir: "v" }); } },
     { id: "next-tab", label: "Next tab", scope: "window", run: () => cycleTab(1) },
     { id: "prev-tab", label: "Previous tab", scope: "window", run: () => cycleTab(-1) },
+    { id: "next-pane", label: "Next terminal (down, across projects)", scope: "window", run: () => cyclePane(1) },
+    { id: "prev-pane", label: "Previous terminal (up, across projects)", scope: "window", run: () => cyclePane(-1) },
     { id: "toggle-sidebar", label: "Toggle sidebar", scope: "window", run: () => { settings.sidebar = !settings.sidebar; save(); } },
     { id: "clear", label: "Clear terminal", scope: "window", run: () => { const sid = activeTab?.active; if (sid) sessions.get(sid)?.term.clear(); } },
     { id: "settings", label: "Open settings", scope: "window", run: () => (modal = { type: "settings" }) },
@@ -2078,6 +2443,19 @@
   // réattribution : l'utilisateur clique un raccourci puis presse la combo
   let recordingBind = $state<string | null>(null);
   let settingsTab = $state<"appearance" | "terminal" | "shortcuts">("appearance");
+  // Capture de la combo en phase CAPTURE, sur window : sur macOS (WKWebView) cliquer
+  // un <button> ne lui donne pas le focus clavier, donc son onkeydown ne se déclenchait
+  // jamais → recordingBind restait armé et globalKeydown gelait tout le clavier. La
+  // phase capture passe aussi AVANT xterm (qui sinon avale la touche via stopPropagation).
+  $effect(() => {
+    if (!recordingBind) return;
+    const onKey = (e: KeyboardEvent) => recordKey(e, recordingBind!);
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  });
+  // quitter les réglages annule un enregistrement en cours (sinon recordingBind
+  // resterait armé après fermeture de la modale).
+  $effect(() => { if (modal?.type !== "settings") recordingBind = null; });
   function recordKey(e: KeyboardEvent, id: string) {
     e.preventDefault();
     e.stopPropagation();
@@ -2095,8 +2473,8 @@
   }
   function resetKey(id: string) { settings.keymap = { ...settings.keymap, [id]: DEFAULT_KEYS[id] }; save(); }
   function resetAllKeys() { settings.keymap = { ...DEFAULT_KEYS }; save(); }
-  const MAC_SYM: Record<string, string> = { Meta: "⌘", Ctrl: "⌃", Alt: "⌥", Shift: "⇧", Comma: ",", Enter: "↵", Space: "␣", BracketLeft: "[", BracketRight: "]", Backslash: "\\", Slash: "/", Minus: "-", Equal: "=", Backquote: "`" };
-  const WIN_NAME: Record<string, string> = { Meta: "Win", Comma: ",", Enter: "Enter", Space: "Space", BracketLeft: "[", BracketRight: "]" };
+  const MAC_SYM: Record<string, string> = { Meta: "⌘", Ctrl: "⌃", Alt: "⌥", Shift: "⇧", Comma: ",", Enter: "↵", Space: "␣", BracketLeft: "[", BracketRight: "]", Backslash: "\\", Slash: "/", Minus: "-", Equal: "=", Backquote: "`", ArrowUp: "↑", ArrowDown: "↓", ArrowLeft: "←", ArrowRight: "→" };
+  const WIN_NAME: Record<string, string> = { Meta: "Win", Comma: ",", Enter: "Enter", Space: "Space", BracketLeft: "[", BracketRight: "]", ArrowUp: "↑", ArrowDown: "↓", ArrowLeft: "←", ArrowRight: "→" };
   function formatCombo(combo: string): string {
     if (!combo) return "—";
     const parts = combo.split("+");
@@ -2134,6 +2512,11 @@
     activeTabId = tab.id;
     tab.active = sid;
     sessions.get(sid)?.term.focus();
+  }
+  /** Panneau sous les yeux : fenêtre au premier plan et panneau affiché. */
+  function visiblePane(sid: string): boolean {
+    if (!document.hasFocus()) return false;
+    return activeTab?.active === sid && (!zoomedSid || zoomedSid === sid);
   }
 
   // zoom : le panneau actif occupe tout l'onglet (⌘⇧Entrée)
@@ -2301,6 +2684,7 @@
 {#snippet iRefresh()}<svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M13 8a5 5 0 1 1-1.5-3.6M13 2.5V5h-2.5"/></svg>{/snippet}
 {#snippet iLaptop()}<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3.5" width="10" height="7" rx="1.5"/><path d="M1.5 12.5h13"/></svg>{/snippet}
 {#snippet iChevronR()}<svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3.5 10.5 8 6 12.5"/></svg>{/snippet}
+{#snippet iBranch()}<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="4.5" cy="3.5" r="1.7"/><circle cx="4.5" cy="12.5" r="1.7"/><circle cx="11.5" cy="4.5" r="1.7"/><path d="M4.5 5.2v5.6M11.5 6.2c0 3-2.5 3.4-4.5 4"/></svg>{/snippet}
 {#snippet iGlobe()}<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="6"/><path d="M2 8h12M8 2c1.7 1.6 2.7 3.8 2.7 6S9.7 12.4 8 14M8 2C6.3 3.6 5.3 5.8 5.3 8S6.3 12.4 8 14"/></svg>{/snippet}
 {#snippet iExternal()}<svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3h4v4M13 3 7.5 8.5M11 9.5V13H3V5h3.5"/></svg>{/snippet}
 {#snippet iWarn()}<svg width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2 1.5 13.5h13zM8 6.5V10M8 11.8v.2"/></svg>{/snippet}
@@ -2461,7 +2845,7 @@
     {@const s = sessions.get(node.leaf)}
     {@const st = sessStatus[node.leaf]}
     <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
-    <div class="pane" class:active={tab.active === node.leaf} class:zoomed={zoomedSid === node.leaf} onclick={() => (tab.active = node.leaf)}>
+    <div class="pane" class:active={tab.active === node.leaf} class:zoomed={zoomedSid === node.leaf} onclick={() => focusPane(tab, node.leaf)}>
       <div class="pane-bar">
         <span class="pane-left">
           {@render paneStat(node.leaf)}
@@ -2577,7 +2961,7 @@
   </div>
 {/snippet}
 
-<main class:no-sidebar={!settings.sidebar}>
+<main class:no-sidebar={!settings.sidebar} style="--term-bg: {activeTheme().background}">
   {#if settings.sidebar}
     <aside class="sidebar">
       <!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -2618,6 +3002,7 @@
                   class="icon-btn chev"
                   class:open={isExpanded(p.id)}
                   onclick={(e) => { e.stopPropagation(); expanded[p.id] = !isExpanded(p.id); }}>{@render iChevronR()}</button>
+                {#if p.emoji}<Tgs name={p.emoji} size={18} play={settings.emojiAnim} />{/if}
                 <span class="row-label strong">{p.name}</span>
                 {#if open}<span class="dot live" title="Project open"></span>{/if}
                 <button
@@ -2636,8 +3021,8 @@
                 {:else}
                   {#each projectViews(p).flatMap(projLeaves) as leaf, n (n)}
                     <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
-                    <div class="row sub dim" onclick={() => openProject(p)}>
-                      <span class="row-icon">{#if leaf.remoteId === "local"}{@render iLaptop()}{:else}{@render iTerminal()}{/if}</span>
+                    <div class="row sub dim" title="Reopen this project" onclick={() => openProject(p)}>
+                      <span class="row-icon">{@render iRefresh()}</span>
                       <span class="row-label">{projRemote(leaf.remoteId)?.name ?? "?"}{leaf.cmd ? ` — ${leaf.cmd}` : ""}</span>
                     </div>
                   {/each}
@@ -2683,6 +3068,7 @@
       {#if activeSshRemote()}
         <button class="icon-btn" class:active-btn={forwardsOpen} title="Port forwards" onclick={() => (forwardsOpen = !forwardsOpen)}>{@render iGlobe()}</button>
         <button class="icon-btn" class:active-btn={files.open} title="Server files (SFTP)" onclick={toggleFiles}>{@render iFolder()}</button>
+        <button class="icon-btn" class:active-btn={git.open} title="Source control (git)" onclick={toggleGit}>{@render iBranch()}</button>
       {/if}
       {#if forwards.length}
         <span class="fwd-count" title="Active tunnels">{forwards.length}</span>
@@ -2772,6 +3158,98 @@
       </aside>
     {/if}
 
+    {#if git.open}
+      <aside class="files git-panel">
+        <div class="files-head">
+          <span class="git-branch-wrap">
+            <button class="git-branch" title="Current branch" onclick={() => (git.showBranches = !git.showBranches)}>
+              {@render iBranch()}<span class="git-branch-name">{git.branch || "—"}</span>
+              {#if git.branches.length > 1}<span class="git-count">{git.branches.length}</span>{/if}
+            </button>
+            {#if git.showBranches}
+              <div class="git-branches">
+                {#each git.branches as b (b)}
+                  <button class="git-branch-item" class:current={b === git.branch} onclick={() => gitCheckout(b)}>{b}</button>
+                {/each}
+              </div>
+            {/if}
+          </span>
+          <span class="files-btns">
+            <button class="icon-btn" class:fetching={git.fetching} title="Refresh (fetch)" onclick={() => gitRefresh(true)}>{@render iRefresh()}</button>
+            <button class="icon-btn" title="Close" onclick={() => (git.open = false)}>{@render iClose()}</button>
+          </span>
+        </div>
+
+        {#if !git.isRepo}
+          <p class="sb-empty">Not a git repository<br /><span class="git-dim">{git.root}</span></p>
+        {:else}
+          <button class="git-graph-row" onclick={toggleGitLog}>
+            <span class="git-graph-chev" class:open={git.showLog}>{@render iChevronR()}</span>
+            <span>Commit Graph</span>
+          </button>
+          {#if git.showLog}
+            <div class="git-log">
+              {#each git.log as l (l)}<div class="git-log-line">{l}</div>{:else}<div class="git-dim git-log-line">No commits</div>{/each}
+            </div>
+          {/if}
+
+          <div class="git-commit-box">
+            <textarea
+              class="git-msg"
+              placeholder="Commit message"
+              bind:value={git.msg}
+              onkeydown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); gitCommit(); } }}></textarea>
+            <div class="git-commit-hint">{KMOD === "Meta" ? "⌘" : "Ctrl"}↵ to commit</div>
+          </div>
+
+          <div class="git-status-line">
+            <span class="git-dot" class:staged={gitStagedCount > 0}></span>
+            <span>{gitStagedCount ? `${gitStagedCount} staged` : "Nothing staged"}</span>
+            <span class="git-upstream" title="Upstream">
+              {git.upstream || "no upstream"}{#if git.ahead || git.behind}&nbsp;↑{git.ahead} ↓{git.behind}{/if}
+            </span>
+          </div>
+
+          <div class="git-actions">
+            <button class="btn git-commit-btn" disabled={!git.msg.trim() || !gitStagedCount} onclick={gitCommit}>Commit</button>
+            <button class="btn git-push-btn" disabled={!git.branch} onclick={gitPush}>Push{#if git.ahead}&nbsp;↑{git.ahead}{/if}</button>
+            <!-- pas d'upstream = rien à tirer (et `pull` échouerait faute de savoir d'où) -->
+            <button class="btn git-pull-btn" disabled={!git.upstream} onclick={gitPull}>Pull{#if git.behind}&nbsp;↓{git.behind}{/if}</button>
+          </div>
+
+          <div class="git-changes-head">
+            <span>CHANGES{#if git.entries.length}&nbsp;<span class="git-count">{git.entries.length}</span>{/if}</span>
+            {#if git.entries.length}
+              <button class="git-all" onclick={gitStageAll}>{git.entries.every((e) => e.staged) ? "Unstage all" : "Stage all"}</button>
+            {/if}
+          </div>
+
+          <div class="files-list">
+            {#each git.entries as entry (entry.path)}
+              <div class="row git-row">
+                <button class="git-file" title="Show diff" onclick={() => gitShowDiff(entry)}>
+                  <span class="row-icon file-icon">{@render iFile()}</span>
+                  <span class="git-name" class:conflict={entry.conflict}>{entry.name}</span>
+                  {#if entry.sub}<span class="git-sub">{entry.sub}</span>{/if}
+                </button>
+                {#if entry.conflict}<span class="git-confl" title="Merge conflict">!</span>{/if}
+                <button
+                  class="git-check"
+                  class:on={entry.staged}
+                  title={entry.conflict ? "Mark resolved" : entry.staged ? "Unstage" : "Stage"}
+                  onclick={() => gitToggleEntry(entry)}>{#if entry.staged}{@render iCheck()}{/if}</button>
+              </div>
+            {:else}
+              <p class="sb-empty">Working tree clean</p>
+            {/each}
+          </div>
+        {/if}
+        {#if git.busy}
+          <div class="files-veil"><span class="veil-spin">{@render iSpinner(16)}</span></div>
+        {/if}
+      </aside>
+    {/if}
+
     {#if forwardsOpen}
       <aside class="files fwd-panel">
         <div class="files-head">
@@ -2853,7 +3331,7 @@
 {#if modal}
   <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
   <div class="overlay" onclick={() => (modal = null)} transition:fade={{ duration: 120 }}>
-    <div class="sheet" class:wide={modal.type === "settings"} onclick={(e) => e.stopPropagation()} transition:scale={{ start: 0.96, opacity: 0, duration: 160 }}>
+    <div class="sheet" class:wide={modal.type === "settings"} class:diff={modal.type === "diff"} onclick={(e) => e.stopPropagation()} transition:scale={{ start: 0.96, opacity: 0, duration: 160 }}>
       {#if modal.type === "remote"}
         <h2>{remotes.some((r) => r.id === (modal as any).data.id) ? "Edit remote" : "New remote"}</h2>
         <form onsubmit={(e) => { e.preventDefault(); saveRemote(); }}>
@@ -2935,6 +3413,30 @@
         <h2>Edit project</h2>
         <form onsubmit={(e) => { e.preventDefault(); saveProjectEdit(); }}>
           <label>{@render field("Name")}<input bind:value={modal.data.name} required use:autofocus /></label>
+          {@render field("Emoji")}
+          <div class="emoji-grid">
+            <button
+              type="button"
+              class="emoji-cell"
+              class:sel={!modal.data.emoji}
+              title="No emoji"
+              onclick={() => modal && modal.type === "project" && (modal.data.emoji = undefined)}>{@render iClose()}</button>
+            {#each EMOJI as name (name)}
+              <button
+                type="button"
+                class="emoji-cell"
+                class:sel={modal.data.emoji === name}
+                onmouseenter={() => (hoverEmoji = name)}
+                onmouseleave={() => (hoverEmoji = null)}
+                onclick={() => modal && modal.type === "project" && (modal.data.emoji = name)}>
+                <Tgs {name} size={26} play={hoverEmoji === name || modal.data.emoji === name} />
+              </button>
+            {/each}
+          </div>
+          <p class="f-hint">
+            “NewsEmoji” pack by its authors on Telegram —
+            <button type="button" class="link-btn" onclick={() => openInBrowser("https://t.me/addemoji/NewsEmoji")}>t.me/addemoji/NewsEmoji</button>
+          </p>
           {#each projectViews(modal.data).flatMap(projLeaves) as leaf, n}
             <label>
               {@render field(`Terminal ${n + 1} · ${remotes.find((r) => r.id === leaf.remoteId)?.name ?? "?"} — initial command`)}
@@ -3030,6 +3532,23 @@
           <button type="button" class="btn ghost" onclick={() => (modal = { type: "configImport", text: "" })}>{@render iClipboard()}Paste config…</button>
         </div>
         <p class="f-hint">Moves your remotes, projects &amp; settings to another PC — never passwords or keys.</p>
+        <div class="sheet-actions">
+          <button class="btn" onclick={() => (modal = null)}>Close</button>
+        </div>
+      {:else if modal.type === "diff"}
+        <h2 class="diff-head">
+          <span class="diff-path">{modal.path}</span>
+          <span class="diff-mode" class:conflict={modal.mode === "conflict"}>{modal.mode}</span>
+        </h2>
+        <div class="diff-body">
+          {#if modal.loading}
+            <p class="sb-empty">Loading…</p>
+          {:else if !modal.text.trim()}
+            <p class="sb-empty">No changes</p>
+          {:else}
+            {#each parseDiff(modal.text) as l}<div class="dl {l.t}">{l.s || " "}</div>{/each}
+          {/if}
+        </div>
         <div class="sheet-actions">
           <button class="btn" onclick={() => (modal = null)}>Close</button>
         </div>
@@ -3149,6 +3668,10 @@
                 </label>
               </div>
             {/if}
+            <label class="f-check">
+              <input type="checkbox" bind:checked={settings.emojiAnim} onchange={() => save()} />
+              <span>Animate project emojis continuously</span>
+            </label>
             <div class="sheet-actions"><button type="submit" class="btn">Close</button></div>
           </form>
         {:else if settingsTab === "terminal"}
@@ -3176,6 +3699,11 @@
               <input type="checkbox" bind:checked={settings.sounds} onchange={() => save()} />
               <span>Play a sound on agent events (waiting / finished / denied)</span>
             </label>
+            <label class="f-check">
+              <input type="checkbox" bind:checked={settings.notifications} onchange={() => save()} />
+              <span>Show a system notification on agent events</span>
+            </label>
+            <p class="f-hint">Both stay quiet while you are looking at the pane that raised the event.</p>
             <label class="f-check">
               <input type="checkbox" bind:checked={settings.tmuxStatus} onchange={() => save()} />
               <span>Show tmux status bar (takes effect on reconnect)</span>
@@ -3441,8 +3969,10 @@
   .sb-section.drop { box-shadow: inset 0 0 0 1.5px var(--accent); border-radius: var(--radius-md); }
   .row .row-plus { display: none; flex: none; }
   .row:hover .row-plus { display: inline-flex; }
+  .row.dim { cursor: pointer; }
   .row.dim .row-label { color: var(--text-tertiary); }
   .row.dim .row-icon { color: var(--text-tertiary); }
+  .row.dim:hover .row-icon { color: var(--accent); } /* survol : « cliquer pour rouvrir » */
   /* sélection source list : accent plein, texte et icônes blancs */
   .row.current { background: var(--accent); }
   .row.current .row-label, .row.current .row-icon, .row.current .row-spin { color: #fff; }
@@ -3497,6 +4027,24 @@
   .sheet .row { margin: 0; }
   .sheet-actions.spread { justify-content: space-between; align-items: center; }
   .sheet.wide { width: 560px; }
+  .sheet.diff { width: min(860px, 92vw); }
+
+  /* vue de diff */
+  .diff-head { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+  .diff-path { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; }
+  .diff-mode { flex: none; font-size: 11px; font-weight: 500; color: var(--text-secondary); background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 1px 7px; }
+  .diff-mode.conflict { color: var(--danger); border-color: var(--danger); }
+  .diff-body {
+    margin: 12px 0; max-height: 62vh; overflow: auto;
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 6px 0;
+    font-family: ui-monospace, Menlo, monospace; font-size: 12px; line-height: 1.5;
+  }
+  /* pre-wrap : une ligne longue s'enroule au lieu d'imposer un scroll horizontal */
+  .dl { padding: 0 10px; white-space: pre-wrap; word-break: break-word; color: var(--text-primary); }
+  .dl.add { background: rgba(48, 209, 88, 0.13); }
+  .dl.del { background: rgba(255, 69, 58, 0.13); }
+  .dl.hunk { color: var(--text-tertiary); background: var(--surface-hover); margin: 4px 0; }
+  .dl.meta { color: var(--text-tertiary); }
 
   /* segmented control (onglets de réglages) */
   .seg { display: flex; gap: 2px; padding: 2px; margin-bottom: 16px; background: var(--surface); border-radius: var(--radius-md); }
@@ -3658,6 +4206,85 @@
   }
   .active-btn { color: var(--accent); }
 
+  /* panneau source control (git) */
+  .git-panel { width: 300px; }
+  .git-branch-wrap { position: relative; }
+  .git-branch {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 3px 8px; border-radius: 999px;
+    border: 1px solid var(--border); background: var(--surface-hover);
+    color: var(--text-primary); font-size: 12px; font-weight: 600; cursor: pointer;
+  }
+  .git-branch:hover { border-color: var(--accent); }
+  .git-branch-name { max-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .git-count {
+    min-width: 15px; height: 15px; padding: 0 4px; border-radius: 8px;
+    background: color-mix(in srgb, var(--text-primary) 12%, transparent);
+    color: var(--text-tertiary); font-size: 10px; font-weight: 600;
+    display: inline-flex; align-items: center; justify-content: center;
+  }
+  .git-branches {
+    position: absolute; top: calc(100% + 4px); left: 0; z-index: 5;
+    min-width: 180px; max-height: 240px; overflow-y: auto;
+    background: var(--bg-app); border: 1px solid var(--border);
+    border-radius: var(--radius-sm); box-shadow: 0 8px 24px rgba(0,0,0,.3); padding: 4px;
+  }
+  .git-branch-item {
+    display: block; width: 100%; text-align: left; padding: 5px 8px; border: none;
+    background: transparent; border-radius: var(--radius-sm); font-size: 12px; color: var(--text-primary); cursor: pointer;
+  }
+  .git-branch-item:hover { background: var(--surface-hover); }
+  .git-branch-item.current { color: var(--accent); font-weight: 600; }
+  .git-graph-row {
+    display: flex; align-items: center; gap: 6px; width: 100%; background: transparent;
+    padding: 8px 12px; font-size: 12px; font-weight: 600; color: var(--text-primary);
+    border: none; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); cursor: pointer;
+  }
+  .git-graph-row:hover { background: var(--surface-hover); }
+  .git-graph-chev { display: inline-flex; transition: transform .12s; color: var(--text-tertiary); }
+  .git-graph-chev.open { transform: rotate(90deg); }
+  .git-log { max-height: 180px; overflow-y: auto; padding: 4px 12px; border-bottom: 1px solid var(--border); }
+  .git-log-line { font-size: 11px; font-family: ui-monospace, SFMono-Regular, monospace; color: var(--text-tertiary); padding: 2px 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .git-commit-box { padding: 10px 12px 6px; }
+  .git-msg {
+    width: 100%; min-height: 56px; resize: vertical; padding: 8px 10px;
+    background: var(--surface-hover); border: 1px solid var(--border);
+    border-radius: var(--radius-sm); color: var(--text-primary); font: inherit; font-size: 12px;
+  }
+  .git-msg:focus { outline: none; border-color: var(--accent); }
+  .git-commit-hint { font-size: 10.5px; color: var(--text-tertiary); padding: 4px 2px 0; }
+  .git-status-line { display: flex; align-items: center; gap: 6px; padding: 4px 12px; font-size: 11.5px; color: var(--text-tertiary); }
+  .git-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--text-tertiary); flex: none; }
+  .git-dot.staged { background: var(--accent); }
+  .git-upstream { margin-left: auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 150px; }
+  .git-actions { display: flex; gap: 8px; padding: 6px 12px 10px; border-bottom: 1px solid var(--border); }
+  .git-actions .btn { flex: 1; min-width: 0; }
+  /* fetch en cours : seule l'icône tourne (.spin global ferait tourner tout le bouton) */
+  .icon-btn.fetching :global(svg) { animation: rot 800ms linear infinite; }
+  .git-changes-head {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 8px 12px 4px; font-size: 10.5px; font-weight: 700; letter-spacing: .04em;
+    color: var(--text-tertiary); text-transform: uppercase;
+  }
+  .git-all { font-size: 11px; color: var(--accent); background: transparent; border: none; cursor: pointer; text-transform: none; letter-spacing: 0; }
+  .git-all:hover { text-decoration: underline; }
+  .git-row { display: flex; align-items: center; gap: 8px; }
+  .git-file { flex: 1; min-width: 0; display: flex; align-items: baseline; gap: 6px; border: none; background: transparent; padding: 0; font: inherit; text-align: left; cursor: pointer; }
+  .git-file .row-icon { align-self: center; }
+  .git-file:hover .git-name { color: var(--accent); }
+  .git-name { font-size: 12.5px; color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .git-sub { font-size: 10.5px; color: var(--text-tertiary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: none; max-width: 90px; }
+  .git-name.conflict { color: var(--danger); }
+  .git-confl { flex: none; color: var(--danger); font-size: 12px; font-weight: 600; padding: 0 4px; }
+  .git-check {
+    width: 18px; height: 18px; flex: none; border-radius: 4px;
+    border: 1.5px solid var(--border); background: transparent;
+    display: inline-flex; align-items: center; justify-content: center; cursor: pointer; color: #fff;
+  }
+  .git-check:hover { border-color: var(--accent); }
+  .git-check.on { background: var(--accent); border-color: var(--accent); }
+  .git-dim { color: var(--text-tertiary); font-size: 11px; }
+
   /* redirections de ports + aperçu */
   .fwd-count {
     flex: none;
@@ -3738,7 +4365,8 @@
     min-height: 0;
     display: flex;
     flex-direction: column;
-    background: var(--bg-app);
+    /* suit le thème : le padding autour de xterm doit être du fond terminal, pas du gris fixe */
+    background: var(--term-bg, var(--bg-app));
   }
   .pane.active { box-shadow: inset 0 0 0 1px var(--border-strong); }
   .pane-bar {
@@ -3941,6 +4569,30 @@
   .f-check input[type="checkbox"]:focus { box-shadow: none; }
   .f-check input[type="checkbox"]:focus-visible { box-shadow: var(--focus-ring); }
   .f-hint { margin: -4px 0 0; font-size: 11.5px; line-height: 1.4; color: var(--text-tertiary); }
+  .emoji-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(38px, 1fr));
+    gap: 2px;
+    max-height: 180px;
+    overflow-y: auto;
+    padding: 6px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface);
+  }
+  .emoji-cell {
+    display: grid;
+    place-items: center;
+    aspect-ratio: 1;
+    padding: 0;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    background: none;
+    color: var(--text-tertiary);
+    cursor: pointer;
+  }
+  .emoji-cell:hover { background: var(--surface-hover); }
+  .emoji-cell.sel { border-color: var(--accent); background: var(--surface-active); }
   .sheet-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px; }
   .split-list { display: flex; flex-direction: column; gap: 1px; margin: 0 -8px; }
   .split-filter { margin-bottom: 10px; }
