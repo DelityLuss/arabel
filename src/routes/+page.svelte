@@ -1137,19 +1137,11 @@
     if (m.projectId) {
       const p = projects.find((x) => x.id === m.projectId);
       if (!p) return;
-      const open = projectTabs(p.id);
-      // projet ouvert : rejoindre la vue courante (split) plutôt qu'un onglet
-      // solitaire ; fermé : une nouvelle vue est le seul endroit possible.
-      const host = open.find((t) => t.id === activeTabId) ?? open[0];
+      const wasOpen = projectTabs(p.id).length > 0;
       const sid = makeSid();
-      if (host) {
-        addPaneToTab(host, sid);
-        activeTabId = host.id;
-        persistProject(p);
-      } else {
-        addProjectTerminal(p, sid);
-        appendProjectView(p, sid);
-      }
+      addProjectTerminal(p, sid); // un terminal = un onglet ; regrouper en split reste un geste explicite
+      // projet fermé : ne pas reserialiser (écraserait ses vues), ajouter la vue.
+      if (wasOpen) persistProject(p); else appendProjectView(p, sid);
     } else if (m.dir && m.sid && m.tabId) {
       const tab = tabs.find((t) => t.id === m.tabId);
       if (!tab?.root) return;
