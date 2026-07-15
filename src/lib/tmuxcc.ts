@@ -89,6 +89,7 @@ export type CcEvents = {
 export class TmuxControl {
   private buf = "";
   private inReply = false;
+  private isCmdReply = false;
   private replyLines: string[] = [];
   constructor(private ev: CcEvents) {}
 
@@ -104,14 +105,33 @@ export class TmuxControl {
   }
 
   private handle(line: string) {
+    // tmux -CC ouvre le flux par un DCS (`\033P1000p`) COLLÉ au premier %begin,
+    // et le referme par ST. Sans ce nettoyage, `startsWith("%begin")` rate le
+    // bloc initial et ses lignes sont prises pour des notifications.
+    // (Les données `%output` sont échappées en `\ooo` : jamais d'ESC brut ici.)
+    line = line.replace(/^\x1bP1000p/, "").replace(/\x1b\\$/, "");
     if (this.inReply) {
       if (line.startsWith("%end") || line.startsWith("%error")) {
         this.inReply = false;
-        this.ev.reply(this.replyLines, line.startsWith("%error"));
+        // seul un bloc de RÉPONSE consomme un handler : livrer le bloc
+        // d'ouverture de tmux décalerait toute la file d'un cran.
+        if (this.isCmdReply) this.ev.reply(this.replyLines, line.startsWith("%error"));
       } else this.replyLines.push(line);
       return;
     }
-    if (line.startsWith("%begin")) { this.inReply = true; this.replyLines = []; return; }
+    if (line.startsWith("%begin")) {
+      this.inReply = true;
+      this.replyLines = [];
+      // `%begin <time> <num> <flags>` : bit 0 = « réponse à une commande du
+      // client ». tmux ouvre le control-mode par un bloc à flags=0 qui ne répond
+      // à aucune commande — c'est le seul moyen de le distinguer.
+      // ponytail: le man tmux dit « flags: currently not used », mais tmux émet
+      // 0 (ouverture) vs 1 (réponse) de façon constante — vérifié en 3.7b, y
+      // compris sur %error. Le `& 1` survit à l'ajout de bits. Si un tmux futur
+      // cassait ça, le symptôme serait un onglet -CC vide : voir demo().
+      this.isCmdReply = (parseInt(line.split(" ")[3], 10) & 1) === 1;
+      return;
+    }
 
     const seg = line.split(" ");
     switch (seg[0]) {
@@ -176,6 +196,17 @@ export function demo() {
   eq(got.lay, ["1", ["1", "2"]], "cc layout");
   ctrl.feed("%begin 1 1 1\nligne\n%end 1 1 1\n");
   eq(got.reply, [["ligne"], false], "cc reply");
+  // Flux RÉEL de tmux -CC (capturé en 3.7b) : le tout premier %begin est préfixé
+  // d'un DCS \033P1000p ET porte flags=0 — c'est le bloc d'ouverture de tmux, il
+  // ne répond à AUCUNE commande. S'il était livré comme une réponse, il mangerait
+  // le handler du bootstrap et l'onglet -CC resterait vide.
+  got.reply = null;
+  ctrl.feed("\x1bP1000p%begin 2 279 0\n%end 2 279 0\n");
+  eq(got.reply, null, "bloc d'ouverture (flags=0) ne consomme pas de handler");
+  ctrl.feed("%begin 3 289 1\n@0|1|b25d,80x24,0,0,0\n%end 3 289 1\n");
+  eq(got.reply, [["@0|1|b25d,80x24,0,0,0"], false], "réponse (flags=1) livrée");
+  ctrl.feed("%begin 4 295 1\n%error 4 295 1\n");
+  eq(got.reply, [[], true], "erreur (flags=1) livrée");
   ctrl.feed("%window-close @1\n");
   eq(got.close, "1", "cc close");
   return "ok";

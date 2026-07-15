@@ -327,6 +327,39 @@ pub async fn exec(
     Ok((status, out))
 }
 
+/// Ce VPS a-t-il déjà été équipé par arabel ? `~/.arabel/hook.sh` est notre
+/// empreinte : seul `install_hooks` la pose, donc sa présence prouve qu'un
+/// `claude_sync` a déjà réussi ici — depuis n'importe quelle machine.
+///
+/// Le drapeau `claude` d'un remote vit dans le store LOCAL de l'app, sur un
+/// Remote dont l'id est un UUID tiré par machine : depuis un 2e poste, le même
+/// VPS repartait « non équipé » alors que tout y était déjà. L'info n'existait
+/// nulle part comme fait observable — seulement comme préférence déclarée. On
+/// la redemande donc au VPS, seule source de vérité partagée par les postes.
+///
+/// On ne teste PAS `command -v claude` : `exec` ouvre un shell non-interactif,
+/// qui ne lit pas ~/.bashrc — or c'est lui qui met ~/.local/bin (là où claude
+/// s'installe) dans le PATH. Le test répondrait « non » sur un VPS pourtant
+/// équipé, soit exactement le bug qu'on corrige.
+#[tauri::command]
+pub async fn claude_probe(
+    host: String,
+    port: u16,
+    user: String,
+    key_path: String,
+    identity_id: Option<String>,
+    auth: Option<String>,
+) -> Result<bool, String> {
+    let handle = connect_auth(&host, port, &user, &key_path, None, identity_id, auth).await?;
+    let (_, out) = exec(
+        &handle,
+        "test -x \"$HOME/.arabel/hook.sh\" && echo yes || echo no",
+        None,
+    )
+    .await?;
+    Ok(out.trim().lines().last() == Some("yes"))
+}
+
 /// Pousse la config locale ~/.claude vers le VPS et installe claude si absent.
 #[tauri::command]
 pub async fn claude_sync(
@@ -336,6 +369,10 @@ pub async fn claude_sync(
     key_path: String,
     identity_id: Option<String>,
     auth: Option<String>,
+    // Réglages arabel poussés dans le settings.json distant. Option<> : un appel
+    // qui les omet garde le comportement d'avant (teams désactivées).
+    agent_teams: Option<bool>,
+    agent_team_panes: Option<bool>,
 ) -> Result<String, String> {
     let home = crate::home_dir()?;
     // ponytail: whitelist explicite — ~/.claude contient aussi l'historique de
@@ -387,13 +424,23 @@ pub async fn claude_sync(
         return Err(format!("remote tar (code {status}): {out}"));
     }
 
-    let hooks = install_hooks(&handle).await;
+    let teams = agent_teams.unwrap_or(false);
+    let panes = agent_team_panes.unwrap_or(true);
+    let hooks = install_hooks(&handle, teams, panes).await;
+    let verbs = install_verb_cli(&handle).await;
     let plugins = provision_plugins(&handle, &home).await;
 
     let mut msg = format!(
-        "claude {boot} · {} config item(s) pushed · {hooks} · {plugins}",
+        "claude {boot} · {} config item(s) pushed · {hooks} · {verbs} · {plugins}",
         existing.len()
     );
+    if teams {
+        msg.push_str(if panes {
+            " · agent teams (own panes)"
+        } else {
+            " · agent teams (in-process)"
+        });
+    }
     if let Some(w) = statusline_warning(&handle, &home).await {
         msg.push_str(&format!(" · {w}"));
     }
@@ -446,8 +493,9 @@ grep -qF "zsh-autosuggestions.zsh" "$RC" 2>/dev/null || \
     }
 }
 
-/// Installe le script de hook arabel et le branche dans ~/.claude/settings.json distant.
-async fn install_hooks(handle: &client::Handle<Handler>) -> String {
+/// Installe le script de hook arabel et le branche dans ~/.claude/settings.json
+/// distant ; y applique aussi les réglages « agent teams ».
+async fn install_hooks(handle: &client::Handle<Handler>, teams: bool, panes: bool) -> String {
     const HOOK_SH: &str = r#"#!/bin/sh
 mkdir -p "$HOME/.arabel"
 printf '{"pane":"%s","event":%s}\n' "$ARABEL_PANE" "$(cat | tr -d '\n')" >> "$HOME/.arabel/events.jsonl"
@@ -468,6 +516,24 @@ for ev in ("Notification", "Stop", "PreToolUse", "UserPromptSubmit"):
     entries = h.setdefault(ev, [])
     if not any("arabel" in json.dumps(e) for e in entries):
         entries.append({"hooks": [cmd]}); changed = True
+
+# Agent teams : la var d'env active la fonctionnalité, teammateMode décide si
+# chaque coéquipier ouvre son propre panneau tmux (miroir dans la grille arabel
+# en mode -CC) ou reste dans le pane du lead. Décoché = on RETIRE ce qu'on avait
+# posé, sinon la case ne voudrait rien dire sur un VPS déjà équipé.
+env = cfg.setdefault("env", {})
+if TEAMS:
+    if env.get("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS") != "1":
+        env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] = "1"; changed = True
+    mode = "tmux" if PANES else "in-process"
+    if cfg.get("teammateMode") != mode:
+        cfg["teammateMode"] = mode; changed = True
+else:
+    if env.pop("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", None) is not None: changed = True
+    if cfg.pop("teammateMode", None) is not None: changed = True
+if not env:
+    cfg.pop("env", None)
+
 os.makedirs(os.path.dirname(p), exist_ok=True)
 json.dump(cfg, open(p, "w"), indent=2)
 print("installed" if changed else "present")
@@ -481,10 +547,71 @@ print("installed" if changed else "present")
     if !matches!(w, Ok((0, _))) {
         return "hooks not installed (script write failed)".into();
     }
-    match exec(handle, "python3 -", Some(MERGE_PY.as_bytes())).await {
+    // Les valeurs sont injectées par un prélude : `format!` sur MERGE_PY buterait
+    // sur les accolades des dicts python.
+    let py = format!(
+        "TEAMS = {}\nPANES = {}\n{MERGE_PY}",
+        if teams { "True" } else { "False" },
+        if panes { "True" } else { "False" },
+    );
+    match exec(handle, "python3 -", Some(py.as_bytes())).await {
         Ok((0, out)) if out.contains("present") => "hooks already in place".into(),
         Ok((0, _)) => "notification hooks installed".into(),
         _ => "hooks not wired up (python3 missing on the VPS?)".into(),
+    }
+}
+
+/// Installe `~/.arabel/arabel` : le CLI que l'agent appelle pour piloter l'app
+/// (`~/.arabel/arabel preview 3000`), et documente les verbes dans le CLAUDE.md
+/// distant pour qu'il sache qu'ils existent.
+///
+/// Aucun PATH à câbler : le CLAUDE.md donne le chemin absolu. C'est ce qui le fait
+/// marcher aussi dans les panneaux `tmux -CC`, qui n'héritent pas de l'init du pane.
+async fn install_verb_cli(handle: &client::Handle<Handler>) -> String {
+    // Le script n'exécute RIEN : il imprime une séquence OSC sur son propre
+    // terminal. L'app la reçoit par le PTY de CE panneau — c'est ce qui lui dit
+    // d'où vient l'ordre, sans aucune variable d'environnement.
+    const VERB_SH: &str = r#"#!/bin/sh
+[ $# -gt 0 ] || { echo "usage: arabel preview <port>" >&2; exit 2; }
+seq="\033]7770;$*\007"
+# tmux n'achemine pas les OSC qu'il ne connaît pas : emballage passthrough, ESC
+# du contenu doublé (allow-passthrough est déjà posé par arabel).
+[ -n "$TMUX" ] && seq="\033Ptmux;\033$seq\033\\\\"
+printf '%b' "$seq"
+"#;
+    // Le tar de claude_sync vient d'écraser le CLAUDE.md distant par la copie
+    // locale : on ré-ajoute la section après, et le grep garantit qu'il n'y en a
+    // qu'une (même motif que shell_enhance avec .zshrc).
+    const DOC_SH: &str = r#"set -e
+MD="$HOME/.claude/CLAUDE.md"
+mkdir -p "$HOME/.claude"
+grep -qF "arabel preview" "$MD" 2>/dev/null && exit 0
+cat >> "$MD" <<'EOF'
+
+## arabel terminal
+This terminal is arabel, a desktop app on the user's machine. You can drive it:
+
+- `~/.arabel/arabel preview <port>` — open a browser pane on that port of THIS
+  server. The tunnel is set up automatically. Run it right after starting a dev
+  server, so the user sees the page without leaving the terminal.
+
+Two more things work here that a plain terminal cannot do:
+- `printf '\033]0;title\007'` sets this pane's title (use it to say what you are doing).
+- OSC 52 copies to the user's local clipboard.
+EOF
+"#;
+    let w = exec(
+        handle,
+        "mkdir -p ~/.arabel && cat > ~/.arabel/arabel && chmod +x ~/.arabel/arabel",
+        Some(VERB_SH.as_bytes()),
+    )
+    .await;
+    if !matches!(w, Ok((0, _))) {
+        return "verbs not installed (script write failed)".into();
+    }
+    match exec(handle, "sh", Some(DOC_SH.as_bytes())).await {
+        Ok((0, _)) => "verbs ready (arabel preview)".into(),
+        _ => "verbs installed (CLAUDE.md not documented)".into(),
     }
 }
 

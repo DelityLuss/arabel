@@ -108,8 +108,66 @@ async fn spawn_in_pty(
     Ok(())
 }
 
+/// Décode la sortie de `wsl.exe -l -q` : de l'UTF-16LE, une distro par ligne.
+/// Testable hors Windows — c'est la seule vraie logique de `wsl_distros`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_distros(out: &[u8]) -> Vec<String> {
+    let u16s: Vec<u16> = out.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    String::from_utf16_lossy(&u16s)
+        .lines()
+        // wsl.exe termine chaque nom par un \r ; trim() l'enlève avec le BOM éventuel
+        .map(|l| l.trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}').to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+/// Distributions WSL installées (vide hors Windows / si WSL absent).
+#[tauri::command]
+pub fn wsl_distros() -> Vec<String> {
+    #[cfg(not(windows))]
+    return Vec::new();
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // -l -q : noms seuls, sans la mention "(par défaut)".
+        // CREATE_NO_WINDOW (0x0800_0000) évite un flash de console.
+        match std::process::Command::new("wsl.exe")
+            .args(["-l", "-q"])
+            .creation_flags(0x0800_0000)
+            .output()
+        {
+            Ok(o) if o.status.success() => parse_distros(&o.stdout),
+            _ => Vec::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_distros;
+
+    fn utf16le(s: &str) -> Vec<u8> {
+        s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn parses_wsl_output() {
+        // ce que `wsl.exe -l -q` écrit réellement : UTF-16LE, lignes en \r\n
+        assert_eq!(
+            parse_distros(&utf16le("Ubuntu\r\nDebian\r\n")),
+            vec!["Ubuntu".to_string(), "Debian".to_string()]
+        );
+        // BOM en tête + ligne vide finale
+        assert_eq!(parse_distros(&utf16le("\u{feff}Ubuntu-22.04\r\n\r\n")), vec!["Ubuntu-22.04".to_string()]);
+        // WSL absent → sortie vide, et jamais de panique sur un octet orphelin
+        assert!(parse_distros(b"").is_empty());
+        assert!(parse_distros(b"\x00").is_empty());
+    }
+}
+
 /// Terminal local : shell de l'utilisateur dans un PTY, mêmes events et mêmes
 /// commandes write/resize/disconnect que les sessions SSH (via SshState).
+/// `distro` non vide → shell de login de cette distribution WSL (Windows only).
 #[tauri::command]
 pub async fn local_connect(
     app: AppHandle,
@@ -117,11 +175,24 @@ pub async fn local_connect(
     session_id: String,
     cols: u32,
     rows: u32,
+    distro: Option<String>,
 ) -> Result<(), String> {
+    #[cfg(not(windows))]
+    let _ = distro; // WSL n'existe que sous Windows
     // Windows n'a pas de $SHELL ni de flag `-l` : PowerShell, présent partout.
     #[cfg(windows)]
     let mut cmd = {
-        let mut c = CommandBuilder::new("powershell.exe");
+        let mut c = match distro.filter(|d| !d.is_empty()) {
+            // `wsl.exe -d <distro>` lance le shell de login de la distro. Le cwd
+            // Windows plus bas ne s'y applique pas : wsl traduirait le chemin en
+            // /mnt/c/… alors qu'on veut le $HOME Linux → il gère seul son cwd.
+            Some(d) => {
+                let mut c = CommandBuilder::new("wsl.exe");
+                c.args(["-d", d.as_str(), "--cd", "~"]);
+                c
+            }
+            None => CommandBuilder::new("powershell.exe"),
+        };
         // portable-pty démarre avec un environnement VIDE. Sans PATH, le chemin
         // relatif "powershell.exe" est introuvable → le terminal local ne
         // démarrait pas sous Windows. On hérite de l'env du process parent

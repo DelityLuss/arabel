@@ -1,17 +1,16 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { listen as tauriListen, type UnlistenFn } from "@tauri-apps/api/event";
-  import { getCurrentWindow } from "@tauri-apps/api/window";
   import { readText, writeText, readImage } from "@tauri-apps/plugin-clipboard-manager";
   import { openUrl } from "@tauri-apps/plugin-opener";
-  import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
+  import { notify, playSound, setBadge, claudeTurn, prefs as notifPrefs, demo as notifyDemo } from "$lib/notify";
   import { Terminal, type ITheme } from "@xterm/xterm";
   import { FitAddon } from "@xterm/addon-fit";
   import { SearchAddon } from "@xterm/addon-search";
   import { WebLinksAddon } from "@xterm/addon-web-links";
   import { WebglAddon } from "@xterm/addon-webgl";
   import "@xterm/xterm/css/xterm.css";
-  import { onDestroy, type Snippet } from "svelte";
+  import { onDestroy, tick, type Snippet } from "svelte";
   import { fade, fly, scale } from "svelte/transition";
   import { flip } from "svelte/animate";
   import { TmuxControl, parseLayout, layToTree, layPanes, layPaneSizes, toHexKeys, demo as tmuxccDemo, type Lay } from "$lib/tmuxcc";
@@ -21,6 +20,7 @@
   // ─── mode démo (aperçu navigateur sans Tauri) ─────────────────────────────
   const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
   if (!inTauri) try { tmuxccDemo(); } catch (e) { console.error("tmuxcc:", e); } // auto-test parseur en dev
+  if (!inTauri) try { notifyDemo(); } catch (e) { console.error("notify:", e); } // auto-test statut de tour
   if (!inTauri) try { gitStatusDemo(); } catch (e) { console.error("git:", e); }
 
   // ─── plateforme : macOS vs Windows/Linux ──────────────────────────────────
@@ -65,9 +65,11 @@
     // démo : réponses factices
     await new Promise((r) => setTimeout(r, cmd === "ssh_connect" ? 700 : 30));
     if (cmd === "store_load") return JSON.stringify(DEMO_STORE) as T;
+    if (cmd === "claude_probe") return true as T; // démo : le VPS est déjà équipé
     if (cmd === "claude_sync") return "claude present · 5 config item(s) pushed · hooks installed" as T;
     if (cmd === "shell_enhance") return "suggestions enabled — open a new terminal." as T;
     if (cmd === "mosh_available") return true as T;
+    if (cmd === "wsl_distros") return ["Ubuntu", "Debian"] as T;
     if (cmd === "sftp_paste_image") return "/home/deploy/.arabel/paste/demo.png" as T;
     if (cmd === "sftp_home") return "/home/deploy" as T;
     if (cmd === "sftp_list")
@@ -118,11 +120,14 @@
   type ImportHost = { host: string; hostName: string; user: string; port: number; identityFile: string };
   type PaneNode = { leaf: string } | { dir: "h" | "v"; ratio: number; a: PaneNode; b: PaneNode };
   type Tab = { id: string; root: PaneNode | null; active: string | null; projectId: string | null; cc?: string };
-  type ProjLeaf = { remoteId: string; cmd: string; id?: string };
+  // `cmd` (legacy, commande par pane) est migré vers Project.cmd au chargement.
+  type ProjLeaf = { remoteId: string; cmd?: string; id?: string };
   type ProjNode = ProjLeaf | { dir: "h" | "v"; ratio?: number; a: ProjNode; b: ProjNode };
   // un projet = plusieurs vues (chaque vue = un onglet ; une vue peut être un split).
   // `root` (legacy, une seule vue) est migré à la lecture via projectViews().
-  type Project = { id: string; name: string; emoji?: string; views?: ProjNode[]; root?: ProjNode };
+  // `cmd` : commandes de démarrage du projet, rejouées sur CHAQUE terminal qu'on
+  // y crée — les panes vont et viennent, la commande appartient au projet.
+  type Project = { id: string; name: string; emoji?: string; cmd?: string; views?: ProjNode[]; root?: ProjNode };
   type SessStatus = { status: "connecting" | "open" | "closed" | "error"; error: string };
   type Modal =
     | { type: "remote"; data: Remote; password: string; back?: boolean }
@@ -138,8 +143,16 @@
     | { type: "diff"; path: string; mode: string; text: string; loading: boolean }
     | null;
 
-  // pseudo-remote pour le terminal local
+  // pseudo-remotes pour les terminaux locaux : la machine + une par distro WSL
+  // (id `wsl:<distro>`, Windows only). Même forme qu'un Remote → remoteRow, la
+  // palette et les projets les traitent sans cas particulier.
   const LOCAL: Remote = { id: "local", name: isMac ? "This Mac" : "This PC", host: "", port: 0, user: "", identityId: "" };
+  const isLocal = (id: string) => id === "local" || id.startsWith("wsl:");
+  let wslDistros = $state<string[]>([]);
+  const locals = $derived<Remote[]>([
+    LOCAL,
+    ...wslDistros.map((d) => ({ ...LOCAL, id: `wsl:${d}`, name: d })),
+  ]);
 
   // ─── thèmes terminal ──────────────────────────────────────────────────────
   const THEMES: Record<string, ITheme> = {
@@ -227,6 +240,13 @@
     sounds: true, // sons d'événements agent (validation demandée / terminé / refus)
     notifications: true, // notifications système sur les mêmes événements
     tmuxStatus: false, // barre de statut tmux masquée par défaut (doublon de la sidebar)
+    // « agent teams » de Claude Code : le lead peut lancer des coéquipiers, chacun
+    // sa session. Expérimental ET nettement plus cher en tokens → opt-in explicite.
+    agentTeams: false,
+    // décoché = teammateMode "in-process" : les coéquipiers restent dans le pane du
+    // lead au lieu d'ouvrir chacun son panneau tmux (miroir dans la grille en -CC).
+    agentTeamPanes: true,
+    projects: true, // décoché = terminaux seuls ; les projets restent en mémoire, juste masqués
     emojiAnim: true, // emojis de projet animés en continu ; décoché = figés sur la 1re frame
     cursorStyle: "bar" as "bar" | "block" | "underline",
     cursorBlink: true,
@@ -278,6 +298,7 @@
   let confirmDeleteId = $state<string | null>(null);
   let moshOk = $state(false); // binaire mosh présent → propose le transport mosh
   rpc<boolean>("mosh_available").then((v) => (moshOk = v)).catch(() => {});
+  rpc<string[]>("wsl_distros").then((v) => (wslDistros = v ?? [])).catch(() => {});
 
   rpc<string>("store_load").then((json) => {
     let data: any;
@@ -286,6 +307,14 @@
     identities = data.identities ?? [];
     remotes = data.remotes ?? [];
     projects = data.projects ?? [];
+    // migration : la commande de démarrage était par pane, elle est désormais au
+    // projet. ponytail: si plusieurs panes en avaient une différente, seule la
+    // première survit — l'ancienne UI ne servait qu'à en poser une.
+    for (const p of projects) {
+      const pleaves = projectViews(p).flatMap(projLeaves);
+      p.cmd ??= pleaves.map((l) => l.cmd).find(Boolean) ?? "";
+      for (const l of pleaves) delete l.cmd;
+    }
     settings = { ...settings, ...data.settings };
     savedTitles = data.titles ?? {}; // noms de terminaux (avant restore : sessLabel les relira par key)
     restoreWorkspace(data.workspace);
@@ -364,7 +393,7 @@
     if (!ws?.tabs?.length) return; // rien à restaurer : on garde l'onglet vide
     const restored: Tab[] = [];
     for (const t of ws.tabs) {
-      const root = buildNode(t.root);
+      const root = buildNode(t.root, projects.find((p) => p.id === t.projectId)?.cmd);
       if (root) restored.push({ id: crypto.randomUUID(), root, active: firstLeaf(root), projectId: t.projectId ?? null });
     }
     if (!restored.length) return;
@@ -414,10 +443,21 @@
     if (activeTabId === t.id) activeTabId = tabs[tabs.length - 1].id;
   }
 
+  /** Rend le clavier au terminal visé APRÈS le flush Svelte : tant que son onglet
+   *  est en display:none, term.focus() est ignoré — c'est ce qui obligeait à
+   *  re-cliquer dans le terminal pour taper ou valider. */
+  async function focusActive(sid: string | null) {
+    if (!sid) return;
+    await tick();
+    if (modal || searchState || renamingSid) return; // une saisie a la priorité
+    sessions.get(sid)?.term.focus();
+  }
+
   // re-fit les terminaux quand on change d'onglet (ils étaient en display:none)
   $effect(() => {
     const t = tabs.find((x) => x.id === activeTabId);
     if (!t) return;
+    focusActive(t.active); // couvre tous les chemins : sidebar, palette, ⌘1..9, cycle d'onglets
     if (t.cc) {
       // onglet tmux -CC : on réapplique le layout tmux courant (re-cale chaque
       // xterm sur la grille tmux + renvoie la taille client), pas de fit conteneur.
@@ -520,6 +560,10 @@
   function shq(s: string): string {
     return `'${s.replace(/'/g, `'\\''`)}'`;
   }
+  /** Commandes de démarrage d'un pane : une par ligne, lignes vides ignorées. */
+  function cmdLines(cmd: string | undefined): string[] {
+    return (cmd ?? "").split("\n").map((l) => l.trim()).filter(Boolean);
+  }
   /** Crée ou réattache la session tmux ; l'init n'est tapé qu'à la création. */
   function tmuxCmd(name: string, init: string, paneSid: string | null): string {
     const n = shq(name);
@@ -586,27 +630,45 @@
       } catch { /* base64 invalide */ }
       return true;
     });
+    // Une frappe qu'on consomme doit AUSSI être annulée côté navigateur. xterm
+    // ne le fait pas : son `_keyDown` fait `if (handler(e) === false) return`,
+    // sans preventDefault. L'action native suivait donc son cours — et comme
+    // xterm écoute `paste` sur son textarea ET sur son élément, ⌘V collait deux
+    // fois : une par pasteClipboard(), une par le collage natif du webview.
+    // `consume()` doit être utilisé partout où l'on renvoie false.
+    const consume = (e: KeyboardEvent) => {
+      e.preventDefault();
+      return false;
+    };
+    // OSC 7770 = verbes arabel, émis par `~/.arabel/arabel` sur le serveur. La
+    // séquence arrive par le PTY de CE panneau : c'est ça qui identifie
+    // l'émetteur — rien à exporter, et ça marche aussi dans un panneau tmux -CC.
+    term.parser.registerOscHandler(7770, (data) => {
+      arabelVerb(sid, data);
+      return true;
+    });
     term.attachCustomKeyEventHandler((e) => {
       if (e.type !== "keydown") return true;
       // Shift+Entrée → nouvelle ligne sans envoyer (attendu par Claude Code) :
       // on émet ESC+CR, reconnu comme saut de ligne même à travers tmux
       if (e.key === "Enter" && e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey) {
         send("\x1b\r");
-        return false;
+        return consume(e);
       }
       // Ctrl+V « nu » (la touche de collage de Claude Code, y compris sur Mac) :
       // si une image locale est dispo on l'upload, sinon on restitue la frappe.
       if (e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "v") {
         pasteClipboard(sid, "\x16");
-        return false;
+        return consume(e);
       }
       // raccourci configurable ? term = exécuté ici (accès sélection/pane) ;
       // window = laissé remonter à globalKeydown, mais rien n'est envoyé au pty.
+      // preventDefault n'empêche pas la remontée : globalKeydown reçoit toujours.
       const id = actionCombos.get(comboOf(e));
       if (id) {
         const b = bindById.get(id)!;
         if (b.scope === "term") b.run(sid);
-        return false;
+        return consume(e);
       }
       return true;
     });
@@ -640,9 +702,10 @@
     const s = sessions.get(sid);
     if (!s) return;
     sessStatus[sid] = { status: "connecting", error: "" };
-    if (s.remote.id === "local") {
+    if (isLocal(s.remote.id)) {
       try {
-        await rpc("local_connect", { sessionId: sid, cols: s.term.cols, rows: s.term.rows });
+        const distro = s.remote.id.startsWith("wsl:") ? s.remote.id.slice(4) : null;
+        await rpc("local_connect", { sessionId: sid, cols: s.term.cols, rows: s.term.rows, distro });
       } catch (e) {
         sessStatus[sid] = { status: "error", error: String(e) };
         return;
@@ -660,13 +723,30 @@
         keyPath = identity.keyPath;
         identityId = identity.id;
       }
+      // Le drapeau `claude` est une préférence stockée dans le store LOCAL, sur un
+      // Remote dont l'id est un UUID tiré par machine : un 2e poste voyait le même
+      // VPS comme neuf et perdait tag, dashboard et hooks. On demande au VPS s'il
+      // est déjà équipé (~/.arabel) — une fois par remote et par lancement, et
+      // seulement tant qu'on ne le sait pas : c'est un cache dérivable, pas une
+      // vérité déclarée. Best-effort : si le probe échoue, on garde l'existant.
+      if (!s.remote.claude && !probedRemotes.has(s.remote.id)) {
+        probedRemotes.add(s.remote.id);
+        try {
+          if (await rpc<boolean>("claude_probe", remoteParams(s.remote))) {
+            s.remote.claude = true;
+            remotes = [...remotes]; // réactivité : tag « claude » + dashboard Agents
+            await save();
+            s.term.write("\x1b[90m[arabel] Claude already set up here — tracking enabled\x1b[0m\r\n");
+          }
+        } catch { /* probe indisponible : on n'empêche pas la connexion */ }
+      }
       const useTmux = s.remote.tmux !== false; // activé par défaut : survie aux déconnexions
       let execCmd: string | null = null;
       if (useTmux) {
         // la sync config doit précéder le premier lancement de claude (hooks)
         if (s.remote.claude && !syncedRemotes.has(s.remote.id)) {
           try {
-            const msg = await rpc<string>("claude_sync", remoteParams(s.remote));
+            const msg = await rpc<string>("claude_sync", syncParams(s.remote));
             syncedRemotes.add(s.remote.id);
             s.term.write(`\x1b[90m[arabel] ${msg}\x1b[0m\r\n`);
           } catch (e) {
@@ -676,7 +756,8 @@
         const init: string[] = [];
         if (s.remote.dir) init.push(`cd ${shq(s.remote.dir)} 2>/dev/null`); // répertoire de travail
         if (s.remote.claude) init.push(`export ARABEL_PANE=${sid}`); // suivi : claude lancé plus tard sera tracké
-        if (s.cmd) init.push(s.cmd);
+        const lines = cmdLines(s.cmd);
+        if (lines.length) init.push(...lines);
         else if (s.remote.claude && s.remote.autoLaunch) init.push("claude"); // lancement auto uniquement si demandé
         execCmd = tmuxCmd(`arabel-${s.key.slice(0, 8)}`, init.join("; "), s.remote.claude ? sid : null);
       }
@@ -738,13 +819,13 @@
         sessStatus[sid] = { status: "closed", error: "" };
         s.unlisteners.forEach((u) => u());
         s.unlisteners = [];
-        if (s.remote.id !== "local") scheduleReconnect(sid); // auto-reconnexion
+        if (!isLocal(s.remote.id)) scheduleReconnect(sid); // auto-reconnexion
       }),
     );
     // taille réelle du pane (la connexion est partie en 80x24 par défaut)
     s.fit.fit();
     rpc("ssh_resize", { sessionId: sid, cols: s.term.cols, rows: s.term.rows });
-    if (s.remote.id !== "local") {
+    if (!isLocal(s.remote.id)) {
       // métriques & hooks passent par des canaux russh indépendants → indisponibles
       // en transport « ssh système » (compromis assumé pour la compat des clés).
       if (!s.remote.sysSsh) {
@@ -755,18 +836,20 @@
         // sans tmux : init envoyé dans le shell après connexion (comportement historique)
         if (s.remote.dir) await rpc("ssh_write", { sessionId: sid, data: `cd ${shq(s.remote.dir)} 2>/dev/null\n` });
         if (s.remote.claude && !s.remote.sysSsh) await rpc("ssh_write", { sessionId: sid, data: `export ARABEL_PANE=${sid}\n` });
-        if (s.cmd) await rpc("ssh_write", { sessionId: sid, data: s.cmd + "\n" });
+        const lines = cmdLines(s.cmd);
+        if (lines.length) await rpc("ssh_write", { sessionId: sid, data: lines.join("\n") + "\n" });
         else if (s.remote.claude && s.remote.autoLaunch && !s.remote.sysSsh) claudeSetup(sid, s.remote);
       }
     } else {
       if (!inTauri) {
-        metrics["local"] = { load: 3.2, cpus: 10, memTotal: 34359738368, memUsed: 21474836480, diskTotal: 994662584320, diskUsed: 703687441776 };
+        metrics[s.remote.id] = { load: 3.2, cpus: 10, memTotal: 34359738368, memUsed: 21474836480, diskTotal: 994662584320, diskUsed: 703687441776 };
       }
-      if (s.cmd) await rpc("ssh_write", { sessionId: sid, data: s.cmd + "\n" });
+      const lines = cmdLines(s.cmd);
+      if (lines.length) await rpc("ssh_write", { sessionId: sid, data: lines.join("\n") + "\n" });
     }
     if (!inTauri) {
       s.term.write(DEMO_OUTPUT);
-      if (s.remote.id !== "local")
+      if (!isLocal(s.remote.id))
         metrics[s.remote.id] = { load: 1.4, cpus: 4, memTotal: 8321499136, memUsed: 5100273664, diskTotal: 84825923584, diskUsed: 39728447488 };
       // démo : activité live puis question à choix (états « travaille » / « attend »)
       if (s.remote.claude) {
@@ -866,6 +949,11 @@
     return c ? ccSessions.get(c.ctrlSid) : undefined;
   };
   const ccPaneId = (sid: string) => sessions.get(sid)?.cc?.paneId ?? "";
+  /** UNIQUE voie d'envoi d'une commande à tmux -CC. tmux répond `%begin…%end` à
+   *  CHAQUE commande : tout envoi doit donc réserver sa place dans `pending`,
+   *  sinon la file se décale et les réponses partent au mauvais handler (le
+   *  bootstrap `list-windows` était mangé par la réponse vide de refresh-client).
+   *  Ne jamais écrire sur `ctrlSid` par `ssh_write` directement. */
   function ccExec(cc: CcSession, cmd: string, handler?: (lines: string[], error: boolean) => void) {
     cc.pending.push(handler ?? (() => {}));
     rpc("ssh_write", { sessionId: cc.ctrlSid, data: cmd + "\n" });
@@ -882,7 +970,7 @@
     const sid = ccSid(cc.ctrlSid, paneId);
     if (sessions.has(sid)) return sid;
     const { term, fit, search } = setupTerm(sid, (data) =>
-      rpc("ssh_write", { sessionId: cc.ctrlSid, data: `send-keys -t %${paneId} -H ${toHexKeys(data)}\n` }),
+      ccExec(cc, `send-keys -t %${paneId} -H ${toHexKeys(data)}`),
     );
     sessions.set(sid, { term, fit, search, remote: cc.remote, cmd: "", key: sid, unlisteners: [], webgl: false, cc: { ctrlSid: cc.ctrlSid, paneId } });
     sessStatus[sid] = { status: "open", error: "" };
@@ -947,10 +1035,10 @@
     const rows = Math.max(5, Math.floor((el.clientHeight - 34) / h)); // -34 : barre du panneau (26) + marge bas (8)
     if (cc.lastSize?.c === cols && cc.lastSize?.r === rows) return; // même taille → pas de refresh (évite une boucle de %layout-change)
     cc.lastSize = { c: cols, r: rows };
-    rpc("ssh_write", { sessionId: cc.ctrlSid, data: `refresh-client -C ${cols}x${rows}\n` });
+    ccExec(cc, `refresh-client -C ${cols}x${rows}`);
   }
   async function openTmuxNative(remote: Remote) {
-    if (remote.id === "local") return toast("Native tmux mode is for SSH remotes.", "error");
+    if (isLocal(remote.id)) return toast("Native tmux mode is for SSH remotes.", "error");
     const authKind: AuthKind = remote.auth ?? "key";
     let keyPath = "";
     let identityId = remote.id;
@@ -964,7 +1052,11 @@
     const tabId = crypto.randomUUID();
     const cc: CcSession = { ctrlSid, remote, tabId, ctrl: null as unknown as TmuxControl, unlisteners: [], pending: [], windows: new Map(), activeWindow: null, winName: {} };
     cc.ctrl = new TmuxControl({
-      output: (pane, bytes) => { const cs = ccSid(ctrlSid, pane); lastOut[cs] = Date.now(); sessions.get(cs)?.term.write(bytes); },
+      // tmux émet le premier %output (prompt du shell) AVANT tout %layout-change :
+      // sans création à la demande, cette sortie est écrite dans le vide et le
+      // panneau reste noir jusqu'à la première frappe. ccApplyLayout garde le
+      // panneau (il est dans le layout) et le placera dans la grille.
+      output: (pane, bytes) => { const cs = ccEnsurePane(cc, pane); lastOut[cs] = Date.now(); sessions.get(cs)?.term.write(bytes); },
       layout: (win, tree) => ccApplyLayout(cc, win, tree),
       windowClose: (win) => {
         cc.windows.delete(win);
@@ -1045,10 +1137,19 @@
     if (m.projectId) {
       const p = projects.find((x) => x.id === m.projectId);
       if (!p) return;
-      const wasOpen = projectTabs(p.id).length > 0;
+      const open = projectTabs(p.id);
+      // projet ouvert : rejoindre la vue courante (split) plutôt qu'un onglet
+      // solitaire ; fermé : une nouvelle vue est le seul endroit possible.
+      const host = open.find((t) => t.id === activeTabId) ?? open[0];
       const sid = makeSid();
-      addProjectTerminal(p, sid); // vue séparée (nouvel onglet), pas de split auto
-      if (wasOpen) persistProject(p); else appendProjectView(p, sid);
+      if (host) {
+        addPaneToTab(host, sid);
+        activeTabId = host.id;
+        persistProject(p);
+      } else {
+        addProjectTerminal(p, sid);
+        appendProjectView(p, sid);
+      }
     } else if (m.dir && m.sid && m.tabId) {
       const tab = tabs.find((t) => t.id === m.tabId);
       if (!tab?.root) return;
@@ -1066,12 +1167,17 @@
   }
   function doPick(remote: Remote) {
     if (modal?.type !== "picker") return;
-    if (modal.cc && !modal.dir && !modal.projectId && remote.id !== "local") {
+    const m = modal;
+    if (m.cc && !m.dir && !m.projectId && !isLocal(remote.id)) {
       modal = null;
       openTmuxNative(remote);
       return;
     }
-    placeLeaf(() => newSession(remote));
+    // le terminal rejoue les commandes du projet où il atterrit : soit le projet
+    // visé par le « + », soit celui de l'onglet qu'on splitte.
+    const pid = m.projectId ?? tabs.find((t) => t.id === m.tabId)?.projectId;
+    const cmd = (pid && projects.find((x) => x.id === pid)?.cmd) || "";
+    placeLeaf(() => newSession(remote, cmd));
   }
 
   // ─── panneaux navigateur (aperçu web intégré à la grille) ────────────────
@@ -1277,7 +1383,7 @@
     if ("leaf" in node) {
       const s = sessions.get(node.leaf);
       // les panneaux tmux natifs se réattachent via tmux -CC, pas via le store
-      return s && !s.cc ? { remoteId: s.remote.id, cmd: s.cmd, id: s.key } : null;
+      return s && !s.cc ? { remoteId: s.remote.id, id: s.key } : null;
     }
     const a = serializeTree(node.a);
     const b = serializeTree(node.b);
@@ -1296,16 +1402,16 @@
     return tabs.filter((t) => t.projectId === pid);
   }
   function projRemote(remoteId: string): Remote | undefined {
-    return remoteId === "local" ? LOCAL : remotes.find((r) => r.id === remoteId);
+    return isLocal(remoteId) ? locals.find((l) => l.id === remoteId) : remotes.find((r) => r.id === remoteId);
   }
-  function buildNode(n: ProjNode): PaneNode | null {
+  function buildNode(n: ProjNode, cmd = ""): PaneNode | null {
     if ("remoteId" in n) {
       const remote = projRemote(n.remoteId);
       if (!remote) return null;
-      return { leaf: newSession(remote, n.cmd, n.id) };
+      return { leaf: newSession(remote, cmd, n.id) };
     }
-    const a = buildNode(n.a);
-    const b = buildNode(n.b);
+    const a = buildNode(n.a, cmd);
+    const b = buildNode(n.b, cmd);
     if (!a) return b;
     if (!b) return a;
     return { dir: n.dir, ratio: n.ratio ?? 0.5, a, b };
@@ -1313,7 +1419,7 @@
   function openProject(p: Project) {
     let last: string | null = null;
     for (const view of projectViews(p)) {
-      const root = buildNode(view);
+      const root = buildNode(view, p.cmd);
       if (!root) continue;
       const tab: Tab = { id: crypto.randomUUID(), root, active: firstLeaf(root), projectId: p.id };
       tabs.push(tab);
@@ -1324,6 +1430,13 @@
       return;
     }
     activeTabId = last;
+  }
+  /** L'inverse d'openProject : range le projet en fermant ses onglets. Sa
+   *  définition n'est pas touchée (aucun persistProject sur une fermeture) et
+   *  tmux garde les sessions côté serveur — la réouverture les réattache par
+   *  `key`. Ranger ne perd donc rien, ni layout ni travail en cours. */
+  function closeProject(p: Project) {
+    for (const t of projectTabs(p.id)) closeTab(t);
   }
   async function confirmSaveProject() {
     if (modal?.type !== "saveProject") return;
@@ -1372,7 +1485,9 @@
   async function deleteRemote(r: Remote) {
     if (r.auth === "password") await rpc("passphrase_delete", { identityId: r.id }).catch(() => {});
     remotes = remotes.filter((x) => x.id !== r.id);
-    projects = projects.filter((p) => projectViews(p).flatMap(projLeaves).some((l) => l.remoteId === "local" || remotes.some((x) => x.id === l.remoteId)));
+    // isLocal plutôt que `locals` : la détection WSL est async, un projet ne doit
+    // jamais être purgé parce qu'elle n'a pas encore répondu.
+    projects = projects.filter((p) => projectViews(p).flatMap(projLeaves).some((l) => isLocal(l.remoteId) || remotes.some((x) => x.id === l.remoteId)));
     confirmDeleteId = null;
     await save();
   }
@@ -1465,6 +1580,7 @@
 
   // ─── sync config Claude Code ──────────────────────────────────────────────
   const syncedRemotes = new Set<string>();
+  const probedRemotes = new Set<string>(); // « déjà équipé ? » demandé au VPS : 1 fois par lancement
   function remoteParams(remote: Remote) {
     const auth: AuthKind = remote.auth ?? "key";
     if (auth !== "key") {
@@ -1474,13 +1590,18 @@
     const identity = identities.find((i) => i.id === remote.identityId)!;
     return { host: remote.host, port: Number(remote.port), user: remote.user, keyPath: identity.keyPath, identityId: identity.id, auth };
   }
+  /** Params de `claude_sync` : la connexion + les réglages arabel qui atterrissent
+   *  dans le settings.json distant. Un seul endroit, sinon un appel oublie un champ. */
+  function syncParams(remote: Remote) {
+    return { ...remoteParams(remote), agentTeams: settings.agentTeams, agentTeamPanes: settings.agentTeamPanes };
+  }
   async function claudeSetup(sid: string, remote: Remote) {
     const s = sessions.get(sid);
     if (!s) return;
     try {
       if (!syncedRemotes.has(remote.id)) {
         s.term.write("\x1b[90m[arabel] syncing Claude Code config…\x1b[0m\r\n");
-        const msg = await rpc<string>("claude_sync", remoteParams(remote));
+        const msg = await rpc<string>("claude_sync", syncParams(remote));
         syncedRemotes.add(remote.id);
         s.term.write(`\x1b[90m[arabel] ${msg}\x1b[0m\r\n`);
       }
@@ -1492,7 +1613,7 @@
   }
   async function enhanceShell(sid: string) {
     const s = sessions.get(sid);
-    if (!s || s.remote.id === "local") return;
+    if (!s || isLocal(s.remote.id)) return;
     s.term.write("\r\n\x1b[90m[arabel] installing autosuggestions…\x1b[0m\r\n");
     try {
       const msg = await rpc<string>("shell_enhance", remoteParams(s.remote));
@@ -1505,10 +1626,10 @@
   }
   async function syncNow(sid: string) {
     const s = sessions.get(sid);
-    if (!s || s.remote.id === "local") return;
+    if (!s || isLocal(s.remote.id)) return;
     s.term.write("\r\n\x1b[90m[arabel] injecting config…\x1b[0m\r\n");
     try {
-      const msg = await rpc<string>("claude_sync", remoteParams(s.remote));
+      const msg = await rpc<string>("claude_sync", syncParams(s.remote));
       syncedRemotes.add(s.remote.id);
       s.term.write(`\x1b[90m[arabel] ${msg}\x1b[0m\r\n`);
       // active le suivi Claude pour ce remote : flag persistant + écoute des hooks
@@ -1559,7 +1680,9 @@
     }
     const s = sessions.get(sid);
     if (!s) return "";
-    return savedTitles[s.key] || autoTitles[sid] || s.remote.name + (s.cmd ? ` — ${s.cmd}` : "");
+    // pas de suffixe de commande : elle est au projet, donc identique sur tous
+    // ses panes — autoTitles (cwd/commande via OSC) les distingue déjà.
+    return savedTitles[s.key] || autoTitles[sid] || s.remote.name;
   }
   function startRename(sid: string) {
     if (isBrowser(sid)) return; // un navigateur s'intitule par son URL
@@ -1599,12 +1722,14 @@
   const lastOut: Record<string, number> = {};
   const lastInput: Record<string, number> = {};
   const lastSubmit: Record<string, number> = {}; // dernière vraie soumission (Entrée)
-  let notifOk = false;
-  if (inTauri) {
-    (async () => {
-      notifOk = (await isPermissionGranted()) || (await requestPermission()) === "granted";
-    })();
-  }
+  // dernier instant où le pane a affiché « esc to interrupt » (= Claude générait).
+  // Sa disparition est ce qui nous dit qu'un tour est fini, sans dépendre des hooks.
+  const sawWorking: Record<string, number> = {};
+  // préférences → module d'alertes (seul endroit qui parle son/notif système)
+  $effect(() => {
+    notifPrefs.sounds = settings.sounds;
+    notifPrefs.notifications = settings.notifications;
+  });
 
   const recentHooks = new Map<string, number>(); // dédoublonnage (plusieurs watchers/listeners possibles)
   listen<{ remoteId: string; line: string }>("arabel-hook", (ev) => {
@@ -1662,8 +1787,14 @@
     const term = sessions.get(sid)?.term;
     if (!term) return "";
     const buf = term.buffer.active;
+    // Fenêtre ancrée sur le CURSEUR, pas sur buf.length : tant que l'écran n'est
+    // pas rempli, buf.length compte les lignes vides du bas de la vue (40 lignes
+    // pour ~20 écrites) et les 16 dernières étaient toutes blanches → marqueur
+    // jamais vu en début de session. On lit n lignes au-dessus du curseur, et on
+    // va jusqu'au bout du buffer car la TUI dessine son footer sous le curseur.
+    const from = Math.max(0, Math.min(buf.baseY + buf.cursorY, buf.length - 1) - n + 1);
     let out = "";
-    for (let i = Math.max(0, buf.length - n); i < buf.length; i++)
+    for (let i = from; i < buf.length; i++)
       out += (buf.getLine(i)?.translateToString(true) ?? "") + "\n";
     return out;
   }
@@ -1672,11 +1803,11 @@
     const s = sessions.get(sid);
     if (!s) return null;
     const now = Date.now();
-    const tail = bottomText(sid, 16);
-    // marqueurs explicites du TUI Claude — fiables, quel que soit le pane
-    if (/esc to interrupt/i.test(tail)) return "working"; // Claude génère (footer live)
-    if (/❯\s*[1-9][.)]/.test(tail) || /\besc to cancel\b/i.test(tail) || /Do you want to proceed/i.test(tail))
-      return "waiting"; // menu de permission / choix en attente de réponse
+    // marqueurs du TUI Claude lus dans le buffer — fiables quel que soit le pane,
+    // et seule source de « done » sans hooks (cf. $lib/notify).
+    const turn = claudeTurn(bottomText(sid, 16), sawWorking[sid] ?? 0, lastSubmit[sid] ?? 0, now);
+    sawWorking[sid] = turn.seen;
+    if (turn.status) return turn.status;
     if (s.remote.claude) {
       // pane Claude : PAS de détection par volume de sortie — sa TUI se redessine
       // en continu (curseur, footer), ce qui faisait clignoter « running » en
@@ -1692,44 +1823,19 @@
     return now - (lastOut[sid] ?? 0) < 1000 ? "working" : null;
   }
 
-  // ─── sons d'événements : tons synthétisés (aucun fichier à bundler) ──────
-  let audioCtx: AudioContext | null = null;
-  function playSound(kind: "waiting" | "done" | "error") {
-    if (!settings.sounds || typeof AudioContext === "undefined") return;
-    try {
-      audioCtx ??= new AudioContext();
-      const ctx = audioCtx;
-      if (ctx.state === "suspended") ctx.resume();
-      // séquence de notes [fréquence Hz, décalage s] par événement
-      const seq = {
-        waiting: [[660, 0], [880, 0.11]],  // montant — « à toi de jouer »
-        done: [[784, 0], [1047, 0.1]],     // quinte — terminé
-        error: [[330, 0], [220, 0.13]],    // descendant — refus / erreur
-      }[kind];
-      for (const [freq, at] of seq) {
-        const osc = ctx.createOscillator(), gain = ctx.createGain();
-        osc.type = "sine";
-        osc.frequency.value = freq;
-        const t0 = ctx.currentTime + at;
-        gain.gain.setValueAtTime(0, t0);
-        gain.gain.linearRampToValueAtTime(0.16, t0 + 0.02);
-        gain.gain.exponentialRampToValueAtTime(0.001, t0 + 0.18);
-        osc.connect(gain).connect(ctx.destination);
-        osc.start(t0);
-        osc.stop(t0 + 0.2);
-      }
-    } catch { /* audio indispo : silencieux */ }
-  }
-
   // ─── alerte (notif système + son) ────────────────────────────────────────
   // Branchée sur liveStatus, PAS sur les hooks : les hooks ne tombent que si le
   // remote a été synchronisé, alors que l'indicateur du pane vient du buffer
   // xterm. C'est ce décalage qui donnait un badge « waiting » muet et sans notif.
+  // Aucun filtre sur `remote.claude` non plus : ce drapeau n'est posé qu'à la
+  // main sur un remote SSH, alors que l'indicateur vient des marqueurs du TUI
+  // → un pane local affichait le badge sans jamais sonner. liveStatus ne rend
+  // « waiting »/« done » que sur ces marqueurs (ou les hooks), donc un shell
+  // ordinaire ne peut pas déclencher d'alerte ici.
   const alerted: Record<string, string> = {};
   $effect(() => {
     void liveTick; // ré-évalué avec l'indicateur
-    for (const [sid, s] of sessions) {
-      if (!s.remote.claude) continue;
+    for (const [sid] of sessions) {
       const st = liveStatus(sid) ?? "idle";
       const prev = alerted[sid];
       if (prev === st) continue;
@@ -1740,8 +1846,7 @@
       if (visiblePane(sid)) continue;
       const body = attentions.find((a) => a.sid === sid)?.message
         ?? (st === "done" ? "Claude finished" : "Claude is waiting for a response");
-      if (notifOk && settings.notifications) sendNotification({ title: `Arabel — ${sessLabel(sid)}`, body });
-      playSound(st);
+      notify(st, `Arabel — ${sessLabel(sid)}`, body);
     }
   });
 
@@ -1798,10 +1903,7 @@
   }
 
   // badge sur l'icône du Dock
-  $effect(() => {
-    const n = attentions.filter((a) => a.kind === "notif").length;
-    if (inTauri) getCurrentWindow().setBadgeCount(n || undefined).catch(() => {});
-  });
+  $effect(() => setBadge(attentions.filter((a) => a.kind === "notif").length));
 
   function attentionTarget(a: Attention): string | null {
     if (a.sid && sessions.has(a.sid)) return a.sid;
@@ -1812,11 +1914,7 @@
     const sid = attentionTarget(a);
     if (!sid) return dismissAttention(a);
     const tab = tabs.find((t) => leaves(t.root).includes(sid));
-    if (tab) {
-      activeTabId = tab.id;
-      tab.active = sid;
-      sessions.get(sid)?.term.focus();
-    }
+    if (tab) focusPane(tab, sid);
   }
   function answerAttention(a: Attention, keys: string) {
     const sid = attentionTarget(a);
@@ -1829,6 +1927,11 @@
   }
   function remoteAttention(rid: string): boolean {
     return attentions.some((a) => a.remoteId === rid);
+  }
+  /** Un pane du projet réclame ton attention. Surtout utile projet replié : les
+   *  lignes de panes sont masquées, la pastille est le seul signal qui reste. */
+  function projectAttention(pid: string): boolean {
+    return attentions.some((a) => tabs.find((t) => leaves(t.root).includes(a.sid))?.projectId === pid);
   }
   /** Tu réponds au clavier dans un panneau Claude → on retire ses toasts en
    *  attente. L'état (working/waiting/done) reste piloté par les hooks. */
@@ -1856,9 +1959,13 @@
 
   // machine locale : sondée tant qu'une session locale existe
   setInterval(async () => {
-    if (![...sessions.values()].some((s) => s.remote.id === "local")) return;
+    // ponytail: WSL tourne sur le matériel de l'hôte (CPU/RAM partagés) → on
+    // sert les mêmes métriques à chaque id local plutôt que de sonder la distro.
+    const ids = [...new Set([...sessions.values()].map((s) => s.remote.id).filter(isLocal))];
+    if (!ids.length) return;
     try {
-      metrics["local"] = (await rpc<Metrics>("local_metrics")) ?? metrics["local"];
+      const m = await rpc<Metrics>("local_metrics");
+      if (m) for (const id of ids) metrics[id] = m;
     } catch {}
   }, 3000);
 
@@ -1882,7 +1989,7 @@
     const r = sid ? sessions.get(sid)?.remote : null;
     // sysSsh : SFTP / forwards / métriques passent par russh, indisponibles → on
     // masque ces affordances pour ces remotes.
-    return r && r.id !== "local" && !r.sysSsh ? r : null;
+    return r && !isLocal(r.id) && !r.sysSsh ? r : null;
   }
   function joinPath(p: string, n: string): string {
     return p === "/" ? `/${n}` : `${p}/${n}`;
@@ -2246,6 +2353,50 @@
   function reloadPreview() {
     if (previewFrame) previewFrame.src = previewFrame.src; // recharge (cross-origin safe)
   }
+
+  // ─── verbes arabel : l'agent pilote l'app depuis le serveur (OSC 7770) ─────
+  //
+  // FRONTIÈRE DE CONFIANCE. Ces octets viennent du serveur : ce n'est pas
+  // forcément Claude qui les émet — un `cat` sur un fichier piégé suffit (même
+  // exposition qu'OSC 52). Donc uniquement des actions inoffensives et visibles :
+  // on valide tout, on n'exécute rien, on n'écrit aucun fichier.
+  function arabelVerb(sid: string, raw: string) {
+    const [verb, ...args] = raw.trim().split(/\s+/);
+    if (verb === "preview") verbPreview(sid, args[0]);
+    // verbe inconnu : ignoré en silence — le script distant peut être plus récent
+    // que l'app (ou ces octets ne nous étaient pas destinés du tout).
+  }
+
+  /** `arabel preview <port>` : ouvre un panneau navigateur sur un port du serveur,
+   *  en montant le tunnel à la demande. Réutilise un forward déjà ouvert sur ce
+   *  port plutôt que d'en empiler un par appel. */
+  async function verbPreview(sid: string, portArg: string) {
+    const port = Number(portArg);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) return;
+    const s = sessions.get(sid);
+    const tab = tabs.find((t) => t.root && leaves(t.root).includes(sid));
+    if (!s || !tab) return;
+    let url = `http://localhost:${port}`; // pane local : le port est déjà ici
+    if (!isLocal(s.remote.id)) {
+      const open = forwards.find((f) => f.remoteId === s.remote.id && f.remotePort === port);
+      let local = open?.localPort;
+      if (!local) {
+        const id = crypto.randomUUID();
+        try {
+          local =
+            (await rpc<number>("port_forward_start", {
+              id, localPort: 0, remoteHost: "localhost", remotePort: port, ...remoteParams(s.remote),
+            })) ?? port; // démo
+        } catch (e) {
+          return toast(`preview ${port}: ${e}`, "error");
+        }
+        forwards = [...forwards, { id, remoteId: s.remote.id, remoteName: s.remote.name, localPort: local, remoteHost: "localhost", remotePort: port }];
+      }
+      url = `http://localhost:${local}`;
+    }
+    addPaneToTab(tab, newBrowser(url));
+    toast(`Agent opened a preview of port ${port}`, "success");
+  }
   function openInBrowser(url: string) {
     if (inTauri) openUrl(url).catch((e) => toast(String(e), "error"));
     else window.open(url, "_blank");
@@ -2303,7 +2454,7 @@
   async function pasteClipboard(sid: string, rawKey = "") {
     const s = sessions.get(sid);
     if (!s) return;
-    if (inTauri && s.remote.id !== "local") {
+    if (inTauri && !isLocal(s.remote.id)) {
       const img = await readImage().catch(() => null); // rejette s'il n'y a pas d'image
       if (img) {
         try {
@@ -2511,7 +2662,8 @@
   function focusPane(tab: Tab, sid: string) {
     activeTabId = tab.id;
     tab.active = sid;
-    sessions.get(sid)?.term.focus();
+    if (zoomedSid && zoomedSid !== sid) zoomedSid = null; // sinon on taperait dans un pane caché sous le zoom
+    // le focus clavier est posé par l'$effect d'onglet (après le flush Svelte)
   }
   /** Panneau sous les yeux : fenêtre au premier plan et panneau affiché. */
   function visiblePane(sid: string): boolean {
@@ -2536,16 +2688,22 @@
         const s = sessions.get(sid);
         if (!s) continue;
         items.push({
-          icon: s.remote.id === "local" ? "local" : "pane",
-          label: s.remote.name + (s.cmd ? ` — ${s.cmd}` : ""),
-          sub: t.projectId ? projects.find((p) => p.id === t.projectId)?.name ?? "project" : "open terminal",
+          icon: isLocal(s.remote.id) ? "local" : "pane",
+          label: sessLabel(sid), // même nom que la sidebar (renommage / titre auto)
+          sub: settings.projects && t.projectId ? projects.find((p) => p.id === t.projectId)?.name ?? "project" : "open terminal",
           run: () => focusPane(t, sid),
         });
       }
     }
-    for (const p of projects)
-      items.push({ icon: "project", label: p.name, sub: "project", run: () => { const o = openTabFor(p.id); o ? (activeTabId = o.id) : openProject(p); } });
-    items.push({ icon: "local", label: LOCAL.name, sub: "new terminal", run: () => openRemote(LOCAL) });
+    if (settings.projects)
+      for (const p of projects) {
+        items.push({ icon: "project", label: p.name, sub: "project", run: () => { const o = openTabFor(p.id); o ? (activeTabId = o.id) : openProject(p); } });
+        // « ranger » vit ici plutôt que sur la ligne : un 4e bouton au survol ne
+        // laissait plus lire le nom du projet. Sans objet si le projet est fermé.
+        if (projectTabs(p.id).length) items.push({ icon: "project", label: p.name, sub: "put away", run: () => closeProject(p) });
+      }
+    for (const l of locals)
+      items.push({ icon: "local", label: l.name, sub: "new terminal", run: () => openRemote(l) });
     for (const r of remotes)
       items.push({ icon: "remote", label: r.name, sub: `${r.user}@${r.host}`, run: () => openRemote(r) });
     for (const b of KEYBINDINGS)
@@ -2744,8 +2902,8 @@
   {@const auth = r.auth ?? "key"}
   {@const sub = auth === "key" ? (identities.find((i) => i.id === r.identityId)?.name ?? "no key") : auth}
   <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
-  <div class="row" class:mgr={withActions} onclick={() => onPick(r)} title={r.id === "local" ? "Local shell" : `${r.user}@${r.host}:${r.port}`}>
-    <span class="row-icon">{#if r.id === "local"}{@render iLaptop()}{:else}{@render iTerminal()}{/if}</span>
+  <div class="row" class:mgr={withActions} onclick={() => onPick(r)} title={r.id.startsWith("wsl:") ? `WSL · ${r.name}` : r.id === "local" ? "Local shell" : `${r.user}@${r.host}:${r.port}`}>
+    <span class="row-icon">{#if isLocal(r.id)}{@render iLaptop()}{:else}{@render iTerminal()}{/if}</span>
     {#if withActions}
       <span class="row-main">
         <span class="row-label">{r.name}</span>
@@ -2781,7 +2939,7 @@
     ondragend={() => { dragSid = null; dropTarget = null; dropRow = null; }}
     {...paneDropzone(sid, sub)}
     onclick={() => focusPane(tab, sid)}>
-    <span class="row-icon">{#if isBrowser(sid)}{@render iGlobe()}{:else if s?.remote.id === "local"}{@render iLaptop()}{:else}{@render iTerminal()}{/if}</span>
+    <span class="row-icon">{#if isBrowser(sid)}{@render iGlobe()}{:else if s && isLocal(s.remote.id)}{@render iLaptop()}{:else}{@render iTerminal()}{/if}</span>
     {#if renamingSid === sid}
       <input class="row-rename" bind:value={renameValue} use:autofocus
         onclick={(e) => e.stopPropagation()}
@@ -2859,7 +3017,7 @@
           {/if}
         </span>
         <span class="pane-btns">
-          {#if s && s.remote.id !== "local" && !s.cc}
+          {#if s && !isLocal(s.remote.id) && !s.cc}
             <button class="icon-btn" title="Enable Claude tracking (config + Agents dashboard)" onclick={() => syncNow(node.leaf)}>{@render iBolt()}</button>
           {/if}
           <button class="icon-btn" title="Fullscreen (⇧⌘Enter)" onclick={() => toggleZoom(node.leaf)}>{#if zoomedSid === node.leaf}{@render iZoomOut()}{:else}{@render iZoom()}{/if}</button>
@@ -2892,17 +3050,17 @@
             {#if st.status === "connecting"}
               <span class="veil-spin">{@render iSpinner(18)}</span>
               <span>Connecting to {s?.remote.name}…</span>
-              {#if s && s.remote.id !== "local"}<span class="veil-target">{s.remote.user}@{s.remote.host}:{s.remote.port}</span>{/if}
+              {#if s && !isLocal(s.remote.id)}<span class="veil-target">{s.remote.user}@{s.remote.host}:{s.remote.port}</span>{/if}
             {:else if st.status === "error"}
               <span class="veil-warn">{@render iWarn()}</span>
               <span class="veil-msg">{st.error}</span>
-              {#if s && s.remote.id !== "local"}<span class="veil-target">{s.remote.user}@{s.remote.host}:{s.remote.port}{s.remote.auth ? ` · ${s.remote.auth}` : ""}</span>{/if}
+              {#if s && !isLocal(s.remote.id)}<span class="veil-target">{s.remote.user}@{s.remote.host}:{s.remote.port}{s.remote.auth ? ` · ${s.remote.auth}` : ""}</span>{/if}
               <div class="veil-actions">
                 <button class="btn" onclick={() => connectSession(node.leaf)}>Retry</button>
                 <button class="btn ghost" onclick={() => removeSession(node.leaf)}>Close</button>
               </div>
             {:else}
-              {#if s && s.remote.id !== "local"}
+              {#if s && !isLocal(s.remote.id)}
                 <span class="veil-spin">{@render iSpinner(18)}</span>
                 <span class="veil-msg">Connection lost — reconnecting automatically…{s.tmux ? " (the tmux session keeps running on the server)" : ""}</span>
               {:else}
@@ -2973,12 +3131,12 @@
           <!-- svelte-ignore a11y_no_static_element_interactions -->
           <div class="sb-section" class:drop={dropTarget === "standalone"} {...dropzone("standalone")}>
             {@render sbSection("Terminals", () => openPicker())}
-            {#each tabs.filter((t) => !t.projectId && t.root) as t (t.id)}
+            {#each tabs.filter((t) => t.root && (!settings.projects || !t.projectId)) as t (t.id)}
               {#each leaves(t.root) as sid (sid)}
                 {@render sessRow(t, sid, false)}
               {/each}
             {:else}
-              {#if dragSid}
+              {#if dragSid && settings.projects}
                 <p class="sb-empty">Drop here to remove from project</p>
               {:else if !tabs.some((t) => t.root)}
                 <!-- rien nulle part (1er lancement) : on guide ; sinon la section reste compacte -->
@@ -2987,6 +3145,7 @@
             {/each}
           </div>
 
+          {#if settings.projects}
           <div class="sb-section">
             {@render sbSection("Projects", null)}
             {#each projects as p (p.id)}
@@ -2997,6 +3156,7 @@
                 class="row"
                 class:drop={dropTarget === p.id}
                 {...dropzone(p.id)}
+                title={p.name}
                 onclick={() => (open ? (activeTabId = ptabs[0].id) : openProject(p))}>
                 <button
                   class="icon-btn chev"
@@ -3004,7 +3164,9 @@
                   onclick={(e) => { e.stopPropagation(); expanded[p.id] = !isExpanded(p.id); }}>{@render iChevronR()}</button>
                 {#if p.emoji}<Tgs name={p.emoji} size={18} play={settings.emojiAnim} />{/if}
                 <span class="row-label strong">{p.name}</span>
-                {#if open}<span class="dot live" title="Project open"></span>{/if}
+                <!-- l'attention prime sur « ouvert » : c'est le seul des deux qui demande un geste -->
+                {#if projectAttention(p.id)}<span class="dot attention" title="A terminal needs you"></span>
+                {:else if open}<span class="dot live" title="Project open"></span>{/if}
                 <button
                   class="icon-btn row-plus"
                   title="Add a terminal to the project"
@@ -3023,7 +3185,7 @@
                     <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
                     <div class="row sub dim" title="Reopen this project" onclick={() => openProject(p)}>
                       <span class="row-icon">{@render iRefresh()}</span>
-                      <span class="row-label">{projRemote(leaf.remoteId)?.name ?? "?"}{leaf.cmd ? ` — ${leaf.cmd}` : ""}</span>
+                      <span class="row-label">{projRemote(leaf.remoteId)?.name ?? "?"}</span>
                     </div>
                   {/each}
                 {/if}
@@ -3032,6 +3194,7 @@
               {@render emptyState(iBookmark, "No projects", "Open some terminals, then save the layout with the bookmark button.", null)}
             {/each}
           </div>
+          {/if}
         {/if}
       </nav>
       <div class="sb-foot">
@@ -3073,7 +3236,7 @@
       {#if forwards.length}
         <span class="fwd-count" title="Active tunnels">{forwards.length}</span>
       {/if}
-      {#if activeTab?.root}
+      {#if activeTab?.root && settings.projects}
         <button
           class="icon-btn"
           title="Save as project"
@@ -3095,7 +3258,9 @@
             <p class="hint">Local &amp; SSH terminal to drive your AI agents</p>
             {#if loaded}
               <div class="welcome-list">
-                {@render remoteRow(LOCAL, (x) => openInTab(t, x), false)}
+                {#each locals as l (l.id)}
+                  {@render remoteRow(l, (x) => openInTab(t, x), false)}
+                {/each}
                 {#each remotes.slice(0, 4) as r (r.id)}
                   {@render remoteRow(r, (x) => openInTab(t, x), false)}
                 {/each}
@@ -3308,7 +3473,7 @@
 {#if attentions.length}
   <div class="attentions">
     {#each attentions.slice(-4) as a (a.id)}
-      <div class="attention" class:stop={a.kind === "stop"} class:hasopts={!!a.options?.length} transition:fly={{ y: 8, duration: 150 }} animate:flip={{ duration: 150 }}>
+      <div class="att-card" class:stop={a.kind === "stop"} class:hasopts={!!a.options?.length} transition:fly={{ y: 8, duration: 150 }} animate:flip={{ duration: 150 }}>
         <div class="att-head">
           <span class="att-icon {a.kind}">{#if a.kind === "stop"}{@render iCheck()}{:else}{@render iAlert()}{/if}</span>
           <button class="att-msg" onclick={() => { gotoAttention(a); dismissAttention(a); }} title="Go to pane">
@@ -3366,30 +3531,33 @@
           <label>{@render field("Working directory (optional)")}
             <input bind:value={modal.data.dir} placeholder="~/code/my-project — otherwise home directory" />
           </label>
-          <label class="f-check">
-            <input type="checkbox" bind:checked={modal.data.claude} />
-            <span>Claude Code — sync config and <b>track the agent</b> (the <code>claude</code> you launch is tracked)</span>
-          </label>
-          {#if modal.data.claude}
-            <label class="f-check sub-check">
-              <input type="checkbox" checked={!!modal.data.autoLaunch} onchange={(e) => { if (modal?.type === "remote") modal.data.autoLaunch = e.currentTarget.checked; }} />
-              <span>Launch <code>claude</code> automatically on connect (otherwise: shell, launch it whenever you want)</span>
-            </label>
-          {/if}
-          <label class="f-check">
-            <input type="checkbox" checked={modal.data.tmux !== false} onchange={(e) => { if (modal?.type === "remote") modal.data.tmux = e.currentTarget.checked; }} />
-            <span>tmux — persistent sessions (survive disconnects)</span>
-          </label>
-          {#if moshOk && modal.data.auth !== "password" && !modal.data.sysSsh}
+          <div class="mgr-head"><span>Session</span></div>
+          <div class="group">
             <label class="f-check">
-              <input type="checkbox" checked={!!modal.data.mosh} onchange={(e) => { if (modal?.type === "remote") modal.data.mosh = e.currentTarget.checked; }} />
-              <span>mosh — near-instant echo &amp; resume after drops (UDP; native tmux splits, not control mode)</span>
+              <input type="checkbox" bind:checked={modal.data.claude} />
+              <span>Claude Code — sync config and <b>track the agent</b> (the <code>claude</code> you launch is tracked)</span>
             </label>
-          {/if}
-          <label class="f-check">
-            <input type="checkbox" checked={!!modal.data.sysSsh} onchange={(e) => { if (modal?.type === "remote") modal.data.sysSsh = e.currentTarget.checked; }} />
-            <span>System ssh — use the OpenSSH binary (any key format, ssh-agent, ~/.ssh/config). No SFTP / port-forwarding / metrics.</span>
-          </label>
+            {#if modal.data.claude}
+              <label class="f-check sub-check">
+                <input type="checkbox" checked={!!modal.data.autoLaunch} onchange={(e) => { if (modal?.type === "remote") modal.data.autoLaunch = e.currentTarget.checked; }} />
+                <span>Launch <code>claude</code> automatically on connect (otherwise: shell, launch it whenever you want)</span>
+              </label>
+            {/if}
+            <label class="f-check">
+              <input type="checkbox" checked={modal.data.tmux !== false} onchange={(e) => { if (modal?.type === "remote") modal.data.tmux = e.currentTarget.checked; }} />
+              <span>tmux — persistent sessions (survive disconnects)</span>
+            </label>
+            {#if moshOk && modal.data.auth !== "password" && !modal.data.sysSsh}
+              <label class="f-check">
+                <input type="checkbox" checked={!!modal.data.mosh} onchange={(e) => { if (modal?.type === "remote") modal.data.mosh = e.currentTarget.checked; }} />
+                <span>mosh — near-instant echo &amp; resume after drops (UDP; native tmux splits, not control mode)</span>
+              </label>
+            {/if}
+            <label class="f-check">
+              <input type="checkbox" checked={!!modal.data.sysSsh} onchange={(e) => { if (modal?.type === "remote") modal.data.sysSsh = e.currentTarget.checked; }} />
+              <span>System ssh — use the OpenSSH binary (any key format, ssh-agent, ~/.ssh/config). No SFTP / port-forwarding / metrics.</span>
+            </label>
+          </div>
           <div class="sheet-actions">
             <button type="button" class="btn ghost" onclick={() => (modal = null)}>Cancel</button>
             <button type="submit" class="btn">Save</button>
@@ -3437,13 +3605,11 @@
             “NewsEmoji” pack by its authors on Telegram —
             <button type="button" class="link-btn" onclick={() => openInBrowser("https://t.me/addemoji/NewsEmoji")}>t.me/addemoji/NewsEmoji</button>
           </p>
-          {#each projectViews(modal.data).flatMap(projLeaves) as leaf, n}
-            <label>
-              {@render field(`Terminal ${n + 1} · ${remotes.find((r) => r.id === leaf.remoteId)?.name ?? "?"} — initial command`)}
-              <input bind:value={leaf.cmd} placeholder="(none)" />
-            </label>
-          {/each}
-          <p class="f-hint">The command is sent to the shell when the pane opens.</p>
+          <label>
+            {@render field("Startup commands")}
+            <textarea class="cmd-area" bind:value={modal.data.cmd} rows="3" placeholder="(none)"></textarea>
+          </label>
+          <p class="f-hint">One command per line, replayed in every terminal opened in this project.</p>
           <div class="sheet-actions">
             <button type="button" class="btn ghost" onclick={() => (modal = null)}>Cancel</button>
             <button type="submit" class="btn">Save</button>
@@ -3470,7 +3636,9 @@
             <span class="row-label">Web browser</span>
             <span class="row-meta">preview localhost / a site</span>
           </div>
-          {@render remoteRow(LOCAL, doPick, false)}
+          {#each locals.filter((l) => l.name.toLowerCase().includes((modal as any).filter.toLowerCase())) as l (l.id)}
+            {@render remoteRow(l, doPick, false)}
+          {/each}
           {#each remotes.filter((r) => r.name.toLowerCase().includes((modal as any).filter.toLowerCase())) as r (r.id)}
             {@render remoteRow(r, doPick, false)}
           {/each}
@@ -3494,7 +3662,7 @@
             <button class="btn ghost sm" onclick={() => editRemote(undefined, true)}>{@render iPlus()}New remote</button>
           </span>
         </div>
-        <div class="split-list">
+        <div class="split-list carded">
           {#each remotes as r (r.id)}
             {@render remoteRow(r, (x) => editRemote(x, true), true)}
           {:else}
@@ -3509,7 +3677,7 @@
           <span>SSH identities</span>
           <button class="btn ghost sm" onclick={() => editIdentity(undefined, true)}>{@render iPlus()}New identity</button>
         </div>
-        <div class="split-list">
+        <div class="split-list carded">
           {#each identities as i (i.id)}
             {@const uses = remotes.filter((r) => (r.auth ?? "key") === "key" && r.identityId === i.id).length}
             <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
@@ -3563,7 +3731,7 @@
       {:else if modal.type === "sshImport"}
         <h2>Import SSH / VS Code remotes</h2>
         <p class="f-hint">From <code>~/.ssh/config</code> (includes resolved) and VS Code's Remote-SSH config.</p>
-        <div class="split-list">
+        <div class="split-list carded">
           {#each modal.hosts as h (h.host)}
             <div class="row import-row">
               <span class="row-icon">{@render iTerminal()}</span>
@@ -3668,10 +3836,19 @@
                 </label>
               </div>
             {/if}
-            <label class="f-check">
-              <input type="checkbox" bind:checked={settings.emojiAnim} onchange={() => save()} />
-              <span>Animate project emojis continuously</span>
-            </label>
+            <div class="mgr-head"><span>Projects</span></div>
+            <div class="group">
+              <label class="f-check">
+                <input type="checkbox" bind:checked={settings.projects} onchange={() => save()} />
+                <span>Projects (saved terminal layouts) — off keeps terminals only</span>
+              </label>
+              {#if settings.projects}
+                <label class="f-check">
+                  <input type="checkbox" bind:checked={settings.emojiAnim} onchange={() => save()} />
+                  <span>Animate project emojis continuously</span>
+                </label>
+              {/if}
+            </div>
             <div class="sheet-actions"><button type="submit" class="btn">Close</button></div>
           </form>
         {:else if settingsTab === "terminal"}
@@ -3687,27 +3864,48 @@
               <label class="f-port">{@render field("Line height")}<input type="number" min="1" max="2" step="0.05" bind:value={settings.lineHeight} onchange={applySettings} /></label>
             </div>
             <label>{@render field("Scrollback (lines kept in history)")}<input type="number" min="0" max="100000" step="1000" bind:value={settings.scrollback} onchange={applySettings} /></label>
-            <label class="f-check">
-              <input type="checkbox" bind:checked={settings.cursorBlink} onchange={applySettings} />
-              <span>Blinking cursor</span>
-            </label>
-            <label class="f-check">
-              <input type="checkbox" bind:checked={settings.copyOnSelect} onchange={applySettings} />
-              <span>Copy selection automatically</span>
-            </label>
-            <label class="f-check">
-              <input type="checkbox" bind:checked={settings.sounds} onchange={() => save()} />
-              <span>Play a sound on agent events (waiting / finished / denied)</span>
-            </label>
-            <label class="f-check">
-              <input type="checkbox" bind:checked={settings.notifications} onchange={() => save()} />
-              <span>Show a system notification on agent events</span>
-            </label>
-            <p class="f-hint">Both stay quiet while you are looking at the pane that raised the event.</p>
-            <label class="f-check">
-              <input type="checkbox" bind:checked={settings.tmuxStatus} onchange={() => save()} />
-              <span>Show tmux status bar (takes effect on reconnect)</span>
-            </label>
+            <div class="mgr-head"><span>Behavior</span></div>
+            <div class="group">
+              <label class="f-check">
+                <input type="checkbox" bind:checked={settings.cursorBlink} onchange={applySettings} />
+                <span>Blinking cursor</span>
+              </label>
+              <label class="f-check">
+                <input type="checkbox" bind:checked={settings.copyOnSelect} onchange={applySettings} />
+                <span>Copy selection automatically</span>
+              </label>
+              <label class="f-check">
+                <input type="checkbox" bind:checked={settings.tmuxStatus} onchange={() => save()} />
+                <span>Show tmux status bar (takes effect on reconnect)</span>
+              </label>
+            </div>
+            <div class="mgr-head"><span>Agent events</span></div>
+            <div class="group">
+              <label class="f-check">
+                <input type="checkbox" bind:checked={settings.sounds} onchange={() => save()} />
+                <span>Play a sound on agent events (waiting / finished / denied)</span>
+              </label>
+              <label class="f-check">
+                <input type="checkbox" bind:checked={settings.notifications} onchange={() => save()} />
+                <span>Show a system notification on agent events</span>
+              </label>
+              <p class="f-hint">Both stay quiet while you are looking at the pane that raised the event.</p>
+            </div>
+            <div class="mgr-head"><span>Agent teams</span></div>
+            <div class="group">
+              <label class="f-check">
+                <input type="checkbox" bind:checked={settings.agentTeams} onchange={() => save()} />
+                <span>Let Claude spawn a team of agents (experimental)</span>
+              </label>
+              <label class="f-check">
+                <input type="checkbox" bind:checked={settings.agentTeamPanes} disabled={!settings.agentTeams} onchange={() => save()} />
+                <span>Give each teammate its own pane</span>
+              </label>
+              <p class="f-hint">
+                Applied on the next sync to a remote. A team costs far more tokens than a single agent. Own panes need a
+                native tmux tab, where each teammate is mirrored as a real pane; unchecked, they all share the lead's pane.
+              </p>
+            </div>
             <div class="sheet-actions"><button type="submit" class="btn">Close</button></div>
           </form>
         {:else}
@@ -3743,28 +3941,51 @@
 
 <style>
   /* ─── design tokens ─────────────────────────────────────────────────── */
-  /* Charte Apple HIG dark mode — valeurs NSColor darkAqua exactes */
+  /* Charte GitHub Primer (dark). Les fonds sont des paliers SOLIDES à teinte
+     froide : c'est ce qui donne des menus nets là où un gris neutre bave.
+     Échelle typo — 5 crans, rien entre les deux :
+       10px  micro-label capitales suivies (en-têtes de section, jauges)
+       11px  méta, hints, kbd, mono technique
+       12px  UI secondaire (options, onglets, libellés de panneau)
+       13px  corps (lignes, champs, boutons)
+       16px  titre de feuille
+       24px  wordmark */
   :global(:root) {
-    --bg-app: #1e1e1e;                          /* controlBackgroundColor */
-    --surface: #282828;                          /* underPageBackgroundColor */
-    --surface-raised: #323232;                   /* windowBackgroundColor (sheets) */
-    --surface-hover: rgba(255, 255, 255, 0.065);
-    --surface-active: rgba(255, 255, 255, 0.1);  /* sélection inactive */
-    --border: rgba(255, 255, 255, 0.098);        /* separatorColor */
-    --border-strong: rgba(255, 255, 255, 0.14);
-    --text-primary: rgba(255, 255, 255, 0.847);  /* labelColor */
-    --text-secondary: rgba(255, 255, 255, 0.549);/* secondaryLabelColor */
-    --text-tertiary: rgba(255, 255, 255, 0.247); /* tertiaryLabelColor */
-    --accent: #007aff;                           /* controlAccentColor */
-    --accent-hover: #1a88ff;
-    --selected: #0059d1;                         /* selectedContentBackgroundColor */
-    --attention: #ff9f0a;                        /* systemOrange */
-    --success: #32d74b;                          /* systemGreen */
-    --danger: #ff453a;                           /* systemRed */
+    --bg-app: #0d1117;                           /* canvas.default */
+    --surface: #161b22;                          /* canvas.overlay — feuilles, panneaux */
+    --surface-raised: #21262d;                   /* contrôle surélevé — btn secondaire, kbd */
+    --surface-inset: #010409;                    /* canvas.inset — rail de segmented control */
+    /* hover/active restent en alpha : ils se composent par-dessus des fonds
+       différents (bg-app, feuille, panneau). Un palier solide en casserait un. */
+    --surface-hover: rgba(177, 186, 196, 0.12);  /* neutral.muted */
+    --surface-active: rgba(177, 186, 196, 0.2);
+    --border: #30363d;                           /* border.default — visible, assumé */
+    --border-strong: #3d444d;                    /* border.emphasis */
+    --text-primary: #e6edf3;                     /* fg.default */
+    --text-secondary: #9198a1;                   /* fg.muted */
+    /* Écart assumé avec Primer : leur fg.subtle actuel (#656c76) tombe à
+       3.57:1 sur le canvas et échoue AA en petit texte — or ce token porte les
+       en-têtes de section (10px) et les hints (11px). #7d8590 (fg.subtle des
+       Primer 2022) passe à 5.07 tout en restant nettement plus discret que
+       --text-secondary. La hiérarchie tient par la taille et les capitales
+       suivies, pas par un gris illisible. */
+    --text-tertiary: #7d8590;
+    /* Primer sépare deux bleus, et l'écart est un problème de contraste, pas
+       de goût : --accent est un bleu de TEXTE (icônes/liens sur fond sombre),
+       --selected un bleu de REMPLISSAGE (blanc par-dessus). Du blanc sur
+       --accent tombe à 3.1:1 et échoue AA ; sur --selected il passe. */
+    --accent: #2f81f7;                           /* accent.fg — sert aussi de survol pour --selected */
+    --accent-subtle: rgba(47, 129, 247, 0.15);   /* accent.subtle — fonds de drop/record */
+    --selected: #1f6feb;                         /* accent.emphasis */
+    --attention: #d29922;                        /* attention.fg */
+    --success: #3fb950;                          /* success.fg */
+    --success-emphasis: #238636;                 /* btn.primary — la seule action affirmative */
+    --success-hover: #2ea043;
+    --danger: #f85149;                           /* danger.fg */
     --radius-sm: 5px;
     --radius-md: 6px;
-    --radius-lg: 10px;                           /* sheets/fenêtres Big Sur+ */
-    --focus-ring: 0 0 0 3.5px rgba(26, 169, 255, 0.5); /* keyboardFocusIndicatorColor */
+    --radius-lg: 10px;
+    --focus-ring: 0 0 0 3px rgba(47, 129, 247, 0.4); /* net, pas un halo */
     --ease: cubic-bezier(0.2, 0, 0, 1);
   }
   :global(html, body) {
@@ -3779,14 +4000,15 @@
     user-select: none;
   }
   :global(::selection) {
-    background: #3f638b; /* selectedTextBackgroundColor */
+    background: rgba(47, 129, 247, 0.4);
   }
   :global(*:focus-visible) {
     outline: none;
     box-shadow: var(--focus-ring);
   }
   :global(::-webkit-scrollbar) { width: 8px; height: 8px; }
-  :global(::-webkit-scrollbar-thumb) { background: rgba(255,255,255,0.12); border-radius: 4px; }
+  :global(::-webkit-scrollbar-thumb) { background: rgba(110, 118, 129, 0.4); border-radius: 4px; }
+  :global(::-webkit-scrollbar-thumb:hover) { background: rgba(110, 118, 129, 0.6); }
   :global(::-webkit-scrollbar-track) { background: transparent; }
 
   main {
@@ -3820,7 +4042,7 @@
     display: flex;
     align-items: center;
     gap: 7px;
-    margin: 0 8px 8px;
+    margin: 6px 8px 8px;
     padding: 2px 10px;
   }
   .sb-logo { display: flex; flex: none; width: 15px; }
@@ -3840,14 +4062,19 @@
   .sb-scroll { flex: 1; overflow-y: auto; min-height: 0; padding-bottom: 8px; }
   .sb-section { margin-top: 10px; }
   .sb-scroll .sb-section:first-child { margin-top: 2px; } /* colle « Terminals » près du haut */
+  /* En-tête de section : capitales suivies, 10px/600. Le gras lourd à faible
+     contraste (11px/700 à 35% d'opacité) bavait ; les capitales portent la
+     hiérarchie, le poids n'a plus à la porter tout seul. */
   .sb-head {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 0 16px 3px 16px;
-    font-size: 11px;
-    font-weight: 700;
-    color: rgba(255, 255, 255, 0.35); /* en-tête source list, sans capitales (style Finder/Music) */
+    padding: 0 16px 4px 16px;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--text-tertiary);
   }
   .sb-add { opacity: 0; }
   .sb-section:hover .sb-add { opacity: 1; }
@@ -3877,15 +4104,17 @@
     background: var(--surface-hover);
     color: var(--text-tertiary);
   }
-  .empty-title { margin: 0; font-size: 12.5px; font-weight: 500; color: var(--text-secondary); }
-  .empty-hint { margin: 0; font-size: 11.5px; line-height: 1.4; color: var(--text-tertiary); max-width: 230px; }
+  .empty-title { margin: 0; font-size: 12px; font-weight: 500; color: var(--text-secondary); }
+  .empty-hint { margin: 0; font-size: 11px; line-height: 1.4; color: var(--text-tertiary); max-width: 230px; }
   .empty-btn { margin-top: 7px; height: 26px; padding: 0 12px; font-size: 12px; }
   .sb-settings {
     flex: none;
     display: flex;
     align-items: center;
     gap: 8px;
-    margin: 8px;
+    /* bas à 2px : Connections + Settings forment une paire, elles se lisent
+       comme un menu, pas comme deux blocs séparés (.sb-brand rattrape l'écart) */
+    margin: 8px 8px 2px;
     padding: 7px 10px;
     background: none;
     border: none;
@@ -3924,20 +4153,25 @@
   .pane-rename { flex: none; width: 170px; height: 18px; font-size: 11px; }
   .row-rename:focus, .pane-rename:focus { box-shadow: none; border-color: var(--accent); }
   .row-meta { font-size: 11px; color: var(--text-tertiary); flex: none; }
+  /* badge Primer : 10px capitales suivies. La bordure était en rgba(94,124,226)
+     — un bleu-violet qui ne correspondait à aucun accent du thème. */
   .row-tag {
     flex: none;
-    font-size: 9px;
+    font-size: 10px;
     font-weight: 600;
     letter-spacing: 0.04em;
     text-transform: uppercase;
     color: var(--accent);
-    border: 1px solid rgba(94, 124, 226, 0.35);
+    background: var(--accent-subtle);
+    border: 1px solid rgba(47, 129, 247, 0.35);
     border-radius: 4px;
-    padding: 1px 4px;
+    padding: 0 5px;
   }
   .row-actions { display: none; align-items: center; gap: 2px; flex: none; }
   .row:hover .row-actions { display: flex; }
-  .row:hover .row-tag, .row:hover .row-meta { display: none; }
+  /* le survol sort les boutons : on rend au nom la place de la pastille (6px +
+     gap), sinon un nom de 11 caractères est déjà rogné. */
+  .row:hover .row-tag, .row:hover .row-meta, .row:hover .dot { display: none; }
   /* variante « manager » (modale Connections) : 2 lignes, détails + actions toujours visibles */
   .row.mgr { height: auto; min-height: 44px; padding-top: 5px; padding-bottom: 5px; }
   .row-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; overflow: hidden; }
@@ -3946,6 +4180,7 @@
   .row-sub { font-size: 11px; color: var(--text-tertiary); font-family: ui-monospace, Menlo, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .row.mgr .row-actions { display: flex; }
   .row.mgr:hover .row-tag, .row.mgr:hover .row-meta { display: inline-flex; }
+  .row.mgr:hover .dot { display: block; } /* le manager est sur 2 lignes : il a la place */
   .confirm-del {
     background: rgba(229, 83, 75, 0.15);
     color: var(--danger);
@@ -3962,10 +4197,10 @@
 
   .row.sub { margin-left: 26px; height: 26px; }
   .row.dragging { opacity: 0.4; }
-  .row.drop { box-shadow: inset 0 0 0 1.5px var(--accent); background: rgba(0, 122, 255, 0.12); }
+  .row.drop { box-shadow: inset 0 0 0 1.5px var(--accent); background: var(--accent-subtle); }
   .row.drop-before { box-shadow: inset 0 2px 0 var(--accent); }
   .row.drop-after { box-shadow: inset 0 -2px 0 var(--accent); }
-  .row.drop-merge { box-shadow: inset 0 0 0 1.5px var(--accent); background: rgba(0, 122, 255, 0.14); }
+  .row.drop-merge { box-shadow: inset 0 0 0 1.5px var(--accent); background: var(--accent-subtle); }
   .sb-section.drop { box-shadow: inset 0 0 0 1.5px var(--accent); border-radius: var(--radius-md); }
   .row .row-plus { display: none; flex: none; }
   .row:hover .row-plus { display: inline-flex; }
@@ -3973,8 +4208,9 @@
   .row.dim .row-label { color: var(--text-tertiary); }
   .row.dim .row-icon { color: var(--text-tertiary); }
   .row.dim:hover .row-icon { color: var(--accent); } /* survol : « cliquer pour rouvrir » */
-  /* sélection source list : accent plein, texte et icônes blancs */
-  .row.current { background: var(--accent); }
+  /* sélection : rempli en --selected (accent.emphasis), pas en --accent —
+     du blanc sur --accent tombe à 3.1:1 et échoue AA. */
+  .row.current { background: var(--selected); }
   .row.current .row-label, .row.current .row-icon, .row.current .row-spin { color: #fff; }
   .row.current .dot.attention { background: #fff; }
   .row.current .row-actions .icon-btn { color: rgba(255, 255, 255, 0.8); }
@@ -3984,14 +4220,14 @@
   .chev.open { transform: rotate(90deg); }
 
   /* question de choix (menu agent) — utilisée dans les notifs */
-  .agent-q { font-size: 10.5px; color: var(--text-secondary); line-height: 1.3; }
+  .agent-q { font-size: 11px; color: var(--text-secondary); line-height: 1.3; }
   .choice-row { display: flex; gap: 4px; }
   .choice-row.wrap { flex-wrap: wrap; }
   .choice {
     display: inline-flex; align-items: center; max-width: 100%;
     padding: 3px 7px; border-radius: 6px; cursor: pointer;
     font-size: 11px; line-height: 1.2; text-align: left;
-    background: var(--surface-2, rgba(120, 120, 128, 0.16));
+    background: var(--surface-active); /* --surface-2 n'a jamais existé : c'était le fallback qui peignait */
     border: 1px solid transparent; color: var(--text-primary);
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
@@ -4000,14 +4236,18 @@
   .choice.yes:hover { border-color: var(--success); }
   .choice.no:hover { border-color: var(--danger, #ff453a); }
 
+  /* même traitement que .sb-head : les sections des modales et de la sidebar
+     doivent se lire comme un seul système */
   .mgr-head {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    margin: 14px 0 4px;
-    font-size: 11px;
-    font-weight: 700;
-    color: rgba(255, 255, 255, 0.35);
+    margin: 18px 0 6px;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--text-tertiary);
   }
   .mgr-head:first-of-type { margin-top: 0; }
   .mgr-btns { display: flex; gap: 2px; }
@@ -4023,6 +4263,16 @@
   }
   .config-paste:focus { border-color: var(--accent); box-shadow: var(--focus-ring); outline: none; }
   .config-paste::placeholder { color: var(--text-tertiary); }
+  .cmd-area {
+    width: 100%; box-sizing: border-box; resize: vertical;
+    background: var(--bg-app); border: 1px solid var(--border-strong); border-radius: var(--radius-md);
+    padding: 6px 10px; color: var(--text-primary);
+    font-family: ui-monospace, Menlo, monospace; font-size: 12px; line-height: 1.5;
+    transition: box-shadow 120ms, border-color 120ms;
+  }
+  .cmd-area:hover { border-color: rgba(255, 255, 255, 0.22); }
+  .cmd-area:focus { border-color: var(--accent); box-shadow: var(--focus-ring); outline: none; }
+  .cmd-area::placeholder { color: var(--text-tertiary); }
   .import-btn { height: 22px; padding: 0 10px; font-size: 12px; flex: none; }
   .sheet .row { margin: 0; }
   .sheet-actions.spread { justify-content: space-between; align-items: center; }
@@ -4032,35 +4282,35 @@
   /* vue de diff */
   .diff-head { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
   .diff-path { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; }
-  .diff-mode { flex: none; font-size: 11px; font-weight: 500; color: var(--text-secondary); background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 1px 7px; }
+  .diff-mode { flex: none; font-size: 11px; font-weight: 500; color: var(--text-secondary); background: var(--surface-raised); border: 1px solid var(--border-strong); border-radius: var(--radius-sm); padding: 1px 7px; }
   .diff-mode.conflict { color: var(--danger); border-color: var(--danger); }
   .diff-body {
     margin: 12px 0; max-height: 62vh; overflow: auto;
-    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 6px 0;
+    background: var(--bg-app); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 6px 0;
     font-family: ui-monospace, Menlo, monospace; font-size: 12px; line-height: 1.5;
   }
   /* pre-wrap : une ligne longue s'enroule au lieu d'imposer un scroll horizontal */
   .dl { padding: 0 10px; white-space: pre-wrap; word-break: break-word; color: var(--text-primary); }
-  .dl.add { background: rgba(48, 209, 88, 0.13); }
-  .dl.del { background: rgba(255, 69, 58, 0.13); }
+  .dl.add { background: rgba(46, 160, 67, 0.15); }
+  .dl.del { background: rgba(248, 81, 73, 0.15); }
   .dl.hunk { color: var(--text-tertiary); background: var(--surface-hover); margin: 4px 0; }
   .dl.meta { color: var(--text-tertiary); }
 
-  /* segmented control (onglets de réglages) */
-  .seg { display: flex; gap: 2px; padding: 2px; margin-bottom: 16px; background: var(--surface); border-radius: var(--radius-md); }
-  .seg button { flex: 1; padding: 5px 10px; border: none; background: transparent; color: var(--text-secondary); font: inherit; font-size: 12.5px; border-radius: var(--radius-sm); cursor: pointer; transition: background 120ms var(--ease); }
+  /* segmented control (onglets de réglages) — rail en creux, onglet actif surélevé */
+  .seg { display: flex; gap: 2px; padding: 3px; margin-bottom: 16px; background: var(--surface-inset); border: 1px solid var(--border); border-radius: var(--radius-md); }
+  .seg button { flex: 1; padding: 5px 10px; border: 1px solid transparent; background: transparent; color: var(--text-secondary); font: inherit; font-size: 12px; font-weight: 500; border-radius: var(--radius-sm); cursor: pointer; transition: background 120ms var(--ease), color 120ms var(--ease); }
   .seg button:hover { color: var(--text-primary); }
-  .seg button.on { background: var(--surface-raised); color: var(--text-primary); box-shadow: 0 1px 2px rgba(0,0,0,0.3); }
+  .seg button.on { background: var(--surface-raised); border-color: var(--border-strong); color: var(--text-primary); }
 
   /* liste des raccourcis */
   .keys-list { display: flex; flex-direction: column; gap: 1px; max-height: 56vh; overflow-y: auto; margin: 0 -4px; }
   .key-row { display: flex; align-items: center; gap: 10px; padding: 5px 8px; border-radius: var(--radius-sm); }
   .key-row:hover { background: var(--surface-hover); }
   .key-row.static:hover { background: transparent; }
-  .key-label { flex: 1; font-size: 12.5px; color: var(--text-primary); }
-  .key-combo { min-width: 92px; padding: 3px 10px; text-align: center; font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: var(--text-primary); background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--radius-sm); cursor: pointer; transition: border-color 120ms var(--ease); }
+  .key-label { flex: 1; font-size: 12px; color: var(--text-primary); }
+  .key-combo { min-width: 92px; padding: 3px 10px; text-align: center; font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: var(--text-primary); background: var(--surface-raised); border: 1px solid var(--border-strong); border-radius: var(--radius-sm); cursor: pointer; transition: border-color 120ms var(--ease); }
   .key-combo:hover { border-color: var(--accent); }
-  .key-combo.recording { border-color: var(--accent); color: var(--accent); background: rgba(0,122,255,0.12); }
+  .key-combo.recording { border-color: var(--accent); color: var(--accent); background: var(--accent-subtle); }
   .key-combo.fixed { cursor: default; color: var(--text-tertiary); border-style: dashed; }
   .key-combo.fixed:hover { border-color: var(--border-strong); }
   .icon-spacer { width: 24px; }
@@ -4121,7 +4371,7 @@
   .meter-fill.warn { background: var(--attention); }
   .meter-fill.crit { background: var(--danger); }
   .meter-pct {
-    font-size: 10.5px;
+    font-size: 11px;
     font-variant-numeric: tabular-nums;
     color: var(--text-tertiary);
     width: 30px;
@@ -4252,18 +4502,27 @@
     border-radius: var(--radius-sm); color: var(--text-primary); font: inherit; font-size: 12px;
   }
   .git-msg:focus { outline: none; border-color: var(--accent); }
-  .git-commit-hint { font-size: 10.5px; color: var(--text-tertiary); padding: 4px 2px 0; }
-  .git-status-line { display: flex; align-items: center; gap: 6px; padding: 4px 12px; font-size: 11.5px; color: var(--text-tertiary); }
+  .git-commit-hint { font-size: 11px; color: var(--text-tertiary); padding: 4px 2px 0; }
+  .git-status-line { display: flex; align-items: center; gap: 6px; padding: 4px 12px; font-size: 11px; color: var(--text-tertiary); }
   .git-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--text-tertiary); flex: none; }
   .git-dot.staged { background: var(--accent); }
   .git-upstream { margin-left: auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 150px; }
   .git-actions { display: flex; gap: 8px; padding: 6px 12px 10px; border-bottom: 1px solid var(--border); }
   .git-actions .btn { flex: 1; min-width: 0; }
+  /* Le vert Primer, réservé à la SEULE action affirmative de l'app : Commit.
+     C'est la signature GitHub. L'étendre à Save/Close la dissoudrait — et un
+     « Close » vert ne veut rien dire.
+     `:not(:disabled)` porte la spécificité, ne pas le retirer : `.btn` est
+     déclaré PLUS BAS dans ce fichier ; à égalité (0,2,0 une fois la classe de
+     scope Svelte ajoutée) il gagnerait à l'ordre source et le vert ne
+     sortirait jamais. Le pseudo-classe passe la règle à (0,3,0). */
+  .git-commit-btn:not(:disabled) { background: var(--success-emphasis); }
+  .git-commit-btn:not(:disabled):hover { background: var(--success-hover); }
   /* fetch en cours : seule l'icône tourne (.spin global ferait tourner tout le bouton) */
   .icon-btn.fetching :global(svg) { animation: rot 800ms linear infinite; }
   .git-changes-head {
     display: flex; align-items: center; justify-content: space-between;
-    padding: 8px 12px 4px; font-size: 10.5px; font-weight: 700; letter-spacing: .04em;
+    padding: 8px 12px 4px; font-size: 10px; font-weight: 600; letter-spacing: .06em;
     color: var(--text-tertiary); text-transform: uppercase;
   }
   .git-all { font-size: 11px; color: var(--accent); background: transparent; border: none; cursor: pointer; text-transform: none; letter-spacing: 0; }
@@ -4272,8 +4531,8 @@
   .git-file { flex: 1; min-width: 0; display: flex; align-items: baseline; gap: 6px; border: none; background: transparent; padding: 0; font: inherit; text-align: left; cursor: pointer; }
   .git-file .row-icon { align-self: center; }
   .git-file:hover .git-name { color: var(--accent); }
-  .git-name { font-size: 12.5px; color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .git-sub { font-size: 10.5px; color: var(--text-tertiary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: none; max-width: 90px; }
+  .git-name { font-size: 12px; color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .git-sub { font-size: 11px; color: var(--text-tertiary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: none; max-width: 90px; }
   .git-name.conflict { color: var(--danger); }
   .git-confl { flex: none; color: var(--danger); font-size: 12px; font-weight: 600; padding: 0 4px; }
   .git-check {
@@ -4282,7 +4541,7 @@
     display: inline-flex; align-items: center; justify-content: center; cursor: pointer; color: #fff;
   }
   .git-check:hover { border-color: var(--accent); }
-  .git-check.on { background: var(--accent); border-color: var(--accent); }
+  .git-check.on { background: var(--selected); border-color: var(--selected); }
   .git-dim { color: var(--text-tertiary); font-size: 11px; }
 
   /* redirections de ports + aperçu */
@@ -4292,9 +4551,9 @@
     height: 16px;
     padding: 0 4px;
     border-radius: 8px;
-    background: var(--accent);
+    background: var(--selected);
     color: #fff;
-    font-size: 10.5px;
+    font-size: 10px;
     font-weight: 600;
     display: flex;
     align-items: center;
@@ -4396,7 +4655,7 @@
   .pstat :global(svg) { flex: none; }
   .pstat-label {
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-    font-family: var(--mono, ui-monospace, monospace); font-size: 10.5px;
+    font-family: var(--mono, ui-monospace, monospace); font-size: 11px;
   }
   .pstat.working { color: var(--accent); }
   .pstat.waiting { color: var(--attention); }
@@ -4468,40 +4727,42 @@
     justify-content: center;
     gap: 8px;
   }
-  .wordmark { font-size: 26px; font-weight: 700; color: var(--text-secondary); letter-spacing: -0.3px; } /* Large Title */
+  .wordmark { font-size: 24px; font-weight: 700; color: var(--text-secondary); letter-spacing: -0.3px; } /* Large Title */
   .welcome .hint { margin: 0 0 12px; font-size: 13px; color: var(--text-tertiary); }
   .welcome-list { width: 300px; display: flex; flex-direction: column; gap: 1px; }
 
   /* ─── boutons / formulaires ──────────────────────────────────────────── */
-  /* push buttons macOS : accent plein / bezel gris */
+  /* Boutons Primer. Le rempli est en --selected (accent.emphasis) et non en
+     --accent : voir la note contraste des tokens. */
   .btn {
     height: 30px;
     padding: 0 16px;
-    background: var(--accent);
+    background: var(--selected);
     color: #fff;
-    border: none;
+    border: 1px solid rgba(240, 246, 252, 0.1);
     border-radius: var(--radius-md);
     font-size: 13px;
     font-weight: 500;
     font-family: inherit;
-    box-shadow: inset 0 0.5px 0 rgba(255, 255, 255, 0.25);
     transition: background 100ms;
   }
-  .btn:hover { background: var(--accent-hover); }
-  .btn:active { background: var(--selected); }
+  .btn:hover { background: var(--accent); }
+  .btn:active { background: #1a5fcc; }
+  .btn:disabled { opacity: 0.5; }
+  /* bouton secondaire Primer : palier solide + bordure, pas un voile blanc */
   .btn.ghost {
-    background: rgba(255, 255, 255, 0.12); /* bouton bezel secondaire */
+    background: var(--surface-raised);
+    border: 1px solid var(--border-strong);
     color: var(--text-primary);
-    box-shadow: inset 0 0.5px 0 rgba(255, 255, 255, 0.12);
   }
-  .btn.ghost:hover { background: rgba(255, 255, 255, 0.17); }
-  .btn.sm { height: 24px; padding: 0 10px; font-size: 11.5px; border-radius: var(--radius-sm); display: inline-flex; align-items: center; gap: 5px; }
+  .btn.ghost:hover { background: var(--border); border-color: #656c76; }
+  .btn.sm { height: 24px; padding: 0 10px; font-size: 11px; border-radius: var(--radius-sm); display: inline-flex; align-items: center; gap: 5px; }
 
   input, select {
     height: 30px;
     box-sizing: border-box;
     width: 100%;
-    background: var(--bg-app); /* textBackgroundColor */
+    background: var(--bg-app); /* champ en creux sur la feuille */
     border: 1px solid var(--border-strong);
     border-radius: var(--radius-md);
     padding: 0 10px;
@@ -4510,7 +4771,7 @@
     font-family: inherit;
     transition: box-shadow 120ms, border-color 120ms;
   }
-  input:hover, select:hover { border-color: rgba(255, 255, 255, 0.22); }
+  input:hover, select:hover { border-color: #656c76; }
   input::placeholder { color: var(--text-tertiary); }
   input:focus, select:focus { border-color: var(--accent); box-shadow: var(--focus-ring); outline: none; }
   input[type="checkbox"] { width: auto; height: auto; accent-color: var(--accent); }
@@ -4520,34 +4781,37 @@
   .overlay {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.5);
+    background: rgba(1, 4, 9, 0.65);
     backdrop-filter: blur(8px) saturate(120%);
     display: flex;
     align-items: center;
     justify-content: center;
     z-index: 30;
   }
+  /* La feuille est en --surface (canvas.overlay) et non en --surface-raised :
+     --surface-raised devient le palier des contrôles POSÉS dessus (btn ghost,
+     seg actif, kbd). Deux paliers distincts = des contrôles qui se détachent. */
   .sheet {
     width: 440px;
     max-height: 82vh;
     overflow-y: auto;
-    background: var(--surface-raised); /* windowBackgroundColor */
-    border: 0.5px solid rgba(255, 255, 255, 0.14);
-    border-radius: 14px;
-    box-shadow: 0 24px 70px rgba(0, 0, 0, 0.6), inset 0 0.5px 0 rgba(255, 255, 255, 0.08);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    box-shadow: 0 16px 32px rgba(1, 4, 9, 0.85);
     padding: 22px 24px;
   }
-  .sheet h2 { margin: 0 0 18px; font-size: 16px; font-weight: 600; letter-spacing: -0.01em; } /* Title 3 emphasized */
+  .sheet h2 { margin: 0 0 18px; font-size: 16px; font-weight: 600; letter-spacing: -0.01em; }
   .sheet form { display: flex; flex-direction: column; gap: 14px; }
   .sheet label { display: flex; flex-direction: column; gap: 5px; }
-  .f-label { font-size: 11.5px; font-weight: 500; letter-spacing: 0.01em; color: var(--text-secondary); }
+  .f-label { font-size: 11px; font-weight: 500; letter-spacing: 0.01em; color: var(--text-secondary); }
   .f-pair { display: flex; gap: 10px; }
   .f-pair .grow { flex: 1; }
   .f-port { width: 80px; flex: none; }
-  .f-check { flex-direction: row !important; align-items: center; gap: 12px !important; font-size: 12.5px; color: var(--text-secondary); }
+  .f-check { flex-direction: row !important; align-items: center; gap: 12px !important; font-size: 12px; color: var(--text-secondary); }
   .f-check span { flex: 1; line-height: 1.35; } /* texte à gauche, interrupteur poussé à droite */
   .f-check.sub-check { margin-left: 22px; margin-top: -6px; font-size: 12px; color: var(--text-tertiary); }
-  .f-check code { font-size: 11px; background: var(--surface); border-radius: 3px; padding: 0 4px; }
+  .f-check code { font-size: 11px; background: var(--surface-active); border-radius: 3px; padding: 0 4px; }
   /* interrupteur iOS pour les options des modales (remplace la case native) */
   .f-check input[type="checkbox"] {
     appearance: none; -webkit-appearance: none;
@@ -4563,12 +4827,32 @@
     background: #fff; box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
     transition: transform 160ms var(--ease);
   }
-  .f-check input[type="checkbox"]:checked { background: var(--accent); }
+  .f-check input[type="checkbox"]:checked { background: var(--selected); }
   .f-check input[type="checkbox"]:checked::after { transform: translateX(14px); }
   .f-check input[type="checkbox"]:hover { border: none; }
   .f-check input[type="checkbox"]:focus { box-shadow: none; }
   .f-check input[type="checkbox"]:focus-visible { box-shadow: var(--focus-ring); }
-  .f-hint { margin: -4px 0 0; font-size: 11.5px; line-height: 1.4; color: var(--text-tertiary); }
+  .f-hint { margin: -4px 0 0; font-size: 11px; line-height: 1.4; color: var(--text-tertiary); }
+  /* Groupe de réglages : carte bordée, lignes séparées par un filet. Remplace
+     la liste d'interrupteurs à plat où chaque option flottait au même niveau
+     que les champs — rien ne disait ce qui allait avec quoi. */
+  .group {
+    display: flex;
+    flex-direction: column;
+    background: var(--bg-app);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    overflow: hidden;
+  }
+  .group .f-check { margin: 0; padding: 10px 12px; }
+  .group .f-check + .f-check { border-top: 1px solid var(--border); }
+  /* sous-option : pas de filet, elle doit rester collée à son parent */
+  .group .f-check.sub-check { margin: 0; padding-left: 34px; border-top: none; }
+  .group .f-check:hover { background: var(--surface-hover); }
+  .group .f-hint { margin: 0; padding: 8px 12px; border-top: 1px solid var(--border); background: var(--surface); }
+  /* dans une feuille, le form pose déjà un gap de 14px : le sous-titre se cale
+     dessus au lieu d'empiler ses propres marges */
+  .sheet form .mgr-head { margin: 2px 0 -6px; }
   .emoji-grid {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(38px, 1fr));
@@ -4578,7 +4862,7 @@
     padding: 6px;
     border: 1px solid var(--border);
     border-radius: 8px;
-    background: var(--surface);
+    background: var(--bg-app);
   }
   .emoji-cell {
     display: grid;
@@ -4595,12 +4879,26 @@
   .emoji-cell.sel { border-color: var(--accent); background: var(--surface-active); }
   .sheet-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px; }
   .split-list { display: flex; flex-direction: column; gap: 1px; margin: 0 -8px; }
+  /* Listes de la modale Connections : mêmes cartes bordées que .group, pour que
+     « remotes » et « identities » se lisent comme des sections et non comme des
+     lignes lâchées sur le fond de la feuille. */
+  .split-list.carded {
+    margin: 0;
+    gap: 0;
+    background: var(--bg-app);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    overflow: hidden;
+  }
+  .split-list.carded .row { border-radius: 0; margin: 0; padding: 0 10px; }
+  .split-list.carded .row + .row { border-top: 1px solid var(--border); }
+  .split-list.carded .empty { padding: 18px 12px; }
   .split-filter { margin-bottom: 10px; }
   .palette-input { margin-bottom: 10px; }
   .palette-list { max-height: 52vh; overflow-y: auto; }
   .palette-list .row { cursor: pointer; }
-  /* ligne active (clavier ↑/↓ ou survol) : accent plein, façon source list */
-  .palette-list .row.sel { background: var(--accent); }
+  /* ligne active (clavier ↑/↓ ou survol) — même bleu de remplissage que .row.current */
+  .palette-list .row.sel { background: var(--selected); }
   .palette-list .row.sel .row-label,
   .palette-list .row.sel .row-icon,
   .palette-list .row.sel .row-meta { color: #fff; }
@@ -4609,9 +4907,10 @@
     flex: none;
     font-family: ui-monospace, Menlo, monospace;
     font-size: 11px;
-    color: var(--text-tertiary);
-    background: var(--surface);
-    border: 1px solid var(--border);
+    color: var(--text-secondary);
+    background: var(--surface-raised);
+    border: 1px solid var(--border-strong);
+    border-bottom-width: 2px; /* touche physique — le seul relief assumé de l'UI */
     border-radius: 4px;
     padding: 1px 6px;
   }
@@ -4675,9 +4974,9 @@
     z-index: 40;
   }
   .toast {
-    background: rgba(50, 50, 50, 0.85);
+    background: rgba(33, 38, 45, 0.9);
     backdrop-filter: blur(30px) saturate(180%);
-    border: 1px solid rgba(255, 255, 255, 0.12);
+    border: 1px solid var(--border);
     border-radius: var(--radius-lg); /* notification macOS */
     padding: 9px 14px;
     font-size: 13px;
@@ -4698,31 +4997,34 @@
     gap: 6px;
     max-width: 380px;
   }
-  .attention {
+  /* `att-card` et pas `attention` : `.dot.attention` (pastille de la sidebar)
+     matchait aussi `.attention`, à égalité de spécificité — la carte gagnait à
+     l'ordre source et repeignait la pastille en carte de 24px. */
+  .att-card {
     display: flex;
     flex-direction: column;
     gap: 6px;
-    background: rgba(50, 50, 50, 0.85);
+    background: rgba(33, 38, 45, 0.9);
     backdrop-filter: blur(30px) saturate(180%);
-    border: 1px solid rgba(255, 255, 255, 0.12);
+    border: 1px solid var(--border);
     border-radius: var(--radius-lg);
     padding: 7px 8px;
-    font-size: 12.5px;
+    font-size: 12px;
     box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
   }
-  .attention.hasopts { min-width: 260px; }
+  .att-card.hasopts { min-width: 260px; }
   .att-head { display: flex; align-items: center; gap: 6px; }
   .att-icon { display: inline-flex; flex: none; color: var(--attention); }
   .att-icon.stop { color: var(--success); }
-  .attention .choice { background: rgba(255, 255, 255, 0.1); color: var(--text-primary); }
-  .attention .agent-q { color: var(--text-secondary); padding: 0 4px; }
+  .att-card .choice { background: var(--surface-active); color: var(--text-primary); }
+  .att-card .agent-q { color: var(--text-secondary); padding: 0 4px; }
   .att-msg {
     flex: 1;
     background: none;
     border: none;
     color: var(--text-primary);
     text-align: left;
-    font-size: 12.5px;
+    font-size: 12px;
     font-family: inherit;
     overflow: hidden;
     text-overflow: ellipsis;

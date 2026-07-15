@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(npx svelte-check *)",
-      "Bash(grep -iA4 'warning')"
+      "Bash(grep -iA4 'warning')",
+      "Bash(cargo check *)"
     ]
   }
 }
