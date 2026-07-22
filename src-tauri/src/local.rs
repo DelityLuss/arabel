@@ -37,6 +37,11 @@ pub fn local_metrics() -> serde_json::Value {
     })
 }
 
+/// pid du process shell de chaque session PTY locale, pour lire son cwd (panneau
+/// git d'un terminal local). Rempli par `spawn_in_pty`, purgé à la fermeture.
+#[derive(Default)]
+pub struct PtyPids(pub std::sync::Mutex<std::collections::HashMap<String, u32>>);
+
 fn size(cols: u32, rows: u32) -> PtySize {
     PtySize {
         rows: rows as u16,
@@ -60,6 +65,10 @@ async fn spawn_in_pty(
     let pair = pty.openpty(size(cols, rows)).map_err(|e| e.to_string())?;
     let mut child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
     drop(pair.slave);
+    // pid du shell → cwd lisible plus tard (local_cwd, panneau git)
+    if let Some(pid) = child.process_id() {
+        app.state::<PtyPids>().0.lock().unwrap().insert(session_id.clone(), pid);
+    }
 
     let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
     let mut writer = pair.master.take_writer().map_err(|e| e.to_string())?;
@@ -84,6 +93,7 @@ async fn spawn_in_pty(
             }
         }
         let _ = app_r.emit(&closed_event, ());
+        app_r.state::<PtyPids>().0.lock().unwrap().remove(&sid);
         tauri::async_runtime::block_on(async {
             app_r.state::<SshState>().0.lock().await.remove(&sid);
         });
@@ -148,6 +158,30 @@ mod tests {
 
     fn utf16le(s: &str) -> Vec<u8> {
         s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect()
+    }
+
+    // Le cœur physique de local_cwd : sysinfo lit-il le cwd d'un AUTRE process du
+    // même utilisateur ? (macOS : proc_pidinfo sans root ; Linux : /proc/pid/cwd)
+    #[cfg(not(windows))]
+    #[test]
+    fn reads_foreign_process_cwd() {
+        use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .current_dir("/tmp")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = Pid::from_u32(child.id());
+        let mut sys = System::new();
+        sys.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[pid]),
+            false,
+            ProcessRefreshKind::nothing().with_cwd(UpdateKind::Always),
+        );
+        let cwd = sys.process(pid).and_then(|p| p.cwd()).map(|c| c.display().to_string());
+        let _ = child.kill();
+        // macOS résout /tmp → /private/tmp : on tolère le suffixe.
+        assert!(cwd.as_deref().is_some_and(|c| c.ends_with("/tmp")), "cwd lu = {cwd:?}");
     }
 
     #[test]
@@ -215,6 +249,50 @@ pub async fn local_connect(
         cmd.cwd(home);
     }
     spawn_in_pty(app, &state, session_id, cols, rows, cmd).await
+}
+
+/// Cwd du shell d'une session locale, pour ouvrir le panneau git là où le terminal
+/// se trouve (et non au home). Lit le cwd du pid via sysinfo — même utilisateur que
+/// l'app, donc autorisé sans root sur macOS/Linux. None si le pid est inconnu ou
+/// illisible → l'appelant retombe sur le home.
+#[tauri::command]
+pub fn local_cwd(pids: State<'_, PtyPids>, session_id: String) -> Option<String> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    let pid = Pid::from_u32(*pids.0.lock().unwrap().get(&session_id)?);
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        false,
+        ProcessRefreshKind::nothing().with_cwd(UpdateKind::Always),
+    );
+    sys.process(pid).and_then(|p| p.cwd()).map(|c| c.display().to_string())
+}
+
+/// `git -C cwd args` sur la machine locale : pendant de `sftp::git_run` (SSH) pour
+/// le panneau source control d'un terminal local. cwd vide/`~` → home.
+// ponytail: une app GUI macOS démarre avec un PATH minimal — on ajoute les
+// préfixes Homebrew (comme mosh_connect) pour trouver git s'il n'est pas dans /usr/bin.
+#[tauri::command]
+pub async fn git_run_local(cwd: String, args: Vec<String>) -> Result<(u32, String), String> {
+    let cwd = if cwd.is_empty() || cwd == "~" {
+        crate::home_dir().unwrap_or_else(|_| ".".into())
+    } else {
+        cwd
+    };
+    let out = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(&cwd)
+        .args(&args)
+        .env(
+            "PATH",
+            format!("/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{}", std::env::var("PATH").unwrap_or_default()),
+        )
+        .output()
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
+    s.push_str(&String::from_utf8_lossy(&out.stderr));
+    Ok((out.status.code().unwrap_or(1) as u32, s))
 }
 
 /// Transport « ssh système » : lance le binaire `ssh` d'OpenSSH dans un PTY, au

@@ -22,9 +22,17 @@
   if (!inTauri) try { tmuxccDemo(); } catch (e) { console.error("tmuxcc:", e); } // auto-test parseur en dev
   if (!inTauri) try { notifyDemo(); } catch (e) { console.error("notify:", e); } // auto-test statut de tour
   if (!inTauri) try { gitStatusDemo(); } catch (e) { console.error("git:", e); }
+  // auto-test : prune une feuille d'une vue de projet (le split se replie sur l'autre)
+  if (!inTauri) try {
+    const split: ProjNode = { dir: "h", a: { remoteId: "r", id: "A" }, b: { remoteId: "r", id: "B" } };
+    console.assert(JSON.stringify(withoutProjLeaf(split, "A")) === JSON.stringify({ remoteId: "r", id: "B" }), "withoutProjLeaf: repli");
+    console.assert(withoutProjLeaf({ remoteId: "r", id: "A" }, "A") === null, "withoutProjLeaf: dernière feuille");
+  } catch (e) { console.error("proj:", e); }
 
   // ─── plateforme : macOS vs Windows/Linux ──────────────────────────────────
   const isMac = typeof navigator !== "undefined" && /Mac/i.test(navigator.platform || navigator.userAgent || "");
+  // Windows : titlebar sans cadre natif → on dessine nos propres min/max/close.
+  const isWindows = typeof navigator !== "undefined" && /Win/i.test(navigator.platform || navigator.userAgent || "");
   // Modificateur applicatif : ⌘ sur macOS, Ctrl+Maj ailleurs. Ctrl seul reste au
   // terminal (^C, ^F, ^K…), donc on ne le capture jamais côté Windows/Linux.
   const appMod = (e: KeyboardEvent) => (isMac ? e.metaKey : e.ctrlKey && e.shiftKey);
@@ -33,6 +41,28 @@
   // Sans les feux macOS (fenêtre décorée nativement sur Windows), on récupère
   // l'espace réservé en haut de la barre latérale / titlebar.
   if (typeof document !== "undefined") document.body.classList.toggle("win", !isMac);
+
+  // ─── contrôles de fenêtre custom (Windows sans cadre natif) ───────────────
+  let maximized = $state(false);
+  async function winCtl(action: "min" | "max" | "close") {
+    if (!inTauri) return;
+    const { getCurrentWindow } = await import("@tauri-apps/api/window");
+    const w = getCurrentWindow();
+    if (action === "min") await w.minimize();
+    else if (action === "max") await w.toggleMaximize();
+    else await w.close();
+  }
+  $effect(() => {
+    if (!isWindows || !inTauri) return;
+    let un: (() => void) | undefined;
+    (async () => {
+      const { getCurrentWindow } = await import("@tauri-apps/api/window");
+      const w = getCurrentWindow();
+      maximized = await w.isMaximized();
+      un = await w.onResized(async () => { maximized = await w.isMaximized(); });
+    })();
+    return () => un?.();
+  });
 
   const DEMO_STORE = {
     identities: [{ id: "i1", name: "id_ed25519", keyPath: "~/.ssh/id_ed25519", hasPassphrase: true }],
@@ -246,6 +276,10 @@
     // décoché = teammateMode "in-process" : les coéquipiers restent dans le pane du
     // lead au lieu d'ouvrir chacun son panneau tmux (miroir dans la grille en -CC).
     agentTeamPanes: true,
+    // ferme le panneau tmux d'un coéquipier quand son agent a fini. Off par défaut :
+    // on ne veut pas escamoter la sortie finale sans que tu l'aies demandé. Le pane
+    // du lead et le pane focalisé ne sont jamais fermés.
+    agentAutoClose: false,
     projects: true, // décoché = terminaux seuls ; les projets restent en mémoire, juste masqués
     emojiAnim: true, // emojis de projet animés en continu ; décoché = figés sur la 1re frame
     cursorStyle: "bar" as "bar" | "block" | "underline",
@@ -435,9 +469,9 @@
     tabs.push(t);
     activeTabId = t.id;
   }
-  function closeTab(t: Tab) {
+  function closeTab(t: Tab, preserve = false) {
     if (t.cc) { const cc = ccSessions.get(t.cc); if (cc) return closeCc(cc); }
-    leaves(t.root).forEach((sid) => closePane(sid));
+    leaves(t.root).forEach((sid) => closePane(sid, preserve));
     tabs = tabs.filter((x) => x.id !== t.id);
     if (!tabs.length) tabs.push({ id: crypto.randomUUID(), root: null, active: null, projectId: null });
     if (activeTabId === t.id) activeTabId = tabs[tabs.length - 1].id;
@@ -530,7 +564,7 @@
     unlisteners: UnlistenFn[];
     webgl: boolean;
     webglTries?: number; // tentatives de récupération du renderer GPU après perte de contexte
-    cc?: { ctrlSid: string; paneId: string }; // panneau piloté en mode contrôle tmux
+    cc?: { ctrlSid: string; paneId: string; agent?: boolean }; // panneau piloté en mode contrôle tmux (agent = né après le bootstrap)
   };
   const sessions = new Map<string, Sess>();
   let sessStatus = $state<Record<string, SessStatus>>({});
@@ -701,13 +735,39 @@
   async function connectSession(sid: string) {
     const s = sessions.get(sid);
     if (!s) return;
+    // Reconnexion / Retry : repartir propre, sinon on empile les listeners.
+    s.unlisteners.forEach((u) => u());
+    s.unlisteners = [];
+    // Un event Tauri émis AVANT que son listener existe est perdu (aucun tampon).
+    // La sortie du PTY part dès le spawn (fait DANS le rpc de connexion) : attacher
+    // le listener seulement APRÈS ratait le 1er jet du shell (prompt/MOTD) → écran
+    // noir. Pire au redémarrage : plein de sessions se reconnectent d'un coup et le
+    // `await listen` traîne. On pose donc les listeners AVANT de spawner.
+    const attachListeners = async () => {
+      s.unlisteners.push(
+        await listen<string>(`ssh-output-${sid}`, (ev) => { lastOut[sid] = Date.now(); s.term.write(b64ToBytes(ev.payload)); }),
+        await listen(`ssh-closed-${sid}`, () => {
+          if (!sessStatus[sid]) return; // fermeture volontaire déjà nettoyée
+          sessStatus[sid] = { status: "closed", error: "" };
+          s.unlisteners.forEach((u) => u());
+          s.unlisteners = [];
+          if (!isLocal(s.remote.id)) scheduleReconnect(sid); // auto-reconnexion
+        }),
+      );
+    };
+    const failed = (e: unknown) => {
+      s.unlisteners.forEach((u) => u());
+      s.unlisteners = [];
+      sessStatus[sid] = { status: "error", error: String(e) };
+    };
     sessStatus[sid] = { status: "connecting", error: "" };
     if (isLocal(s.remote.id)) {
       try {
         const distro = s.remote.id.startsWith("wsl:") ? s.remote.id.slice(4) : null;
+        await attachListeners();
         await rpc("local_connect", { sessionId: sid, cols: s.term.cols, rows: s.term.rows, distro });
       } catch (e) {
-        sessStatus[sid] = { status: "error", error: String(e) };
+        failed(e);
         return;
       }
     } else {
@@ -762,6 +822,7 @@
         execCmd = tmuxCmd(`arabel-${s.key.slice(0, 8)}`, init.join("; "), s.remote.claude ? sid : null);
       }
       try {
+        await attachListeners();
         if (s.remote.sysSsh) {
           // transport « ssh système » : délègue à OpenSSH (compat parfaite des clés).
           // pas de metrics/hooks/SFTP (ils vivent sur le canal de contrôle russh).
@@ -806,22 +867,12 @@
           });
         }
       } catch (e) {
-        sessStatus[sid] = { status: "error", error: String(e) };
+        failed(e);
         return;
       }
       s.tmux = useTmux;
     }
     sessStatus[sid] = { status: "open", error: "" };
-    s.unlisteners.push(
-      await listen<string>(`ssh-output-${sid}`, (ev) => { lastOut[sid] = Date.now(); s.term.write(b64ToBytes(ev.payload)); }),
-      await listen(`ssh-closed-${sid}`, () => {
-        if (!sessStatus[sid]) return; // fermeture volontaire déjà nettoyée
-        sessStatus[sid] = { status: "closed", error: "" };
-        s.unlisteners.forEach((u) => u());
-        s.unlisteners = [];
-        if (!isLocal(s.remote.id)) scheduleReconnect(sid); // auto-reconnexion
-      }),
-    );
     // taille réelle du pane (la connexion est partie en 80x24 par défaut)
     s.fit.fit();
     rpc("ssh_resize", { sessionId: sid, cols: s.term.cols, rows: s.term.rows });
@@ -879,7 +930,11 @@
     }, Math.min(15000, 1500 * 2 ** (attempt - 1)));
   }
 
-  function removeSession(sid: string) {
+  /** `preserve` : fermer le pane SANS l'oublier de la vue du projet (rangement
+   *  d'un projet, quitter l'app). Par défaut on l'oublie — une fermeture manuelle
+   *  d'un terminal doit le retirer des vues persistées, sinon le projet gardait des
+   *  lignes « fantômes » à rouvrir (parfois dupliquées). */
+  function removeSession(sid: string, preserve = false) {
     const s = sessions.get(sid);
     if (!s) return;
     sessions.delete(sid);
@@ -894,16 +949,28 @@
       rpc("metrics_unwatch", { remoteId: s.remote.id }).catch(() => {});
       delete metrics[s.remote.id];
     }
+    const affected = new Set<string>();
     for (const t of tabs) {
       if (t.root && leaves(t.root).includes(sid)) {
+        if (t.projectId) affected.add(t.projectId);
         t.root = withoutLeaf(t.root, sid);
         if (t.active === sid) t.active = firstLeaf(t.root);
         if (!t.root && tabs.length > 1) closeTab(t);
       }
     }
+    // retire ce terminal des vues sauvegardées de son projet (par sa key stable)
+    if (!preserve && affected.size) {
+      for (const pid of affected) {
+        const p = projects.find((x) => x.id === pid);
+        if (!p) continue;
+        p.views = projectViews(p).map((v) => withoutProjLeaf(v, s.key)).filter((v): v is ProjNode => !!v);
+        delete p.root;
+      }
+      save();
+    }
   }
 
-  async function closePane(sid: string) {
+  async function closePane(sid: string, preserve = false) {
     if (isBrowser(sid)) return closeBrowser(sid); // panneau navigateur : pas de session SSH
     if (sessions.get(sid)?.cc) return ccKill(sid); // panneau tmux : kill-pane
     const st = sessStatus[sid]?.status;
@@ -911,14 +978,14 @@
       try {
         await rpc("ssh_disconnect", { sessionId: sid });
         if (inTauri) {
-          removeSession(sid); // l'event ssh-closed nettoie aussi, removeSession est idempotent
+          removeSession(sid, preserve); // l'event ssh-closed nettoie aussi, removeSession est idempotent
           return;
         }
       } catch {
         /* déjà morte */
       }
     }
-    removeSession(sid);
+    removeSession(sid, preserve);
   }
 
   function openInTab(tab: Tab, remote: Remote) {
@@ -941,6 +1008,7 @@
     unlisteners: UnlistenFn[]; pending: ((lines: string[], error: boolean) => void)[];
     windows: Map<string, Lay>; activeWindow: string | null; winName: Record<string, string>;
     lastSize?: { c: number; r: number }; // dernière taille client envoyée (évite une boucle de layout)
+    bootstrapped?: boolean; // list-windows initial traité : les panes suivants sont des agents/splits
   };
   const ccSessions = new Map<string, CcSession>();
   const ccSid = (ctrlSid: string, paneId: string) => `cc:${ctrlSid}:${paneId}`;
@@ -972,7 +1040,9 @@
     const { term, fit, search } = setupTerm(sid, (data) =>
       ccExec(cc, `send-keys -t %${paneId} -H ${toHexKeys(data)}`),
     );
-    sessions.set(sid, { term, fit, search, remote: cc.remote, cmd: "", key: sid, unlisteners: [], webgl: false, cc: { ctrlSid: cc.ctrlSid, paneId } });
+    // agent = pane apparu APRÈS le bootstrap (un coéquipier ouvert par Claude Code,
+    // ou un split manuel). Les panes du list-windows initial sont le(s) lead(s).
+    sessions.set(sid, { term, fit, search, remote: cc.remote, cmd: "", key: sid, unlisteners: [], webgl: false, cc: { ctrlSid: cc.ctrlSid, paneId, agent: cc.bootstrapped === true } });
     sessStatus[sid] = { status: "open", error: "" };
     return sid;
   }
@@ -1104,6 +1174,10 @@
         if (active === "1") cc.activeWindow = w;
         try { ccApplyLayout(cc, w, parseLayout(layout)); } catch { /* layout illisible */ }
       }
+      // ponytail: à partir d'ici, tout nouveau pane est un agent/split. Ceiling :
+      // réattacher une session qui avait DÉJÀ des panes d'agents les compte comme
+      // lead → ils ne s'auto-fermeront pas. Acceptable pour un opt-in.
+      cc.bootstrapped = true;
     });
   }
   function closeCc(cc: CcSession) {
@@ -1386,6 +1460,16 @@
   function projLeaves(n: ProjNode): ProjLeaf[] {
     return "remoteId" in n ? [n] : [...projLeaves(n.a), ...projLeaves(n.b)];
   }
+  /** Retire une feuille d'une vue de projet par sa key stable (pendant ProjNode de
+   *  `withoutLeaf`). Un split qui perd un côté se replie sur l'autre. */
+  function withoutProjLeaf(n: ProjNode, key: string): ProjNode | null {
+    if ("remoteId" in n) return n.id === key ? null : n;
+    const a = withoutProjLeaf(n.a, key);
+    const b = withoutProjLeaf(n.b, key);
+    if (!a) return b;
+    if (!b) return a;
+    return { ...n, a, b };
+  }
   /** Vues d'un projet (compat : ancien format `root` = une seule vue). */
   function projectViews(p: Project): ProjNode[] {
     return p.views ?? (p.root ? [p.root] : []);
@@ -1418,7 +1502,9 @@
       last = tab.id;
     }
     if (!last) {
-      toast("None of this project's remotes exist yet.", "error");
+      // projet vidé (tous ses terminaux fermés) : proposer d'en ouvrir un, pas une erreur
+      if (!projectViews(p).length) openPicker({ projectId: p.id });
+      else toast("None of this project's remotes exist yet.", "error");
       return;
     }
     activeTabId = last;
@@ -1428,7 +1514,7 @@
    *  tmux garde les sessions côté serveur — la réouverture les réattache par
    *  `key`. Ranger ne perd donc rien, ni layout ni travail en cours. */
   function closeProject(p: Project) {
-    for (const t of projectTabs(p.id)) closeTab(t);
+    for (const t of projectTabs(p.id)) closeTab(t, true); // ranger : garde les vues pour rouvrir à l'identique
   }
   async function confirmSaveProject() {
     if (modal?.type !== "saveProject") return;
@@ -1676,6 +1762,12 @@
     // ses panes — autoTitles (cwd/commande via OSC) les distingue déjà.
     return savedTitles[s.key] || autoTitles[sid] || s.remote.name;
   }
+  /** Nom du terminal tronqué : partagé par la notif système et la carte in-app.
+   *  On garde le DÉBUT (machine/contexte) ; « » si le pane a disparu. */
+  function shortLabel(sid: string): string {
+    const l = sessLabel(sid);
+    return l.length > 32 ? l.slice(0, 31) + "…" : l;
+  }
   function startRename(sid: string) {
     if (isBrowser(sid)) return; // un navigateur s'intitule par son URL
     renamingSid = sid;
@@ -1838,7 +1930,35 @@
       if (visiblePane(sid)) continue;
       const body = attentions.find((a) => a.sid === sid)?.message
         ?? (st === "done" ? "Claude finished" : "Claude is waiting for a response");
-      notify(st, `Arabel — ${sessLabel(sid)}`, body);
+      // titre = le terminal concerné, tronqué (un titre OSC / chemin peut être
+      // long) ; on garde le DÉBUT, qui identifie la machine/le contexte. macOS
+      // affiche déjà « Arabel » en en-tête → pas de préfixe redondant.
+      notify(st, shortLabel(sid) || "terminal", body);
+    }
+  });
+
+  // ─── fermeture auto des panneaux d'agents terminés (opt-in) ───────────────
+  // Un pane tmux « agent » (né après le bootstrap) qui reste « done » ~1,5 s est
+  // tué côté tmux (kill-pane), sauf le pane focalisé. Le lead n'est jamais agent,
+  // donc jamais fermé. « done » sur un pane cc ne vient que des marqueurs TUI de
+  // Claude (un shell ordinaire ne l'atteint jamais) → pas de faux positif.
+  const doneSince = new Map<string, number>();
+  const autoClosed = new Set<string>();
+  $effect(() => {
+    void liveTick;
+    if (!settings.agentAutoClose) return;
+    const now = Date.now();
+    for (const [sid, s] of sessions) {
+      const paneCc = s.cc;
+      if (!paneCc?.agent || autoClosed.has(sid)) continue;
+      if (liveStatus(sid) !== "done") { doneSince.delete(sid); continue; }
+      const t0 = doneSince.get(sid);
+      if (t0 == null) { doneSince.set(sid, now); continue; }
+      if (now - t0 < 1500) continue; // « done » stable, pas un flottement transitoire
+      const tab = tabs.find((t) => t.cc === paneCc.ctrlSid);
+      if (tab?.active === sid) continue; // tu es dessus → on n'y touche pas
+      autoClosed.add(sid);
+      ccKill(sid);
     }
   });
 
@@ -1983,6 +2103,30 @@
     // masque ces affordances pour ces remotes.
     return r && !isLocal(r.id) && !r.sysSsh ? r : null;
   }
+  /** Remote éligible au panneau git : le terminal LOCAL (git s'exécute en local) ou
+   *  un SSH russh (via le pool SFTP). Exclut sysSsh (pas de pool) et WSL (chemins
+   *  Linux ≠ hôte Windows où tournerait le git local). */
+  function activeGitRemote(): Remote | null {
+    const sid = activeTab?.active;
+    const r = sid ? sessions.get(sid)?.remote : null;
+    if (!r) return null;
+    if (r.id === "local") return r;
+    return !isLocal(r.id) && !r.sysSsh ? r : null;
+  }
+  /** Cwd réel du terminal actif : pid local (sysinfo) ou pane tmux distant. null si
+   *  indéterminable (SSH sans tmux, pane -CC…) → l'appelant retombe sur r.dir/home. */
+  async function terminalCwd(sid: string, r: Remote): Promise<string | null> {
+    const s = sessions.get(sid);
+    if (!s) return null;
+    let p: string | null = null;
+    try {
+      if (r.id === "local") p = await rpc<string | null>("local_cwd", { sessionId: sid });
+      // sous tmux, OSC 7 est absorbé par tmux → on demande le cwd à tmux lui-même.
+      else if (s.tmux && !s.cc)
+        p = await rpc<string>("session_cwd", { remoteId: r.id, ...remoteParams(r), session: `arabel-${s.key.slice(0, 8)}` });
+    } catch { return null; }
+    return p && p.startsWith("/") ? p : null;
+  }
   function joinPath(p: string, n: string): string {
     return p === "/" ? `/${n}` : `${p}/${n}`;
   }
@@ -2075,12 +2219,12 @@
   type GStatus = { branch: string; upstream: string; ahead: number; behind: number; entries: GEntry[] };
   type DLine = { t: "add" | "del" | "hunk" | "meta" | "ctx"; s: string };
   let git = $state<{
-    open: boolean; remote: Remote | null; root: string; busy: boolean; isRepo: boolean;
+    open: boolean; remote: Remote | null; sid: string | null; root: string; busy: boolean; isRepo: boolean;
     branch: string; upstream: string; ahead: number; behind: number;
     entries: GEntry[]; msg: string; branches: string[]; showBranches: boolean;
     log: string[]; showLog: boolean; fetching: boolean;
   }>({
-    open: false, remote: null, root: "", busy: false, isRepo: true,
+    open: false, remote: null, sid: null, root: "", busy: false, isRepo: true,
     branch: "", upstream: "", ahead: 0, behind: 0,
     entries: [], msg: "", branches: [], showBranches: false, log: [], showLog: false, fetching: false,
   });
@@ -2089,10 +2233,13 @@
   async function gitRun(args: string[]): Promise<[number, string]> {
     const r = git.remote;
     if (!r) return [1, ""];
+    // local : git s'exécute sur la machine ; sinon via le pool russh du remote.
     // ne jette JAMAIS : les appelants finissent tous par gitRefresh() pour remettre
     // busy à false. Une coupure SSH qui rejette ici laisserait le panneau voilé à vie.
-    return rpc<[number, string]>("git_run", { remoteId: r.id, ...remoteParams(r), cwd: git.root, args })
-      .catch((e) => [1, String(e)] as [number, string]);
+    const call = r.id === "local"
+      ? rpc<[number, string]>("git_run_local", { cwd: git.root, args })
+      : rpc<[number, string]>("git_run", { remoteId: r.id, ...remoteParams(r), cwd: git.root, args });
+    return call.catch((e) => [1, String(e)] as [number, string]);
   }
   /** Parse `git status --porcelain=v2 --branch`. Pur → testable (voir gitStatusDemo). */
   function parseStatus(out: string): GStatus {
@@ -2151,6 +2298,12 @@
     // conflit (--cc) : préfixe 2 colonnes → les deux côtés comptent comme des ajouts
     const cc = parseDiff("diff --cc f.txt\n@@@ -1,1 -1,1 +1,5 @@@\n++<<<<<<< HEAD\n +main\n++=======\n+ other\n++>>>>>>> other\n");
     eq(cc.map((l) => l.t), ["meta", "hunk", "add", "add", "add", "add", "add"], "diff conflit");
+
+    // ansiToHtml : couleur rendue en span, texte échappé (pas d'injection depuis un
+    // message de commit), reset qui ferme le span.
+    eq(ansiToHtml("\x1b[32m*\x1b[0m x"), `<span style="color:#4ade80;">*</span> x`, "ansi couleur");
+    eq(ansiToHtml("a<b>&"), "a&lt;b&gt;&amp;", "ansi échappe");
+    eq(ansiToHtml("\x1b[31m<script>"), `<span style="color:#f87171;">&lt;script&gt;</span>`, "ansi échappe sous couleur");
   }
   function splitPath(p: string): { name: string; sub: string } {
     const i = p.lastIndexOf("/");
@@ -2194,23 +2347,31 @@
     const [, st] = await gitRun(GIT_STATUS);
     if (git.remote?.id === r.id) Object.assign(git, parseStatus(st));
   }
-  async function gitPointTo(r: Remote) {
-    git.remote = r; git.showBranches = false; git.showLog = false;
-    const home = await rpc<string>("sftp_home", { remoteId: r.id, ...remoteParams(r) }).catch(() => "~");
-    git.root = r.dir ? (r.dir.startsWith("/") ? r.dir : joinPath(home, r.dir)) : home;
+  async function gitPointTo(r: Remote, sid: string | null) {
+    git.remote = r; git.sid = sid; git.showBranches = false; git.showLog = false;
+    // là où le terminal se trouve, en priorité ; sinon le dossier configuré / le home.
+    const cwd = sid ? await terminalCwd(sid, r) : null;
+    if (cwd) git.root = cwd;
+    else if (r.id === "local") git.root = "~"; // dernier recours local (git_run_local → home)
+    else {
+      const home = await rpc<string>("sftp_home", { remoteId: r.id, ...remoteParams(r) }).catch(() => "~");
+      git.root = r.dir ? (r.dir.startsWith("/") ? r.dir : joinPath(home, r.dir)) : home;
+    }
     gitRefresh(true);
   }
   function toggleGit() {
     if (git.open) { git.open = false; return; }
-    const r = activeSshRemote();
-    if (!r) return;
+    const sid = activeTab?.active ?? null;
+    const r = activeGitRemote();
+    if (!r || !sid) return;
     git.open = true;
-    gitPointTo(r);
+    gitPointTo(r, sid);
   }
-  // suit le remote du panneau actif
+  // suit le panneau actif : re-cible sur changement de pane (remote OU cwd)
   $effect(() => {
-    const r = activeSshRemote();
-    if (git.open && r && r.id !== git.remote?.id) gitPointTo(r);
+    const sid = activeTab?.active ?? null;
+    const r = activeGitRemote();
+    if (git.open && r && sid && sid !== git.sid) gitPointTo(r, sid);
   });
   async function gitToggleEntry(entry: GEntry) {
     git.busy = true;
@@ -2295,8 +2456,51 @@
     if (modal?.type === "diff" && modal.path === entry.path) { modal.text = out; modal.loading = false; }
   }
   async function gitLoadLog() {
-    const [, out] = await gitRun(["log", "--oneline", "--decorate", "-40"]);
+    // git dessine ET colore le graphe (rails par lane + refs) → on rend juste ses
+    // couleurs ANSI (ansiToHtml). Bien plus simple qu'un moteur de lanes maison.
+    const [, out] = await gitRun([
+      "log", "--graph", "--color=always", "--decorate", "--pretty=format:%C(auto)%h%d %s", "-40",
+    ]);
     git.log = out.split("\n").filter(Boolean);
+  }
+  // 16 couleurs ANSI → hex accordés au thème sombre. Git colore les rails du graphe
+  // (rouge/vert/jaune/bleu/magenta/cyan en rotation par lane) et les décorations.
+  const ANSI_FG: Record<number, string> = {
+    30: "#6b7280", 31: "#f87171", 32: "#4ade80", 33: "#e3b341", 34: "#60a5fa", 35: "#c084fc", 36: "#22d3ee", 37: "#d1d5db",
+    90: "#9ca3af", 91: "#fca5a5", 92: "#86efac", 93: "#fde047", 94: "#93c5fd", 95: "#d8b4fe", 96: "#67e8f9", 97: "#f9fafb",
+  };
+  /** Rend une ligne colorée par git (séquences SGR) en HTML sûr : le texte est
+   *  échappé, seuls des <span style="color:…"> sont injectés. Pur → testable. */
+  function ansiToHtml(s: string): string {
+    const esc = (t: string) => t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    let out = "", color = "", bold = false, open = false;
+    const restyle = () => {
+      if (open) { out += "</span>"; open = false; }
+      if (color || bold) { out += `<span style="${color ? `color:${color};` : ""}${bold ? "font-weight:600;" : ""}">`; open = true; }
+    };
+    let i = 0;
+    while (i < s.length) {
+      if (s[i] === "\x1b" && s[i + 1] === "[") {
+        const end = s.indexOf("m", i);
+        if (end === -1) break;
+        for (const c of s.slice(i + 2, end).split(";").map(Number)) {
+          if (c === 0) { color = ""; bold = false; }
+          else if (c === 1) bold = true;
+          else if (c === 22) bold = false;
+          else if (c === 39) color = "";
+          else if (ANSI_FG[c]) color = ANSI_FG[c];
+        }
+        restyle();
+        i = end + 1;
+      } else {
+        const next = s.indexOf("\x1b", i);
+        const chunk = next === -1 ? s.slice(i) : s.slice(i, next);
+        out += esc(chunk);
+        i += chunk.length;
+      }
+    }
+    if (open) out += "</span>";
+    return out;
   }
   async function toggleGitLog() {
     if (git.showLog) { git.showLog = false; return; }
@@ -2793,7 +2997,7 @@
     for (const cc of [...ccSessions.values()]) rpc("ssh_disconnect", { sessionId: cc.ctrlSid }).catch(() => {});
     for (const sid of [...sessions.keys()]) {
       rpc("ssh_disconnect", { sessionId: sid }).catch(() => {});
-      removeSession(sid);
+      removeSession(sid, true); // quitter ne doit jamais oublier les vues d'un projet
     }
     forwards.forEach((f) => rpc("port_forward_stop", { id: f.id }).catch(() => {}));
   });
@@ -2801,7 +3005,7 @@
 </script>
 
 <!-- empêche le webview de « naviguer » vers un fichier déposé hors zone -->
-<svelte:window onkeydown={globalKeydown} oncontextmenu={globalContextMenu} onresize={onWindowResize} ondragover={(e) => e.preventDefault()} ondrop={(e) => e.preventDefault()} />
+<svelte:window onkeydown={globalKeydown} oncontextmenu={globalContextMenu} onresize={onWindowResize} onfocus={() => focusActive(activeTab?.active ?? null)} ondragover={(e) => e.preventDefault()} ondrop={(e) => e.preventDefault()} />
 
 <!-- ─── icônes ─────────────────────────────────────────────────────────── -->
 {#snippet choiceBtns(att: Attention)}
@@ -2930,7 +3134,8 @@
     }}
     ondragend={() => { dragSid = null; dropTarget = null; dropRow = null; }}
     {...paneDropzone(sid, sub)}
-    onclick={() => focusPane(tab, sid)}>
+    onclick={() => focusPane(tab, sid)}
+    onmousedown={(e) => { if (e.button === 1) { e.preventDefault(); closePane(sid); } }}>
     <span class="row-icon">{#if isBrowser(sid)}{@render iGlobe()}{:else if s && isLocal(s.remote.id)}{@render iLaptop()}{:else}{@render iTerminal()}{/if}</span>
     {#if renamingSid === sid}
       <input class="row-rename" bind:value={renameValue} use:autofocus
@@ -3223,6 +3428,8 @@
       {#if activeSshRemote()}
         <button class="icon-btn" class:active-btn={forwardsOpen} title="Port forwards" onclick={() => (forwardsOpen = !forwardsOpen)}>{@render iGlobe()}</button>
         <button class="icon-btn" class:active-btn={files.open} title="Server files (SFTP)" onclick={toggleFiles}>{@render iFolder()}</button>
+      {/if}
+      {#if activeGitRemote()}
         <button class="icon-btn" class:active-btn={git.open} title="Source control (git)" onclick={toggleGit}>{@render iBranch()}</button>
       {/if}
       {#if forwards.length}
@@ -3236,6 +3443,24 @@
             const proj = activeTab.projectId && projects.find((p) => p.id === activeTab.projectId);
             modal = { type: "saveProject", tabId: activeTab.id, name: proj ? proj.name : "" };
           }}>{@render iBookmark()}</button>
+      {/if}
+      {#if isWindows}
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <div class="win-controls">
+          <button class="wc" title="Minimize" aria-label="Minimize" onclick={() => winCtl("min")}>
+            <svg width="10" height="10" viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 5h8"/></svg>
+          </button>
+          <button class="wc" title={maximized ? "Restore" : "Maximize"} aria-label="Maximize" onclick={() => winCtl("max")}>
+            {#if maximized}
+              <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1" y="3" width="6" height="6"/><path d="M3 3V1h6v6H7"/></svg>
+            {:else}
+              <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="1.5" y="1.5" width="7" height="7"/></svg>
+            {/if}
+          </button>
+          <button class="wc wc-close" title="Close" aria-label="Close" onclick={() => winCtl("close")}>
+            <svg width="10" height="10" viewBox="0 0 10 10" stroke="currentColor" stroke-width="1"><path d="M1 1l8 8M9 1l-8 8"/></svg>
+          </button>
+        </div>
       {/if}
     </header>
 
@@ -3346,7 +3571,7 @@
           </button>
           {#if git.showLog}
             <div class="git-log">
-              {#each git.log as l (l)}<div class="git-log-line">{l}</div>{:else}<div class="git-dim git-log-line">No commits</div>{/each}
+              {#each git.log as l, i (i)}<div class="git-log-line">{@html ansiToHtml(l)}</div>{:else}<div class="git-dim git-log-line">No commits</div>{/each}
             </div>
           {/if}
 
@@ -3415,11 +3640,12 @@
         </div>
         <form class="fwd-add" onsubmit={(e) => { e.preventDefault(); addForward(); }}>
           <input placeholder="remote port (e.g. 3000)" bind:value={newFwd.remotePort} />
-          <button type="submit" class="btn fwd-go" disabled={!newFwd.remotePort} title="Open tunnel">{@render iPlus()}</button>
+          <button type="submit" class="fwd-go" disabled={!newFwd.remotePort} title="Open tunnel">{@render iPlus()}</button>
         </form>
         <div class="files-list">
           {#each forwards as f (f.id)}
-            <div class="fwd-row">
+            <div class="fwd-row" transition:fly={{ y: -4, duration: 140 }}>
+              <span class="fwd-dot" title="Tunnel live"></span>
               <span class="fwd-label" title="localhost:{f.localPort} → {f.remoteName}:{f.remotePort}">
                 <b>:{f.localPort}</b> <span class="fwd-arrow">→</span> {f.remoteName}:{f.remotePort}
               </span>
@@ -3469,7 +3695,8 @@
         <div class="att-head">
           <span class="att-icon {a.kind}">{#if a.kind === "stop"}{@render iCheck()}{:else}{@render iAlert()}{/if}</span>
           <button class="att-msg" onclick={() => { gotoAttention(a); dismissAttention(a); }} title="Go to pane">
-            {a.message}
+            {#if shortLabel(a.sid)}<span class="att-where">{shortLabel(a.sid)}</span>{/if}
+            <span class="att-text">{a.message}</span>
           </button>
           {#if a.kind === "notif" && !a.options?.length}
             <button class="att-btn yes" title="Allow (sends 1)" onclick={() => answerAttention(a, "1")}>✓</button>
@@ -3896,6 +4123,14 @@
               <p class="f-hint">
                 Applied on the next sync to a remote. A team costs far more tokens than a single agent. Own panes need a
                 native tmux tab, where each teammate is mirrored as a real pane; unchecked, they all share the lead's pane.
+              </p>
+              <label class="f-check">
+                <input type="checkbox" bind:checked={settings.agentAutoClose} onchange={() => save()} />
+                <span>Close a teammate's pane once its agent finishes</span>
+              </label>
+              <p class="f-hint">
+                Off by default. Only teammate panes are closed — never the lead pane, never the one you're focused on. You can
+                always close a pane yourself with {formatCombo(settings.keymap["close-pane"])} or its ✕ button (appears on hover).
               </p>
             </div>
             <div class="sheet-actions"><button type="submit" class="btn">Close</button></div>
@@ -4332,6 +4567,21 @@
   }
   .tb-space { flex: 1; height: 100%; }
 
+  /* contrôles de fenêtre Windows : collés au coin haut-droit, pleine hauteur,
+     alignés sur les compteurs — annule le padding droit de la titlebar. */
+  .win-controls { display: flex; align-self: stretch; margin-right: -8px; }
+  .wc {
+    width: 44px; align-self: stretch;
+    display: inline-flex; align-items: center; justify-content: center;
+    background: transparent; border: none; cursor: default;
+    color: var(--text-secondary);
+    transition: background 120ms var(--ease), color 120ms var(--ease);
+  }
+  .wc:hover { background: var(--surface-hover); color: var(--text-primary); }
+  .wc:active { background: var(--surface-raised); }
+  .wc-close:hover { background: #e81123; color: #fff; }
+  .wc-close:active { background: #f1707a; }
+
   .meter {
     display: flex;
     align-items: center;
@@ -4485,8 +4735,9 @@
   .git-graph-row:hover { background: var(--surface-hover); }
   .git-graph-chev { display: inline-flex; transition: transform .12s; color: var(--text-tertiary); }
   .git-graph-chev.open { transform: rotate(90deg); }
-  .git-log { max-height: 180px; overflow-y: auto; padding: 4px 12px; border-bottom: 1px solid var(--border); }
-  .git-log-line { font-size: 11px; font-family: ui-monospace, SFMono-Regular, monospace; color: var(--text-tertiary); padding: 2px 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .git-log { max-height: 180px; overflow: auto; padding: 4px 12px; border-bottom: 1px solid var(--border); }
+  /* white-space: pre → les espaces/rails du graphe git restent alignés (monospace) */
+  .git-log-line { font-size: 11px; font-family: ui-monospace, SFMono-Regular, monospace; color: var(--text-tertiary); padding: 1px 0; white-space: pre; }
   .git-commit-box { padding: 10px 12px 6px; }
   .git-msg {
     width: 100%; min-height: 56px; resize: vertical; padding: 8px 10px;
@@ -4553,14 +4804,35 @@
   }
   .fwd-panel { width: 300px; }
   .fwd-add { display: flex; gap: 6px; padding: 8px 10px; border-bottom: 1px solid var(--border); }
-  .fwd-add input { flex: 1; }
-  .fwd-go { width: 30px; padding: 0; flex: none; display: inline-flex; align-items: center; justify-content: center; }
-  .fwd-row { display: flex; align-items: center; gap: 6px; margin: 0 6px; padding: 4px 6px; border-radius: var(--radius-sm); font-size: 12px; }
+  .fwd-add input { flex: 1; font-family: ui-monospace, Menlo, monospace; }
+  /* Bouton discret quand le champ est vide, il « s'allume » en bleu dès qu'on tape un port. */
+  .fwd-go {
+    width: 30px; height: 30px; padding: 0; flex: none;
+    display: inline-flex; align-items: center; justify-content: center;
+    border-radius: var(--radius-md);
+    border: 1px solid var(--border-strong); background: var(--surface-raised);
+    color: var(--text-tertiary);
+    transition: background 120ms var(--ease), color 120ms var(--ease), border-color 120ms var(--ease), transform 80ms var(--ease);
+  }
+  .fwd-go:not(:disabled) { background: var(--selected); border-color: rgba(240, 246, 252, 0.1); color: #fff; }
+  .fwd-go:not(:disabled):hover { background: var(--accent); transform: translateY(-1px); }
+  .fwd-go:not(:disabled):active { transform: translateY(0) scale(0.94); }
+  .fwd-go:disabled { cursor: default; }
+  .fwd-row { display: flex; align-items: center; gap: 7px; margin: 0 6px; padding: 4px 6px; border-radius: var(--radius-sm); font-size: 12px; }
   .fwd-row:hover { background: var(--surface-hover); }
-  .fwd-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .fwd-dot {
+    width: 6px; height: 6px; border-radius: 50%; flex: none; background: var(--success);
+    animation: fwd-pulse 2.4s var(--ease) infinite;
+  }
+  @keyframes fwd-pulse {
+    0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--success) 55%, transparent); }
+    70%, 100% { box-shadow: 0 0 0 5px transparent; }
+  }
+  .fwd-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, Menlo, monospace; }
   .fwd-label b { color: var(--accent); font-weight: 600; }
   .fwd-arrow { color: var(--text-tertiary); }
   .fwd-btns { display: flex; gap: 1px; flex: none; }
+  @media (prefers-reduced-motion: reduce) { .fwd-dot { animation: none; } .fwd-go { transition: none; } }
 
   .preview {
     flex: none;
@@ -5012,17 +5284,20 @@
   .att-card .agent-q { color: var(--text-secondary); padding: 0 4px; }
   .att-msg {
     flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 1px;
     background: none;
     border: none;
-    color: var(--text-primary);
     text-align: left;
-    font-size: 12px;
     font-family: inherit;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
     padding: 0 4px;
   }
+  .att-where, .att-text { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .att-where { font-size: 10px; color: var(--text-secondary); }
+  .att-text { font-size: 12px; color: var(--text-primary); }
   .att-btn {
     width: 22px;
     height: 22px;

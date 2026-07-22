@@ -154,8 +154,19 @@ pub fn run() {
         .manage(ssh::WatchState(Mutex::new(HashMap::new())))
         .manage(ssh::ForwardState(Mutex::new(HashMap::new())))
         .manage(sftp::SftpState(Mutex::new(HashMap::new())))
+        .manage(local::PtyPids::default())
         .setup(|app| {
             build_menu(app)?;
+            // Windows : on retire le cadre natif pour dessiner nos propres boutons
+            // (min/max/close) dans la titlebar, alignés sur les compteurs — comme
+            // les feux macOS. Tauri garde la fenêtre redimensionnable sans cadre.
+            #[cfg(target_os = "windows")]
+            {
+                use tauri::Manager;
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.set_decorations(false);
+                }
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -165,6 +176,8 @@ pub fn run() {
             local::mosh_connect,
             local::mosh_available,
             local::wsl_distros,
+            local::local_cwd,
+            local::git_run_local,
             ssh::metrics_watch,
             ssh::metrics_unwatch,
             ssh::ssh_connect,
@@ -186,6 +199,7 @@ pub fn run() {
             sftp::sftp_upload,
             sftp::sftp_paste_image,
             sftp::git_run,
+            sftp::session_cwd,
             store::store_load,
             store::store_save,
             store::passphrase_set,

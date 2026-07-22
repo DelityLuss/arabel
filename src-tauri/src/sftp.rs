@@ -305,3 +305,40 @@ pub async fn git_run(
     }
     res
 }
+
+/// Cwd du pane tmux d'une session arabel (`#{pane_current_path}`) — pour ouvrir le
+/// panneau git là où le terminal se trouve, sous tmux (le défaut). Passe par le
+/// canal exec poolé, comme `git_run`. Chaîne vide si la session/tmux est absente →
+/// l'appelant retombe sur le dossier configuré du remote.
+// ponytail: renvoie le pane ACTIF de la session ; un split tmux manuel peut viser
+// un autre pane que celui affiché. Suffisant pour le cas courant (1 pane/session).
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn session_cwd(
+    state: State<'_, SftpState>,
+    remote_id: String,
+    host: String,
+    port: u16,
+    user: String,
+    key_path: String,
+    identity_id: Option<String>,
+    auth: Option<String>,
+    session: String,
+) -> Result<String, String> {
+    let handle = {
+        let pool = ensure(&state, &remote_id, &host, port, &user, &key_path, identity_id, auth).await?;
+        pool.get(&remote_id).unwrap().0.clone()
+    };
+    // exec non-login = PATH minimal ; tmux vit souvent dans /usr/local|/opt/homebrew.
+    let cmd = format!(
+        "PATH=\"$PATH:/usr/local/bin:/opt/homebrew/bin\" tmux display-message -p -t {} '#{{pane_current_path}}'",
+        shq(&session)
+    );
+    let res = crate::ssh::exec(&handle, &cmd, None).await;
+    if res.is_err() {
+        state.0.lock().await.remove(&remote_id);
+    }
+    // tmux imprime le chemin sur stdout ; si la session manque, une erreur (ignorée
+    // par l'appelant qui vérifie « commence par / »).
+    Ok(res?.1.trim().to_string())
+}
