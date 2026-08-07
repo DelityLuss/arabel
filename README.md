@@ -71,8 +71,16 @@ npm run tauri build
 ```
 
 The default build embeds a local Whisper (whisper.cpp), so it needs **cmake and a
-C++ toolchain** — and Metal is switched on for macOS. If you only want dictation
-through an API, drop it:
+C++ toolchain** — Metal is switched on for macOS. Per platform:
+
+| | |
+|---|---|
+| **macOS** | `brew install cmake` |
+| **Windows** | cmake + Visual Studio's C++ build tools. Either install LLVM as well, or set `WHISPER_DONT_GENERATE_BINDINGS=1` to use the bindings shipped with the crate — that's what CI does, and it skips the libclang requirement. |
+| **Linux** | `cmake`, `build-essential`, plus `libasound2-dev` for the microphone (needed even without local Whisper). |
+
+If you only want dictation through an API, drop whisper.cpp entirely — no cmake,
+no C++ toolchain:
 
 ```sh
 npm run tauri build -- --no-default-features

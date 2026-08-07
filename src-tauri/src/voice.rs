@@ -87,6 +87,24 @@ struct DlProgress {
 
 // ─── capture ─────────────────────────────────────────────────────────────────
 
+/// Où l'utilisateur va rouvrir le robinet du micro. macOS pose la question une
+/// fois (TCC) ; Windows a DEUX interrupteurs — l'accès micro global et celui des
+/// applications de bureau — et refuse en silence si le second est coupé.
+fn permission_hint() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        " — System Settings › Privacy & Security › Microphone"
+    }
+    #[cfg(target_os = "windows")]
+    {
+        " — Settings › Privacy & security › Microphone (including “Let desktop apps access your microphone”)"
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        ""
+    }
+}
+
 /// Nom lisible d'un périphérique. cpal 0.18 le range dans une `DeviceDescription`,
 /// dont la lecture peut échouer (device débranché entre l'énumération et l'appel).
 fn device_name(d: &cpal::Device) -> Option<String> {
@@ -101,6 +119,9 @@ pub fn voice_devices() -> Result<Vec<String>, String> {
         .map_err(|e| e.to_string())?
         .filter_map(|d| device_name(&d))
         .collect();
+    // WASAPI comme ALSA rendent volontiers le même micro plusieurs fois (deux
+    // interfaces, deux plugins) : dedup ne mord que sur des voisins, d'où le tri.
+    names.sort();
     names.dedup();
     Ok(names)
 }
@@ -144,7 +165,7 @@ pub async fn voice_start(
             Ok(())
         }
         Ok(Err(e)) => Err(e),
-        Err(_) => Err("the microphone did not start — check the system permission".into()),
+        Err(_) => Err(format!("the microphone did not start{}", permission_hint())),
     }
 }
 
@@ -255,7 +276,7 @@ where
             |e| eprintln!("[arabel] microphone stream error: {e}"),
             None,
         )
-        .map_err(|e| format!("cannot open the microphone: {e}"))
+        .map_err(|e| format!("cannot open the microphone: {e}{}", permission_hint()))
 }
 
 /// Arrête l'enregistrement et rend l'audio capté, en 16 kHz mono.
@@ -500,10 +521,15 @@ fn wav16(pcm: &[f32]) -> Vec<u8> {
 
 // ─── modèles locaux ──────────────────────────────────────────────────────────
 
+/// Les modèles vont dans les données LOCALES, pas dans la config : un GGML pèse
+/// de 150 Mo à 1,5 Go, et sur Windows `app_config_dir` est `%APPDATA%` (Roaming)
+/// — un profil itinérant se traînerait le modèle à chaque ouverture de session.
+/// Sur Linux ça tombe dans `~/.local/share`, sa vraie place ; sur macOS c'est le
+/// même Application Support qu'avant.
 fn models_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app
         .path()
-        .app_config_dir()
+        .app_local_data_dir()
         .map_err(|e| e.to_string())?
         .join("models");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -573,8 +599,28 @@ pub async fn voice_model_download(app: AppHandle, url: String, name: String) -> 
     dest.to_str().map(str::to_string).ok_or_else(|| "invalid path".into())
 }
 
+/// Supprimer un modèle exige de le RELÂCHER d'abord : whisper.cpp mappe le
+/// fichier en mémoire et Windows refuse d'effacer un fichier encore ouvert (là
+/// où Unix l'accepte sans broncher). On vide donc le cache s'il pointe dessus.
 #[tauri::command]
-pub fn voice_model_delete(path: String) -> Result<(), String> {
+pub fn voice_model_delete(app: AppHandle, path: String) -> Result<(), String> {
+    #[cfg(feature = "local-whisper")]
+    {
+        let cache = app.state::<WhisperCache>();
+        // `let` et pas `if let` : le verrou doit être une liaison nommée, sinon
+        // il vit jusqu'à la fin de l'instruction et emprunte `cache` plus
+        // longtemps que celui-ci n'existe.
+        let mut g = match cache.0.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        if g.as_ref().is_some_and(|(p, _)| p == &PathBuf::from(&path)) {
+            *g = None; // dernière référence au contexte → le fichier est refermé
+        }
+        drop(g);
+    }
+    #[cfg(not(feature = "local-whisper"))]
+    let _ = &app;
     std::fs::remove_file(path).map_err(|e| e.to_string())
 }
 
