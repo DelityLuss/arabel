@@ -2681,8 +2681,7 @@
     }
   }
 
-  async function pasteInto(sid: string, e: MouseEvent) {
-    e.preventDefault();
+  async function pasteInto(sid: string) {
     if (!inTauri) return;
     await pasteClipboard(sid);
     sessions.get(sid)?.term.focus();
@@ -2972,6 +2971,24 @@
   function mountTerm(node: HTMLElement, sid: string) {
     attach(node, sid);
     let current = sid;
+    // Clic droit = COLLER, comme dans n'importe quel terminal — jamais un menu.
+    // Une appli qui capte la souris (tmux `mouse on`, vim, htop…) reçoit sinon le
+    // bouton 3 et ouvre SON menu : tmux affiche display-menu (« Kill », « Move »…)
+    // et le collage est englouti. On intercepte donc en phase CAPTURE sur le
+    // conteneur, au-dessus d'xterm : le rapport souris n'est jamais émis vers le
+    // pty, ni en SSH, ni en local, ni dans un panneau tmux -CC.
+    const rightClick = (e: MouseEvent) => {
+      if (e.button !== 2) return;
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.type === "mousedown") pasteInto(current);
+    };
+    node.addEventListener("mousedown", rightClick, true);
+    node.addEventListener("mouseup", rightClick, true);
+    // le menu natif du webview est déjà coupé par globalContextMenu ; on le
+    // recoupe ici pour que l'ordre des handlers ne puisse pas le laisser passer.
+    const ctx = (e: MouseEvent) => e.preventDefault();
+    node.addEventListener("contextmenu", ctx, true);
     const ro = new ResizeObserver(() => {
       const s = sessions.get(current);
       // panneau tmux -CC : xterm est piloté par tmux → on prévient tmux (il
@@ -2985,7 +3002,12 @@
         current = newSid;
         attach(node, newSid);
       },
-      destroy: () => ro.disconnect(),
+      destroy: () => {
+        node.removeEventListener("mousedown", rightClick, true);
+        node.removeEventListener("mouseup", rightClick, true);
+        node.removeEventListener("contextmenu", ctx, true);
+        ro.disconnect();
+      },
     };
   }
 
@@ -3229,7 +3251,7 @@
           {/if}
         </span>
       </div>
-      <div class="pane-term" use:mountTerm={node.leaf} oncontextmenu={(e) => pasteInto(node.leaf, e)}>
+      <div class="pane-term" use:mountTerm={node.leaf}>
         {#if searchState?.sid === node.leaf}
           <div class="search-bar" transition:fly={{ y: -4, duration: 120 }}>
             <input
