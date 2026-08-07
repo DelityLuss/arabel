@@ -99,6 +99,9 @@
     if (cmd === "claude_sync") return "claude present · 5 config item(s) pushed · hooks installed" as T;
     if (cmd === "shell_enhance") return "suggestions enabled — open a new terminal." as T;
     if (cmd === "mosh_available") return true as T;
+    // démo web : pas de micro ni de coffre derrière, la dictée reste inerte
+    if (cmd === "voice_local_available" || cmd === "voice_key_present") return false as T;
+    if (cmd === "voice_devices" || cmd === "voice_models") return [] as T;
     if (cmd === "wsl_distros") return ["Ubuntu", "Debian"] as T;
     if (cmd === "sftp_paste_image") return "/home/deploy/.arabel/paste/demo.png" as T;
     if (cmd === "sftp_home") return "/home/deploy" as T;
@@ -259,6 +262,35 @@
     "prev-tab": isMac ? "Meta+Shift+BracketLeft" : "Ctrl+Alt+BracketLeft",
     "next-pane": isMac ? "Meta+Ctrl+ArrowDown" : "Ctrl+Alt+ArrowDown",
     "prev-pane": isMac ? "Meta+Ctrl+ArrowUp" : "Ctrl+Alt+ArrowUp",
+    // ⌘M seul est déjà « réduire la fenêtre » côté macOS : on prend ⌘⇧M.
+    dictate: isMac ? "Meta+Shift+M" : "Ctrl+Shift+M",
+  };
+
+  // ─── dictée vocale ────────────────────────────────────────────────────────
+  /** Endpoints compatibles OpenAI (`/audio/transcriptions`). Un seul chemin de
+   *  code les sert tous — y compris un whisper.cpp/faster-whisper auto-hébergé. */
+  const VOICE_PRESETS = [
+    { label: "Groq", base: "https://api.groq.com/openai/v1", model: "whisper-large-v3-turbo" },
+    { label: "OpenAI", base: "https://api.openai.com/v1", model: "gpt-4o-transcribe" },
+  ];
+  /** Modèles GGML de whisper.cpp, téléchargés à la demande dans le dossier de
+   *  config. Le champ URL reste éditable : si un nom change côté HuggingFace,
+   *  ça se rattrape sans nouvelle version de l'app. */
+  const HF_MODELS = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/";
+  const WHISPER_MODELS = [
+    { file: "ggml-base.bin", size: "148 MB", note: "quick, shaky on French" },
+    { file: "ggml-small.bin", size: "488 MB", note: "fair balance" },
+    { file: "ggml-large-v3-turbo-q5_0.bin", size: "574 MB", note: "best quality for the size" },
+  ];
+  const VOICE_DEFAULTS = {
+    backend: "api" as "api" | "local",
+    apiBase: VOICE_PRESETS[0].base,
+    apiModel: VOICE_PRESETS[0].model,
+    modelPath: "", // modèle GGML pour le backend local
+    language: "", // vide = détection auto ; forcer « fr » aide beaucoup Whisper
+    prompt: "", // amorce de vocabulaire (noms de commandes, jargon)
+    device: "", // vide = micro par défaut du système
+    autoSend: false, // insérer seulement, ou insérer ET valider
   };
 
   let settings = $state({
@@ -288,6 +320,9 @@
     lineHeight: 1.25,
     keymap: { ...DEFAULT_KEYS } as Record<string, string>,
     customTheme: { ...THEMES["Arabel Dark"] } as ITheme,
+    // Dictée : la clé d'API n'est PAS ici (elle vit dans le coffre chiffré, côté
+    // Rust) — ce store-ci part dans le partage de config entre machines.
+    voice: { ...VOICE_DEFAULTS },
   });
   function activeTheme(): ITheme {
     return settings.theme === "Custom" ? settings.customTheme : (THEMES[settings.theme] ?? THEMES["Arabel Dark"]);
@@ -350,6 +385,9 @@
       for (const l of pleaves) delete l.cmd;
     }
     settings = { ...settings, ...data.settings };
+    // La fusion ci-dessus est plate : un bloc `voice` écrit par une version
+    // antérieure écraserait le défaut ET perdrait les clés ajoutées depuis.
+    settings.voice = { ...VOICE_DEFAULTS, ...(data.settings?.voice ?? {}) };
     savedTitles = data.titles ?? {}; // noms de terminaux (avant restore : sessLabel les relira par key)
     restoreWorkspace(data.workspace);
     loaded = true;
@@ -683,6 +721,12 @@
     });
     term.attachCustomKeyEventHandler((e) => {
       if (e.type !== "keydown") return true;
+      // Échap pendant une dictée = annuler : l'audio est jeté, rien n'est
+      // transcrit ni inséré. Consommé, sinon l'appli distante le reçoit aussi.
+      if (e.key === "Escape" && dictation?.sid === sid && !dictation.working) {
+        stopDictation(false);
+        return consume(e);
+      }
       // Shift+Entrée → nouvelle ligne sans envoyer (attendu par Claude Code) :
       // on émet ESC+CR, reconnu comme saut de ligne même à travers tmux
       if (e.key === "Enter" && e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey) {
@@ -939,6 +983,8 @@
     if (!s) return;
     sessions.delete(sid);
     if (zoomedSid === sid) zoomedSid = null;
+    // dictée en cours dans ce panneau : plus de destination, on relâche le micro
+    if (dictation?.sid === sid) stopDictation(false);
     delete sessStatus[sid];
     s.unlisteners.forEach((u) => u());
     s.term.dispose();
@@ -2687,6 +2733,121 @@
     sessions.get(sid)?.term.focus();
   }
 
+  // ─── dictée vocale ────────────────────────────────────────────────────────
+  // Bascule : la frappe démarre, la même arrête et transcrit. Pas de « maintenir
+  // pour parler » : le moteur de raccourcis ne voit que le keydown, et une touche
+  // relâchée pendant que la fenêtre a perdu le focus resterait enfoncée à vie.
+  let dictation = $state<{ sid: string; level: number; working: boolean } | null>(null);
+  let voiceLocalOk = $state(false); // backend Whisper local compilé dans ce binaire ?
+  let voiceKeySaved = $state(false); // clé d'API présente dans le coffre (jamais relue ici)
+  let voiceDevices = $state<string[]>([]);
+  let voiceModels = $state<[string, number][]>([]);
+  let voiceDl = $state<{ file: string; received: number; total: number } | null>(null);
+
+  listen<number>("voice-level", (e) => {
+    if (dictation) dictation.level = e.payload;
+  });
+  listen<{ received: number; total: number }>("voice-download", (e) => {
+    if (voiceDl) voiceDl = { ...voiceDl, ...e.payload };
+  });
+
+  async function toggleDictation(sid: string) {
+    if (dictation?.working) return; // transcription en vol : ni relance ni arrêt
+    if (dictation) return void stopDictation(true);
+    if (!inTauri) return toast("Dictation needs the desktop app.", "error");
+    const v = settings.voice;
+    if (v.backend === "api" && !v.apiBase.trim())
+      return toast("Set up dictation first — Settings → Voice.", "error");
+    if (v.backend === "local" && !v.modelPath)
+      return toast("Pick a local model first — Settings → Voice.", "error");
+    try {
+      await rpc("voice_start", { device: v.device || null });
+    } catch (e) {
+      return toast(`Microphone: ${e}`, "error", 6000);
+    }
+    dictation = { sid, level: 0, working: false };
+  }
+
+  /** `insert` faux = on jette l'audio (Échap) : rien n'est transcrit, donc rien
+   *  n'est facturé ni inséré. */
+  async function stopDictation(insert: boolean) {
+    const d = dictation;
+    if (!d || d.working) return;
+    if (!insert) {
+      dictation = null;
+      rpc("voice_cancel").catch(() => {});
+      return;
+    }
+    dictation = { ...d, working: true };
+    try {
+      const text = (await rpc<string>("voice_stop", { cfg: $state.snapshot(settings.voice) })).trim();
+      const s = sessions.get(d.sid);
+      if (!text) toast("Nothing heard.", "info", 2500);
+      else if (s) {
+        // paste() plutôt qu'un ssh_write direct : ça emprunte le `send` de la
+        // session (SSH, PTY local ou send-keys d'un panneau tmux -CC) et ça
+        // respecte le collage entre crochets — un texte multiligne ne part donc
+        // pas tout seul à l'exécution.
+        s.term.paste(text);
+        if (settings.voice.autoSend) s.term.input("\r");
+        s.term.focus();
+      }
+    } catch (e) {
+      toast(`Dictation: ${e}`, "error", 8000);
+    } finally {
+      dictation = null;
+    }
+  }
+
+  /** Rafraîchit ce que seul le backend sait : micros, modèles présents, clé posée. */
+  async function refreshVoice() {
+    if (!inTauri) return;
+    voiceLocalOk = await rpc<boolean>("voice_local_available").catch(() => false);
+    voiceKeySaved = await rpc<boolean>("voice_key_present").catch(() => false);
+    voiceDevices = await rpc<string[]>("voice_devices").catch(() => []);
+    voiceModels = await rpc<[string, number][]>("voice_models").catch(() => []);
+  }
+
+  async function saveVoiceKey(key: string) {
+    try {
+      await rpc("voice_key_set", { key });
+      voiceKeySaved = key.trim().length > 0;
+      toast(voiceKeySaved ? "API key saved to the vault" : "API key removed", "success");
+    } catch (e) {
+      toast(`Vault: ${e}`, "error");
+    }
+  }
+
+  async function downloadModel(file: string) {
+    if (voiceDl) return;
+    voiceDl = { file, received: 0, total: 0 };
+    try {
+      const path = await rpc<string>("voice_model_download", { url: HF_MODELS + file, name: file });
+      settings.voice.modelPath = path;
+      settings.voice.backend = "local";
+      save();
+      await refreshVoice();
+      toast(`${file} ready`, "success");
+    } catch (e) {
+      toast(`Download: ${e}`, "error", 8000);
+    } finally {
+      voiceDl = null;
+    }
+  }
+
+  async function deleteModel(path: string) {
+    try {
+      await rpc("voice_model_delete", { path });
+      if (settings.voice.modelPath === path) {
+        settings.voice.modelPath = "";
+        save();
+      }
+      await refreshVoice();
+    } catch (e) {
+      toast(`${e}`, "error");
+    }
+  }
+
   /** Coupe le menu contextuel natif du webview (Recharger, Inspecter…) : look
    *  d'app native. On garde le menu natif dans les champs de formulaire (hors
    *  terminal) pour le copier/coller ; le terminal gère son propre clic droit. */
@@ -2778,6 +2939,7 @@
     { id: "zoom", label: "Zoom pane (fullscreen)", scope: "term", run: (sid) => sid && toggleZoom(sid) },
     { id: "copy", label: "Copy selection", scope: "term", run: (sid) => { const s = sid ? sessions.get(sid) : null; if (s?.term.hasSelection() && inTauri) writeText(s.term.getSelection()).catch(() => {}); } },
     { id: "paste", label: "Paste", scope: "term", run: (sid) => { if (sid && inTauri) pasteClipboard(sid); } },
+    { id: "dictate", label: "Dictate (speech to text)", scope: "term", run: (sid) => sid && toggleDictation(sid) },
   ];
   const bindById = new Map(KEYBINDINGS.map((b) => [b.id, b]));
   const actionCombos = $derived.by(() => {
@@ -2788,7 +2950,7 @@
 
   // réattribution : l'utilisateur clique un raccourci puis presse la combo
   let recordingBind = $state<string | null>(null);
-  let settingsTab = $state<"appearance" | "terminal" | "shortcuts">("appearance");
+  let settingsTab = $state<"appearance" | "terminal" | "voice" | "shortcuts">("appearance");
   // Capture de la combo en phase CAPTURE, sur window : sur macOS (WKWebView) cliquer
   // un <button> ne lui donne pas le focus clavier, donc son onkeydown ne se déclenchait
   // jamais → recordingBind restait armé et globalKeydown gelait tout le clavier. La
@@ -3262,6 +3424,19 @@
               oninput={() => searchState && sessions.get(searchState.sid)?.search.findNext(searchState.query, { incremental: true })}
             />
             <button class="icon-btn" onclick={closeSearch}>{@render iClose()}</button>
+          </div>
+        {/if}
+        {#if dictation?.sid === node.leaf}
+          <div class="dictate-pill" transition:fly={{ y: 6, duration: 120 }}>
+            {#if dictation.working}
+              <span class="dict-spin">{@render iSpinner(13)}</span>
+              <span>Transcribing…</span>
+            {:else}
+              <span class="dict-dot"></span>
+              <span class="dict-meter"><span class="dict-fill" style="width:{Math.round(Math.min(1, dictation.level * 1.6) * 100)}%"></span></span>
+              <span class="dict-hint">{formatCombo(keyOf("dictate"))} to insert · Esc cancels</span>
+              <button class="icon-btn" title="Cancel" onclick={(e) => { e.stopPropagation(); stopDictation(false); }}>{@render iClose()}</button>
+            {/if}
           </div>
         {/if}
         {#if st && st.status !== "open"}
@@ -4014,6 +4189,7 @@
         <div class="seg">
           <button type="button" class:on={settingsTab === "appearance"} onclick={() => (settingsTab = "appearance")}>Appearance</button>
           <button type="button" class:on={settingsTab === "terminal"} onclick={() => (settingsTab = "terminal")}>Terminal</button>
+          <button type="button" class:on={settingsTab === "voice"} onclick={() => { settingsTab = "voice"; refreshVoice(); }}>Voice</button>
           <button type="button" class:on={settingsTab === "shortcuts"} onclick={() => (settingsTab = "shortcuts")}>Shortcuts</button>
         </div>
 
@@ -4154,6 +4330,105 @@
                 Off by default. Only teammate panes are closed — never the lead pane, never the one you're focused on. You can
                 always close a pane yourself with {formatCombo(settings.keymap["close-pane"])} or its ✕ button (appears on hover).
               </p>
+            </div>
+            <div class="sheet-actions"><button type="submit" class="btn">Close</button></div>
+          </form>
+        {:else if settingsTab === "voice"}
+          <form onsubmit={(e) => { e.preventDefault(); modal = null; }}>
+            <p class="f-hint">
+              In a terminal, {formatCombo(keyOf("dictate"))} starts dictating and the same combo inserts what you said.
+              The microphone is read natively, so the system asks for permission the first time.
+            </p>
+            <div class="seg">
+              <button type="button" class:on={settings.voice.backend === "api"} onclick={() => { settings.voice.backend = "api"; save(); }}>API</button>
+              <button type="button" class:on={settings.voice.backend === "local"} disabled={!voiceLocalOk}
+                title={voiceLocalOk ? "" : "This build was made without the local-whisper feature"}
+                onclick={() => { settings.voice.backend = "local"; save(); }}>Local model</button>
+            </div>
+
+            {#if settings.voice.backend === "api"}
+              <div class="mgr-head"><span>Endpoint</span></div>
+              <div class="chip-row">
+                {#each VOICE_PRESETS as p (p.base)}
+                  <button type="button" class="chip" class:on={settings.voice.apiBase === p.base}
+                    onclick={() => { settings.voice.apiBase = p.base; settings.voice.apiModel = p.model; save(); }}>{p.label}</button>
+                {/each}
+              </div>
+              <div class="f-pair">
+                <label class="grow">{@render field("Base URL")}<input bind:value={settings.voice.apiBase} onchange={() => save()} placeholder="https://api.groq.com/openai/v1" /></label>
+                <label class="grow">{@render field("Model")}<input bind:value={settings.voice.apiModel} onchange={() => save()} placeholder="whisper-large-v3-turbo" /></label>
+              </div>
+              <label>{@render field(voiceKeySaved ? "API key — saved in the vault" : "API key")}
+                <input type="password" autocomplete="off" placeholder={voiceKeySaved ? "•••••••••  (type to replace)" : "sk-…"}
+                  onchange={(e) => { saveVoiceKey(e.currentTarget.value); e.currentTarget.value = ""; }} />
+              </label>
+              <p class="f-hint">
+                Any OpenAI-compatible <code>/audio/transcriptions</code> endpoint fits here — including a whisper.cpp or
+                faster-whisper server of your own. The key is encrypted in the same local vault as your SSH passphrases; empty
+                the field to forget it.
+              </p>
+            {:else}
+              <div class="mgr-head"><span>Installed models</span></div>
+              {#if voiceModels.length}
+                <div class="dl-list">
+                  {#each voiceModels as [path, size] (path)}
+                    <div class="dl-row">
+                      <button type="button" class="chip grow" class:on={settings.voice.modelPath === path}
+                        onclick={() => { settings.voice.modelPath = path; save(); }}>{path.split(/[\\/]/).pop()}</button>
+                      <span class="dim">{(size / 1e6).toFixed(0)} MB</span>
+                      <button type="button" class="icon-btn" title="Delete this model" onclick={() => deleteModel(path)}>{@render iTrash()}</button>
+                    </div>
+                  {/each}
+                </div>
+              {:else}
+                <p class="f-hint">Nothing downloaded yet.</p>
+              {/if}
+              <div class="mgr-head"><span>Download</span></div>
+              <div class="dl-list">
+                {#each WHISPER_MODELS as m (m.file)}
+                  {@const have = voiceModels.some(([p]) => p.endsWith(m.file))}
+                  <div class="dl-row">
+                    <span class="grow">{m.file}<span class="dim"> · {m.size} · {m.note}</span></span>
+                    {#if have}
+                      <span class="dim">installed</span>
+                    {:else if voiceDl?.file === m.file}
+                      <span class="dim">{voiceDl.total ? `${Math.round((voiceDl.received / voiceDl.total) * 100)} %` : `${(voiceDl.received / 1e6).toFixed(0)} MB`}</span>
+                    {:else}
+                      <button type="button" class="btn ghost" disabled={!!voiceDl} onclick={() => downloadModel(m.file)}>Download</button>
+                    {/if}
+                  </div>
+                {/each}
+              </div>
+              <p class="f-hint">
+                Models come from HuggingFace and land next to Arabel's config. Nothing leaves the machine when you dictate —
+                the first transcription after a launch also pays for loading the model.
+              </p>
+            {/if}
+
+            <div class="mgr-head"><span>Dictation</span></div>
+            <div class="f-pair">
+              <label class="grow">{@render field("Language")}
+                <select bind:value={settings.voice.language} onchange={() => save()}>
+                  <option value="">Auto-detect</option>
+                  <option value="fr">French</option>
+                  <option value="en">English</option>
+                </select>
+              </label>
+              <label class="grow">{@render field("Microphone")}
+                <select bind:value={settings.voice.device} onchange={() => save()}>
+                  <option value="">System default</option>
+                  {#each voiceDevices as d (d)}<option value={d}>{d}</option>{/each}
+                </select>
+              </label>
+            </div>
+            <label>{@render field("Vocabulary hint (optional)")}<input bind:value={settings.voice.prompt} onchange={() => save()} placeholder="tmux, SvelteKit, russh, kubectl…" /></label>
+            <p class="f-hint">Naming the language beats auto-detection on short sentences; the hint fixes the spelling of names the model has never seen.</p>
+            <div class="group">
+              <label class="f-check">
+                <input type="checkbox" bind:checked={settings.voice.autoSend} onchange={() => save()} />
+                <span>Press Enter right after inserting</span>
+              </label>
+              <p class="f-hint">Off by default — the text lands in the prompt and you read it before anything runs.</p>
             </div>
             <div class="sheet-actions"><button type="submit" class="btn">Close</button></div>
           </form>
@@ -5349,6 +5624,54 @@
     box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
   }
   .search-bar input { width: 170px; height: 24px; }
+
+  /* dictée : pastille d'enregistrement, posée comme la barre de recherche */
+  .dictate-pill {
+    position: absolute;
+    bottom: 8px;
+    right: 10px;
+    z-index: 6;
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    background: var(--surface-raised);
+    border: 1px solid var(--border-strong);
+    border-radius: 999px;
+    padding: 5px 8px 5px 12px;
+    font-size: 11px;
+    color: var(--text-secondary);
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+  }
+  .dict-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--danger, #e5484d); animation: dict-pulse 1.4s ease-in-out infinite; }
+  .dict-meter { width: 54px; height: 4px; border-radius: 2px; background: var(--surface-inset); overflow: hidden; }
+  .dict-fill { display: block; height: 100%; background: var(--selected); transition: width 80ms linear; }
+  .dict-hint { color: var(--text-tertiary); }
+  .dict-spin { display: inline-flex; color: var(--text-tertiary); } /* le svg porte déjà .spin */
+  @keyframes dict-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+
+  /* réglages Voice : puces de préréglage et lignes de modèles */
+  .chip-row { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
+  .chip {
+    padding: 4px 10px;
+    font: inherit;
+    font-size: 12px;
+    color: var(--text-secondary);
+    background: var(--surface-inset);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    text-align: left;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .chip:hover { color: var(--text-primary); background: var(--surface-hover); }
+  .chip.on { background: var(--surface-raised); border-color: var(--border-strong); color: var(--text-primary); }
+  .dl-list { display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: var(--radius-md); overflow: hidden; }
+  .dl-row { display: flex; gap: 10px; align-items: center; padding: 8px 10px; font-size: 12px; color: var(--text-secondary); }
+  .dl-row + .dl-row { border-top: 1px solid var(--border); }
+  .dl-row .grow { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .dim { color: var(--text-tertiary); font-size: 11px; }
 
   /* terminal : sélection de texte autorisée */
   .pane-term :global(.xterm) { user-select: text; }

@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Fusionné par Tauri dans l'Info.plist du bundle macOS.
+  Sans NSMicrophoneUsageDescription, macOS tue le process à la première
+  ouverture du micro (TCC) au lieu d'afficher une demande d'autorisation.
+-->
+<plist version="1.0">
+<dict>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Arabel uses the microphone to dictate text into your terminal.</string>
+</dict>
+</plist>

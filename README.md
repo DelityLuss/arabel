@@ -36,8 +36,9 @@ a terminal, a sidebar, and the handful of things you actually reach for.
 | **Git panel** | Over the remote, through the SSH channel: status, stage, diff viewer, commit, branch list and switch, log, fetch with ahead/behind, `pull --ff-only`, push. |
 | **SFTP** | Browse, download, drag-and-drop upload. |
 | **Port forwards & browser panes** | Preview your dev server inside the grid. |
+| **Dictation** | Speak into any pane (⌘⇧M): the mic is read natively (cpal), and transcription runs either through an OpenAI-compatible API (Groq, OpenAI, or a server of your own) or fully offline via a local Whisper model you download from the app. The text is inserted, not sent — you read it first. |
 | **Getting around** | Command palette (⌘P) over panes, projects and remotes · find in terminal (⌘F) · zoom a pane · drag panes between tabs and projects. |
-| **Yours to tweak** | 17 rebindable actions, a theme editor (16-colour ANSI grid, 5 presets incl. OLED), font import from VS Code, live CPU/RAM/disk meters, and config sharing between machines (secrets excluded). |
+| **Yours to tweak** | 18 rebindable actions, a theme editor (16-colour ANSI grid, 5 presets incl. OLED), font import from VS Code, live CPU/RAM/disk meters, and config sharing between machines (secrets excluded). |
 
 ## How it fits together
 
@@ -67,6 +68,14 @@ build it yourself:
 ```sh
 npm install
 npm run tauri build
+```
+
+The default build embeds a local Whisper (whisper.cpp), so it needs **cmake and a
+C++ toolchain** — and Metal is switched on for macOS. If you only want dictation
+through an API, drop it:
+
+```sh
+npm run tauri build -- --no-default-features
 ```
 
 ## Development

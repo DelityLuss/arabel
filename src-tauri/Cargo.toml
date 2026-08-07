@@ -40,6 +40,27 @@ russh-sftp = "2.3.0"
 font-kit = "0.14"
 # Résolution cross-platform du home / Downloads (HOME sur Unix, %USERPROFILE% sur Windows).
 dirs = "5"
+# Dictée vocale (voice.rs). cpal = micro natif (CoreAudio / WASAPI / ALSA) : on
+# NE passe PAS par getUserMedia du webview, capricieux dans WKWebView et soumis
+# à un re-prompt TCC à chaque rebuild non signé.
+cpal = "0.18"
+# Appel des API de transcription + téléchargement des modèles. rustls plutôt
+# qu'OpenSSL : pas de dépendance système à traîner sur les trois OS.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "multipart", "stream", "charset", "http2"] }
+futures-util = "0.3"
+# Whisper local (whisper.cpp). Optionnel mais activé par défaut : sans lui, seul
+# le backend API répond. Compiler whisper.cpp demande cmake + un toolchain C++ ;
+# `--no-default-features` produit un binaire API-only qui n'en a pas besoin.
+whisper-rs = { version = "0.16", optional = true }
+
+# macOS : inférence sur le GPU via Metal — sur Apple Silicon c'est plusieurs fois
+# plus rapide que le CPU, et ça laisse les cœurs à l'app.
+[target.'cfg(target_os = "macos")'.dependencies]
+whisper-rs = { version = "0.16", optional = true, features = ["metal"] }
+
+[features]
+default = ["local-whisper"]
+local-whisper = ["dep:whisper-rs"]
 
 # Build release optimisé : LTO complet + un seul codegen-unit = meilleur inlining
 # à travers les crates (crypto russh, tokio, parseur xterm côté natif). strip = binaire plus léger.

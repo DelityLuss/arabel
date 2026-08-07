@@ -3,6 +3,7 @@ mod local;
 mod sftp;
 pub mod ssh;
 mod store;
+mod voice;
 
 use ssh::SshState;
 use std::collections::HashMap;
@@ -145,7 +146,7 @@ fn build_menu(app: &tauri::App) -> tauri::Result<()> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_notification::init())
@@ -155,6 +156,12 @@ pub fn run() {
         .manage(ssh::ForwardState(Mutex::new(HashMap::new())))
         .manage(sftp::SftpState(Mutex::new(HashMap::new())))
         .manage(local::PtyPids::default())
+        .manage(voice::VoiceState::default());
+    // Contexte whisper.cpp gardé chaud entre deux dictées : n'existe que si le
+    // backend local est compilé dans ce binaire.
+    #[cfg(feature = "local-whisper")]
+    let builder = builder.manage(voice::WhisperCache::default());
+    builder
         .setup(|app| {
             build_menu(app)?;
             // Windows : on retire le cadre natif pour dessiner nos propres boutons
@@ -204,6 +211,16 @@ pub fn run() {
             store::store_save,
             store::passphrase_set,
             store::passphrase_delete,
+            voice::voice_devices,
+            voice::voice_start,
+            voice::voice_stop,
+            voice::voice_cancel,
+            voice::voice_local_available,
+            voice::voice_models,
+            voice::voice_model_download,
+            voice::voice_model_delete,
+            voice::voice_key_set,
+            voice::voice_key_present,
             fonts::list_fonts
         ])
         .run(tauri::generate_context!())
