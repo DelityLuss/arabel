@@ -58,6 +58,22 @@ jobs:
         if: matrix.platform == 'ubuntu-22.04'
         run: echo "WHISPER_DONT_GENERATE_BINDINGS=1" >> "$GITHUB_ENV"
 
+      - name: Windows — build whisper.cpp portable (pas optimisé pour le CPU du runner)
+        # Par défaut GGML_NATIVE=ON : whisper.cpp se compile pour les instructions
+        # du CPU de CE runner GitHub (AVX2/FMA...), pas celui de la machine qui
+        # exécutera le binaire. Un CPU utilisateur sans AVX2 (ou une VM/sandbox où
+        # Windows le masque, cas fréquent) plante avec une instruction illégale —
+        # pas une erreur Rust récupérable, tout le process meurt. Ça arrive pile
+        # au premier calcul, donc au lancement de la transcription, jamais pendant
+        # la capture micro (cpal, indépendant de whisper.cpp). whisper-rs-sys
+        # relaie tout env var GGML_* vers CMake, d'où ce garde-fou par variable
+        # d'environnement plutôt qu'un patch. On garde AVX (universel depuis 2011)
+        # et coupe seulement AVX2/FMA/F16C, la vraie zone à risque.
+        if: matrix.platform == 'windows-latest'
+        run: |
+          echo "GGML_NATIVE=OFF" >> "$GITHUB_ENV"
+          echo "GGML_AVX2=OFF" >> "$GITHUB_ENV"
+
       - name: macOS — lier libclang_rt.osx (ggml-metal utilise @available, symbole absent du rustc de ce runner)
         # Le backend Metal de ggml (Objective-C) insère des appels à
         # ___isPlatformVersionAtLeast pour ses checks @available(...). std les

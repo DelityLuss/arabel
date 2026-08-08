@@ -291,6 +291,7 @@
     prompt: "", // amorce de vocabulaire (noms de commandes, jargon)
     device: "", // vide = micro par défaut du système
     autoSend: false, // insérer seulement, ou insérer ET valider
+    pushToTalk: true, // maintien (défaut) ou bascule — voir toggleDictation
   };
 
   let settings = $state({
@@ -771,7 +772,16 @@
       const id = actionCombos.get(comboOf(e));
       if (id) {
         const b = bindById.get(id)!;
-        if (b.scope === "term") b.run(sid);
+        // e.repeat : le système répète le keydown tant qu'on tient la touche —
+        // sans ce garde-fou, tenir un raccourci-bascule (dictée, zoom…) l'active
+        // et le désactive en boucle au lieu de ne compter qu'un seul appui.
+        if (b.scope === "term" && !e.repeat) {
+          if (id === "dictate" && settings.voice.pushToTalk) {
+            if (!dictation) holdStartDictation(sid, e.code);
+          } else {
+            b.run(sid);
+          }
+        }
         return consume(e);
       }
       return true;
@@ -2761,10 +2771,15 @@
   }
 
   // ─── dictée vocale ────────────────────────────────────────────────────────
-  // Bascule : la frappe démarre, la même arrête et transcrit. Pas de « maintenir
-  // pour parler » : le moteur de raccourcis ne voit que le keydown, et une touche
-  // relâchée pendant que la fenêtre a perdu le focus resterait enfoncée à vie.
+  // Deux modes (settings.voice.pushToTalk) : bascule (une frappe démarre, la
+  // suivante arrête et transcrit) ou maintien (on enregistre tant que la touche
+  // est tenue). Le maintien s'appuie sur un keyup GLOBAL plutôt que sur le
+  // moteur de raccourcis, qui ne voit que le keydown ; `dictateBlur` referme
+  // l'enregistrement si la fenêtre perd le focus pendant que la touche est
+  // tenue, sinon il resterait « enfoncé » à vie (le keyup n'arriverait jamais).
   let dictation = $state<{ sid: string; level: number; working: boolean } | null>(null);
+  // Code de la touche qui a ouvert la dictée en mode maintien ; null hors maintien.
+  let dictateHoldKey: string | null = null;
   let voiceLocalOk = $state(false); // backend Whisper local compilé dans ce binaire ?
   let voiceKeySaved = $state(false); // clé d'API présente dans le coffre (jamais relue ici)
   let voiceDevices = $state<string[]>([]);
@@ -2824,6 +2839,26 @@
     } finally {
       dictation = null;
     }
+  }
+
+  /** Démarre en mode maintien. `toggleDictation` fait l'aller-retour `voice_start`
+   *  (permission micro comprise) ; une frappe très brève peut relâcher la touche
+   *  avant que ça ne résolve — `dictateHoldKey` est revérifié au retour pour
+   *  arrêter aussitôt plutôt que de laisser le micro tourner indéfiniment. */
+  async function holdStartDictation(sid: string, code: string) {
+    dictateHoldKey = code;
+    await toggleDictation(sid);
+    if (dictateHoldKey !== code) stopDictation(true);
+  }
+  function dictateKeyup(e: KeyboardEvent) {
+    if (dictateHoldKey !== e.code) return;
+    dictateHoldKey = null;
+    if (dictation && !dictation.working) stopDictation(true);
+  }
+  function dictateBlur() {
+    if (!dictateHoldKey) return;
+    dictateHoldKey = null;
+    if (dictation && !dictation.working) stopDictation(true);
   }
 
   /** Rafraîchit ce que seul le backend sait : micros, modèles présents, clé posée. */
@@ -3031,7 +3066,7 @@
     const id = actionCombos.get(comboOf(e));
     if (id) {
       const b = bindById.get(id)!;
-      if (b.scope === "window") { e.preventDefault(); b.run(activeTab?.active ?? null); }
+      if (b.scope === "window") { e.preventDefault(); if (!e.repeat) b.run(activeTab?.active ?? null); }
     }
   }
 
@@ -3216,7 +3251,7 @@
 </script>
 
 <!-- empêche le webview de « naviguer » vers un fichier déposé hors zone -->
-<svelte:window onkeydown={globalKeydown} oncontextmenu={globalContextMenu} onresize={onWindowResize} onfocus={() => focusActive(activeTab?.active ?? null)} ondragover={(e) => e.preventDefault()} ondrop={(e) => e.preventDefault()} />
+<svelte:window onkeydown={globalKeydown} onkeyup={dictateKeyup} onblur={dictateBlur} oncontextmenu={globalContextMenu} onresize={onWindowResize} onfocus={() => focusActive(activeTab?.active ?? null)} ondragover={(e) => e.preventDefault()} ondrop={(e) => e.preventDefault()} />
 
 <!-- ─── icônes ─────────────────────────────────────────────────────────── -->
 {#snippet choiceBtns(att: Attention)}
@@ -3461,7 +3496,7 @@
             {:else}
               <span class="dict-dot"></span>
               <span class="dict-meter"><span class="dict-fill" style="width:{Math.round(Math.min(1, dictation.level * 1.6) * 100)}%"></span></span>
-              <span class="dict-hint">{formatCombo(keyOf("dictate"))} to insert · Esc cancels</span>
+              <span class="dict-hint">{settings.voice.pushToTalk ? "Release" : formatCombo(keyOf("dictate"))} to insert · Esc cancels</span>
               <button class="icon-btn" title="Cancel" onclick={(e) => { e.stopPropagation(); stopDictation(false); }}>{@render iClose()}</button>
             {/if}
           </div>
@@ -4363,7 +4398,11 @@
         {:else if settingsTab === "voice"}
           <form onsubmit={(e) => { e.preventDefault(); modal = null; }}>
             <p class="f-hint">
-              In a terminal, {formatCombo(keyOf("dictate"))} starts dictating and the same combo inserts what you said.
+              {#if settings.voice.pushToTalk}
+                In a terminal, hold {formatCombo(keyOf("dictate"))} to dictate — release it to insert what you said.
+              {:else}
+                In a terminal, {formatCombo(keyOf("dictate"))} starts dictating and the same combo inserts what you said.
+              {/if}
               The microphone is read natively, so the system asks for permission the first time.
             </p>
             <div class="seg">
@@ -4433,6 +4472,14 @@
             {/if}
 
             <div class="mgr-head"><span>Dictation</span></div>
+            <div class="seg">
+              <button type="button" class:on={settings.voice.pushToTalk} onclick={() => { settings.voice.pushToTalk = true; save(); }}>Hold to talk</button>
+              <button type="button" class:on={!settings.voice.pushToTalk} onclick={() => { settings.voice.pushToTalk = false; save(); }}>Press to talk</button>
+            </div>
+            <p class="f-hint">
+              Hold to talk records only while {formatCombo(keyOf("dictate"))} is held down. Press to talk starts on the
+              first press and stops (and transcribes) on the second.
+            </p>
             <div class="f-pair">
               <label class="grow">{@render field("Language")}
                 <select bind:value={settings.voice.language} onchange={() => save()}>
