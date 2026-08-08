@@ -58,6 +58,17 @@ jobs:
         if: matrix.platform == 'ubuntu-22.04'
         run: echo "WHISPER_DONT_GENERATE_BINDINGS=1" >> "$GITHUB_ENV"
 
+      - name: macOS — lier libclang_rt.osx (ggml-metal utilise @available, symbole absent du rustc de ce runner)
+        # Le backend Metal de ggml (Objective-C) insère des appels à
+        # ___isPlatformVersionAtLeast pour ses checks @available(...). std les
+        # fournit depuis peu, mais tant que le stable du runner n'a pas ce
+        # correctif le lien échoue ("symbol(s) not found"). Fix connu :
+        # lier explicitement libclang_rt.osx.a, le runtime clang qui le fournit.
+        if: matrix.platform == 'macos-latest'
+        run: |
+          RT=$(xcrun --sdk macosx clang -print-file-name=libclang_rt.osx.a)
+          echo "RUSTFLAGS=-C link-arg=$RT" >> "$GITHUB_ENV"
+
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
