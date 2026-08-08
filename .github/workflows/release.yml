@@ -49,21 +49,18 @@ jobs:
 
       - run: npm ci
 
+      - name: whisper.cpp Linux — bindings glibc pré-générées (bindgen indisponible/inutile)
+        # whisper-rs-sys teste juste la PRÉSENCE de la variable
+        # (env::var(...).is_ok()), pas sa valeur : elle doit être absente sur
+        # macOS/Windows, où les bindings glibc pré-générées ne correspondent
+        # pas au vrai libc et cassent la build (tailles de _IO_FILE fausses).
+        # bindgen y régénère depuis les vrais en-têtes de l'OS.
+        if: matrix.platform == 'ubuntu-22.04'
+        run: echo "WHISPER_DONT_GENERATE_BINDINGS=1" >> "$GITHUB_ENV"
+
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # ggml (whisper.cpp) utilise std::filesystem, indisponible sous le
-          # deployment target par défaut de l'image macOS — sans ça
-          # ggml-backend-reg.cpp ne compile pas ("introduced in macOS 10.15").
-          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.platform == 'macos-latest' && '11.0' || '' }}
-          # whisper.cpp : bindings pré-générés (glibc) uniquement sur Linux, où
-          # ils correspondent au libc réel. Sur macOS/Windows ils cassent le
-          # build (tailles de _IO_FILE etc. fausses) — bindgen doit régénérer
-          # depuis les vrais en-têtes de l'OS.
-          WHISPER_DONT_GENERATE_BINDINGS: ${{ matrix.platform == 'ubuntu-22.04' && '1' || '' }}
-          # Windows : bindgen a besoin de libclang, présent sur le runner mais
-          # pas toujours détecté automatiquement sans ce chemin explicite.
-          LIBCLANG_PATH: ${{ matrix.platform == 'windows-latest' && 'C:\Program Files\LLVM\bin' || '' }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: Arabel ${{ github.ref_name }}
