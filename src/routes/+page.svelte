@@ -678,6 +678,32 @@
     );
   }
 
+  /** Coupe le suivi souris (1000 normal, 1002 glisser, 1003 tout mouvement, 1005/1006/1015
+   *  encodages) et le rapport de focus (1004). Ces séquences sont écrites DANS l'émulateur,
+   *  pas envoyées au pty : elles remettent l'état local à zéro sans rien dire au serveur.
+   *
+   *  Pourquoi c'est nécessaire : c'est l'APPLI distante qui allume le suivi souris (tmux
+   *  avec `mouse on`, un TUI…) et à elle de l'éteindre en partant. Coupée net — connexion
+   *  perdue, tmux tué, TUI qui meurt sur un signal — elle n'éteint rien, et l'xterm, lui,
+   *  survit : on réutilise le même objet Terminal d'une connexion à l'autre. Le shell suivant
+   *  recevait donc des rapports souris qu'il n'a jamais demandés, et les affichait tels quels
+   *  (« 35;33;12M » à chaque mouvement = mouvement sans bouton, colonne 33, ligne 12).
+   *
+   *  Volontairement absent : le collage entre crochets (2004). L'éteindre à tort ferait
+   *  exécuter un texte collé multiligne — un redraw le rallumera de toute façon. */
+  const MOUSE_OFF = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1015l";
+
+  /** Efface l'écran ET coupe le suivi souris : c'est le geste qu'on fait quand un
+   *  panneau part en vrille, et une appli morte qui a laissé la souris allumée est
+   *  précisément ce genre de vrille. Un TUI vivant, lui, la rallume à son prochain
+   *  rendu — et de toute façon on ne nettoie pas l'écran sous un TUI. */
+  function clearPane(sid: string) {
+    const s = sessions.get(sid);
+    if (!s) return;
+    s.term.clear();
+    s.term.write(MOUSE_OFF);
+  }
+
   /** Crée un xterm configuré (addons, presse-papier, raccourcis). `send` route la saisie. */
   function setupTerm(sid: string, send: (data: string) => void) {
     const term = new Terminal(termOptions());
@@ -782,6 +808,7 @@
     // Reconnexion / Retry : repartir propre, sinon on empile les listeners.
     s.unlisteners.forEach((u) => u());
     s.unlisteners = [];
+    s.term.write(MOUSE_OFF); // l'émulateur survit à la session : il ne doit pas hériter de son suivi souris
     // Un event Tauri émis AVANT que son listener existe est perdu (aucun tampon).
     // La sortie du PTY part dès le spawn (fait DANS le rpc de connexion) : attacher
     // le listener seulement APRÈS ratait le 1er jet du shell (prompt/MOTD) → écran
@@ -2872,7 +2899,7 @@
       case "split-v":
         if (sid && activeTab) openPicker({ tabId: activeTab.id, sid, dir: ev.payload === "split-h" ? "h" : "v" });
         break;
-      case "clear": if (sid) sessions.get(sid)?.term.clear(); break;
+      case "clear": if (sid) clearPane(sid); break;
       case "toggle-sidebar": settings.sidebar = !settings.sidebar; save(); break;
       case "settings": modal = { type: "settings" }; break;
       case "sync-config": if (sid) syncNow(sid); break;
@@ -2933,7 +2960,7 @@
     { id: "next-pane", label: "Next terminal (down, across projects)", scope: "window", run: () => cyclePane(1) },
     { id: "prev-pane", label: "Previous terminal (up, across projects)", scope: "window", run: () => cyclePane(-1) },
     { id: "toggle-sidebar", label: "Toggle sidebar", scope: "window", run: () => { settings.sidebar = !settings.sidebar; save(); } },
-    { id: "clear", label: "Clear terminal", scope: "window", run: () => { const sid = activeTab?.active; if (sid) sessions.get(sid)?.term.clear(); } },
+    { id: "clear", label: "Clear terminal", scope: "window", run: () => { const sid = activeTab?.active; if (sid) clearPane(sid); } },
     { id: "settings", label: "Open settings", scope: "window", run: () => (modal = { type: "settings" }) },
     { id: "search", label: "Find in terminal", scope: "window", run: () => { const sid = activeTab?.active; if (sid) openSearch(sid); } },
     { id: "zoom", label: "Zoom pane (fullscreen)", scope: "term", run: (sid) => sid && toggleZoom(sid) },
