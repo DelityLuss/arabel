@@ -626,6 +626,10 @@
       // = scroll NATIF du navigateur (inertie), le plus fluide (comme Terax). Les
       // définir fait intercepter/animer la molette par xterm → saccades.
       theme: activeTheme(),
+      // Liens OSC 8 (ceux que Claude Code, gh, ls --hyperlink posent sur un
+      // texte). Sans ce handler, xterm ouvre un confirm() puis un window.open()
+      // — inerte dans WKWebView : le clic ne faisait donc RIEN.
+      linkHandler: { activate: (_e: MouseEvent, uri: string) => openInBrowser(uri) },
     };
   }
 
@@ -712,7 +716,10 @@
     const search = new SearchAddon();
     term.loadAddon(fit);
     term.loadAddon(search);
-    term.loadAddon(new WebLinksAddon());
+    // Idem pour les URLs détectées dans le texte brut : le handler par défaut de
+    // l'addon fait window.open(), bloqué dans WKWebView. openInBrowser passe par
+    // le plugin opener → navigateur du système.
+    term.loadAddon(new WebLinksAddon((_e, uri) => openInBrowser(uri)));
     term.onSelectionChange(() => {
       const sel = term.getSelection();
       if (sel && settings.copyOnSelect && inTauri) writeText(sel).catch(() => {});
@@ -3203,6 +3210,11 @@
     // pty, ni en SSH, ni en local, ni dans un panneau tmux -CC.
     const rightClick = (e: MouseEvent) => {
       if (e.button !== 2) return;
+      // macOS peut traduire Ctrl+clic en bouton droit. Au-dessus d'un lien
+      // (xterm pose `xterm-cursor-pointer` tant qu'il est survolé), on laisse
+      // filer jusqu'à xterm : c'est le geste d'ouverture attendu, pas un
+      // collage. Ailleurs, le clic droit colle comme avant.
+      if (isMac && e.ctrlKey && node.querySelector(".xterm-cursor-pointer")) return;
       e.preventDefault();
       e.stopPropagation();
       if (e.type === "mousedown") pasteInto(current);

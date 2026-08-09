@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Tauri signe le bundle macOS avec le Hardened Runtime. Sous ce régime, le micro
+  n'est PAS qu'une affaire de TCC : sans l'entitlement audio-input, CoreAudio
+  ouvre le flux, appelle nos callbacks… et ne livre que du silence. Aucune erreur,
+  aucune boîte de dialogue — juste un vumètre à zéro. NSMicrophoneUsageDescription
+  (Info.plist) ne suffit donc pas, les deux sont nécessaires.
+-->
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.device.audio-input</key>
+	<true/>
+</dict>
+</plist>

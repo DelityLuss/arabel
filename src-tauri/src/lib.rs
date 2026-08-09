@@ -223,6 +223,21 @@ pub fn run() {
             voice::voice_key_present,
             fonts::list_fonts
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(|_app, _event| {
+            // whisper.cpp libère son device Metal dans un destructeur STATIQUE,
+            // donc pendant l'exit du process. Si notre contexte vit encore à ce
+            // moment-là, ses buffers GPU sont toujours enregistrés et ggml abort
+            // (`GGML_ASSERT([rsets->data count] == 0)`) : l'app plantait à la
+            // fermeture dès qu'on avait dicté une fois en local. On le relâche
+            // donc nous-mêmes, tant que l'ordre de destruction nous appartient.
+            #[cfg(feature = "local-whisper")]
+            if matches!(_event, tauri::RunEvent::Exit) {
+                use tauri::Manager;
+                if let Ok(mut g) = _app.state::<voice::WhisperCache>().0.lock() {
+                    *g = None;
+                }
+            }
+        });
 }

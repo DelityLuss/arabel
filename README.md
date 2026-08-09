@@ -8,7 +8,7 @@
 
 [![Licence: MIT](https://img.shields.io/badge/licence-MIT-blue.svg)](#licence)
 ![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)
-![Version](https://img.shields.io/badge/version-0.6.1-green)
+![Version](https://img.shields.io/badge/version-0.6.2-green)
 
 ![Arabel](docs/cover.png)
 
