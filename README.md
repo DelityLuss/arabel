@@ -77,8 +77,34 @@ C++ toolchain** — Metal is switched on for macOS. Per platform:
 | | |
 |---|---|
 | **macOS** | `brew install cmake` |
-| **Windows** | cmake + Visual Studio's C++ build tools. Either install LLVM as well, or set `WHISPER_DONT_GENERATE_BINDINGS=1` to use the bindings shipped with the crate — that's what CI does, and it skips the libclang requirement. |
+| **Windows** | See below — it needs the most setup. |
 | **Linux** | `cmake`, `build-essential`, plus `libasound2-dev` for the microphone (needed even without local Whisper). |
+
+### Building on Windows
+
+```powershell
+winget install Kitware.CMake LLVM.LLVM NASM.NASM
+```
+
+Then build from the **x64 Native Tools Command Prompt for VS 2022**, not a plain
+PowerShell: several build scripts read `INCLUDE` / `LIB` / `VCINSTALLDIR`, and
+outside that prompt they are unset and compiling even a trivial `.c` probe fails.
+Visual Studio needs the *Desktop development with C++* workload.
+
+What each piece is for:
+
+- **LLVM** — `whisper-rs-sys` runs bindgen, which needs `libclang.dll`. If it
+  isn't found, set `LIBCLANG_PATH` (Visual Studio also ships one at
+  `…\VC\Tools\Llvm\x64\bin` when the *C++ Clang tools* component is installed).
+  Do **not** reach for `WHISPER_DONT_GENERATE_BINDINGS=1` here: the bindings
+  shipped with the crate are glibc ones, they do not match MSVC's libc and the
+  build breaks further along. That variable is for Linux only.
+- **NASM** — `aws-lc-sys`, pulled in by `russh` for SSH crypto, assembles with
+  it on x86-64 Windows. `set AWS_LC_SYS_PREBUILT_NASM=1` works instead, using
+  the object files shipped with the crate.
+
+None of this is needed for `--no-default-features` except NASM, which SSH itself
+depends on.
 
 If you only want dictation through an API, drop whisper.cpp entirely — no cmake,
 no C++ toolchain:
