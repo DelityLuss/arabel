@@ -1,3 +1,4 @@
+mod ctx;
 mod fonts;
 mod local;
 mod sftp;
@@ -198,6 +199,11 @@ pub fn run() {
             ssh::shell_enhance,
             ssh::events_watch,
             ssh::events_unwatch,
+            ssh::ctx_watch,
+            ssh::ctx_unwatch,
+            ssh::ctx_remote_setup,
+            ctx::ctx_setup,
+            ctx::ctx_read,
             ssh::ssh_config_parse,
             ssh::vscode_terminal,
             ssh::port_forward_start,

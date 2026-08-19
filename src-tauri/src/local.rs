@@ -245,6 +245,11 @@ pub async fn local_connect(
         c
     };
     cmd.env("TERM", "xterm-256color");
+    // Le pane se nomme lui-même dans l'environnement du shell : c'est ce que le
+    // relais de status line relit pour dire DE QUEL pane vient un relevé de
+    // contexte. Les sessions SSH font pareil, mais par un `export` visible dans
+    // le terminal — ici on peut le poser proprement, à la naissance du process.
+    cmd.env("ARABEL_PANE", &session_id);
     if let Some(home) = dirs::home_dir() {
         cmd.cwd(home);
     }

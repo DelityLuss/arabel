@@ -373,6 +373,9 @@ pub async fn claude_sync(
     // qui les omet garde le comportement d'avant (teams désactivées).
     agent_teams: Option<bool>,
     agent_team_panes: Option<bool>,
+    // Relais de status line (bandeau contexte / quotas). Absent = on n'y touche
+    // pas plus qu'avant : `false` retire le nôtre s'il traîne, sans plus.
+    context_banner: Option<bool>,
 ) -> Result<String, String> {
     let home = crate::home_dir()?;
     // ponytail: whitelist explicite — ~/.claude contient aussi l'historique de
@@ -429,9 +432,13 @@ pub async fn claude_sync(
     let hooks = install_hooks(&handle, teams, panes).await;
     let verbs = install_verb_cli(&handle).await;
     let plugins = provision_plugins(&handle, &home).await;
+    // Après le tar : il vient d'écraser le settings.json distant par le nôtre,
+    // qui porte le chemin de NOTRE ctx.sh mais pas la status line que le VPS
+    // avait mise de côté. On rejoue donc le branchement ici.
+    let banner = install_statusline(&handle, context_banner.unwrap_or(false)).await;
 
     let mut msg = format!(
-        "claude {boot} · {} config item(s) pushed · {hooks} · {verbs} · {plugins}",
+        "claude {boot} · {} config item(s) pushed · {hooks} · {verbs} · {plugins} · {banner}",
         existing.len()
     );
     if teams {
@@ -559,6 +566,58 @@ print("installed" if changed else "present")
         Ok((0, _)) => "notification hooks installed".into(),
         _ => "hooks not wired up (python3 missing on the VPS?)".into(),
     }
+}
+
+/// Pousse (ou retire) le relais de status line qui alimente le bandeau
+/// « contexte & quotas » — voir `ctx.rs` pour le pourquoi du procédé.
+///
+/// `enable == false` n'est pas un no-op : il DÉSINSTALLE. Décocher le réglage
+/// doit défaire ce qu'on a posé sur le VPS, sinon la case ne voudrait rien dire
+/// sur une machine déjà équipée (même raison que « agent teams »).
+async fn install_statusline(handle: &client::Handle<Handler>, enable: bool) -> String {
+    if enable {
+        let w = exec(
+            handle,
+            "mkdir -p ~/.arabel && cat > ~/.arabel/ctx.sh && chmod +x ~/.arabel/ctx.sh",
+            Some(crate::ctx::CTX_SH.as_bytes()),
+        )
+        .await;
+        if !matches!(w, Ok((0, _))) {
+            return "context banner off (script write failed)".into();
+        }
+    }
+    // Prélude injecté : `format!` sur le script buterait sur les accolades python.
+    let py = format!(
+        "ENABLE = {}\nOURS = {:?}\n{}",
+        if enable { "True" } else { "False" },
+        crate::ctx::STATUSLINE_CMD,
+        crate::ctx::MERGE_PY,
+    );
+    match exec(handle, "python3 -", Some(py.as_bytes())).await {
+        Ok((0, out)) if out.contains("unchanged") => {
+            if enable { "context banner already wired" } else { "no context banner" }.into()
+        }
+        Ok((0, _)) => {
+            if enable { "context banner wired (status line)" } else { "context banner removed" }.into()
+        }
+        _ => "context banner not wired (python3 missing on the VPS?)".into(),
+    }
+}
+
+/// Branche/débranche le relais sur un VPS déjà équipé, sans repasser par la
+/// grosse sync : c'est ce que fait la case à cocher des réglages.
+#[tauri::command]
+pub async fn ctx_remote_setup(
+    host: String,
+    port: u16,
+    user: String,
+    key_path: String,
+    identity_id: Option<String>,
+    auth: Option<String>,
+    enable: bool,
+) -> Result<String, String> {
+    let handle = connect_auth(&host, port, &user, &key_path, None, identity_id, auth).await?;
+    Ok(install_statusline(&handle, enable).await)
 }
 
 /// Installe `~/.arabel/arabel` : le CLI que l'agent appelle pour piloter l'app
@@ -835,6 +894,46 @@ pub async fn events_watch(
 #[tauri::command]
 pub async fn events_unwatch(state: State<'_, WatchState>, remote_id: String) -> Result<(), String> {
     watch_stop(&state, &format!("hook:{remote_id}")).await;
+    Ok(())
+}
+
+/// Contexte & quotas des panes claude de ce VPS, relus toutes les 3 s.
+///
+/// Un `tail -F` serait plus fin, mais le relais RÉÉCRIT un fichier par pane au
+/// lieu d'empiler des lignes (sinon le fichier grossirait à chaque rendu de
+/// status line, plusieurs fois par seconde). On relit donc, comme les métriques.
+/// Le ménage d'entrée jette les panes d'une session d'app révolue.
+#[tauri::command]
+pub async fn ctx_watch(
+    app: AppHandle,
+    remote_id: String,
+    host: String,
+    port: u16,
+    user: String,
+    key_path: String,
+    identity_id: Option<String>,
+    auth: Option<String>,
+) -> Result<(), String> {
+    watch_stream(
+        app,
+        format!("ctx:{remote_id}"),
+        remote_id,
+        "arabel-ctx",
+        r#"mkdir -p ~/.arabel/ctx; find ~/.arabel/ctx -name '*.json' -mtime +0 -delete 2>/dev/null; \
+           while :; do for f in ~/.arabel/ctx/*.json; do [ -f "$f" ] && { cat "$f"; echo; }; done; sleep 3; done"#,
+        host,
+        port,
+        user,
+        key_path,
+        identity_id,
+        auth,
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn ctx_unwatch(state: State<'_, WatchState>, remote_id: String) -> Result<(), String> {
+    watch_stop(&state, &format!("ctx:{remote_id}")).await;
     Ok(())
 }
 

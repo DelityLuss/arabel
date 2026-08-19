@@ -327,6 +327,10 @@
     // on ne veut pas escamoter la sortie finale sans que tu l'aies demandé. Le pane
     // du lead et le pane focalisé ne sont jamais fermés.
     agentAutoClose: false,
+    // Bandeau « contexte & quotas » sous la sidebar. Off par défaut : il se
+    // branche sur la status line de Claude Code (voir ctx.rs), donc il touche à
+    // ta config d'agent — ça se demande, ça ne s'impose pas.
+    contextBanner: false,
     projects: true, // décoché = terminaux seuls ; les projets restent en mémoire, juste masqués
     emojiAnim: true, // emojis de projet animés en continu ; décoché = figés sur la 1re frame
     cursorStyle: "bar" as "bar" | "block" | "underline",
@@ -406,6 +410,10 @@
     savedTitles = data.titles ?? {}; // noms de terminaux (avant restore : sessLabel les relira par key)
     restoreWorkspace(data.workspace);
     loaded = true;
+    // Le relais de status line vit dans ~/.claude/settings.json, pas dans notre
+    // store : il peut avoir été défait ailleurs (autre outil, reset de config).
+    // On réaffirme le réglage au démarrage — idempotent dans les deux sens.
+    rpc("ctx_setup", { enable: settings.contextBanner }).catch(() => {});
   });
 
   async function save() {
@@ -984,6 +992,8 @@
       if (!s.remote.sysSsh) {
         rpc("metrics_watch", { remoteId: s.remote.id, ...remoteParams(s.remote) }).catch(() => {});
         if (s.remote.claude) rpc("events_watch", { remoteId: s.remote.id, ...remoteParams(s.remote) }).catch(() => {});
+        if (s.remote.claude && settings.contextBanner)
+          rpc("ctx_watch", { remoteId: s.remote.id, ...remoteParams(s.remote) }).catch(() => {});
       }
       if (!s.tmux) {
         // sans tmux : init envoyé dans le shell après connexion (comportement historique)
@@ -1006,6 +1016,12 @@
         metrics[s.remote.id] = { load: 1.4, cpus: 4, memTotal: 8321499136, memUsed: 5100273664, diskTotal: 84825923584, diskUsed: 39728447488 };
       // démo : activité live puis question à choix (états « travaille » / « attend »)
       if (s.remote.claude) {
+        ctxUsage[sid] = {
+          at: Date.now(), seen: Date.now(), ctxPct: 38, ctxTokens: 76000, ctxSize: 200000,
+          fiveHourPct: 21, fiveHourReset: Date.now() + 8_040_000,
+          weekPct: 64, weekReset: Date.now() + 244_800_000,
+          model: "Opus 5",
+        };
         activity = { ...activity, [sid]: { label: "npm test", tool: "Bash", at: Date.now() } };
         paneStatus = { ...paneStatus, [sid]: "working" };
         setTimeout(() => {
@@ -1048,9 +1064,11 @@
     s.term.dispose();
     attentions = attentions.filter((a) => a.sid !== sid);
     { const { [sid]: _a, ...ra } = activity; activity = ra; const { [sid]: _p, ...rp } = paneStatus; paneStatus = rp; }
+    delete ctxUsage[sid];
     if (![...sessions.values()].some((x) => x.remote.id === s.remote.id)) {
       rpc("events_unwatch", { remoteId: s.remote.id }).catch(() => {});
       rpc("metrics_unwatch", { remoteId: s.remote.id }).catch(() => {});
+      rpc("ctx_unwatch", { remoteId: s.remote.id }).catch(() => {});
       delete metrics[s.remote.id];
     }
     const affected = new Set<string>();
@@ -1775,7 +1793,12 @@
   /** Params de `claude_sync` : la connexion + les réglages arabel qui atterrissent
    *  dans le settings.json distant. Un seul endroit, sinon un appel oublie un champ. */
   function syncParams(remote: Remote) {
-    return { ...remoteParams(remote), agentTeams: settings.agentTeams, agentTeamPanes: settings.agentTeamPanes };
+    return {
+      ...remoteParams(remote),
+      agentTeams: settings.agentTeams,
+      agentTeamPanes: settings.agentTeamPanes,
+      contextBanner: settings.contextBanner,
+    };
   }
   async function claudeSetup(sid: string, remote: Remote) {
     const s = sessions.get(sid);
@@ -1793,6 +1816,32 @@
       toast(`Claude sync failed: ${e}`, "error");
     }
   }
+  /** Applique le réglage « bandeau contexte » : ici, et sur chaque VPS claude
+   *  déjà connecté — sinon décocher ne déferait rien tant qu'on n'a pas resynchronisé.
+   *  Volontairement plus léger que `claude_sync` : on ne pousse que le relais. */
+  async function applyContextBanner() {
+    const on = settings.contextBanner;
+    if (!on) ctxUsage = {};
+    try {
+      await rpc("ctx_setup", { enable: on });
+    } catch (e) {
+      toast(`Context banner: ${e}`, "error");
+    }
+    // un remote peut porter plusieurs panes : un seul aller-retour par machine
+    const targets = new Map<string, Remote>();
+    for (const s of sessions.values())
+      if (!isLocal(s.remote.id) && s.remote.claude && !s.remote.sysSsh) targets.set(s.remote.id, s.remote);
+    for (const r of targets.values()) {
+      try {
+        await rpc("ctx_remote_setup", { ...remoteParams(r), enable: on });
+        if (on) rpc("ctx_watch", { remoteId: r.id, ...remoteParams(r) }).catch(() => {});
+        else rpc("ctx_unwatch", { remoteId: r.id }).catch(() => {});
+      } catch (e) {
+        toast(`${r.name}: ${e}`, "error");
+      }
+    }
+  }
+
   async function enhanceShell(sid: string) {
     const s = sessions.get(sid);
     if (!s || isLocal(s.remote.id)) return;
@@ -1823,6 +1872,10 @@
         await save();
       }
       rpc("events_watch", { remoteId: s.remote.id, ...remoteParams(s.remote) }).catch(() => {});
+      // la sync vient de poser le relais de status line sur ce VPS : autant en
+      // lire tout de suite les relevés (sinon rien avant la prochaine connexion)
+      if (settings.contextBanner)
+        rpc("ctx_watch", { remoteId: s.remote.id, ...remoteParams(s.remote) }).catch(() => {});
       s.term.write("\x1b[90m[arabel] agent tracking enabled (see the Agents section)\x1b[0m\r\n");
       toast(wasTracked ? "Claude config synced" : "Claude tracking enabled for this remote", "success");
     } catch (e) {
@@ -2192,6 +2245,114 @@
   });
   function gb(bytes: number): string {
     return (bytes / 1073741824).toFixed(1);
+  }
+
+  // ─── contexte & quotas Claude Code (bandeau de la sidebar) ────────────────
+  // Le relais de status line (~/.arabel/ctx.sh, voir ctx.rs) dépose un JSON par
+  // pane où claude tourne. On le relit ici : distant par le flux `arabel-ctx`,
+  // local par un sondage — même cadence de 3 s que les métriques.
+  type CtxUsage = {
+    at: number; // horodatage du relevé (horloge de la machine qui exécute claude)
+    seen: number; // dernier instant OÙ CE RELEVÉ A BOUGÉ, à notre horloge à nous.
+    //             Comparer `at` à notre `Date.now()` ne dirait rien de fiable :
+    //             le VPS n'a pas la même horloge. Un écart entre deux relevés,
+    //             si.
+    ctxPct: number | null; // contexte consommé, 0–100
+    ctxTokens: number | null;
+    ctxSize: number | null;
+    fiveHourPct: number | null; // quota consommé sur la fenêtre glissante de 5 h
+    fiveHourReset: number | null; // epoch ms
+    weekPct: number | null; // idem sur 7 jours
+    weekReset: number | null;
+    model: string;
+  };
+  let ctxUsage = $state<Record<string, CtxUsage>>({});
+
+  /** `resets_at` arrive en epoch secondes (en-tête d'API) ou en ISO 8601 selon
+   *  le chemin par lequel Claude Code l'a reçu — on accepte les deux. */
+  function resetAt(v: unknown): number | null {
+    if (typeof v === "number" && v > 0) return v * 1000;
+    if (typeof v === "string") { const t = Date.parse(v); return Number.isNaN(t) ? null : t; }
+    return null;
+  }
+  function num(v: unknown): number | null {
+    return typeof v === "number" && Number.isFinite(v) ? v : null;
+  }
+  /** Une ligne du relais → l'état d'un pane. Rien n'est garanti présent :
+   *  `rate_limits` n'existe qu'après la première réponse d'API de la session, et
+   *  `context_window.current_usage` est nul tant que rien n'a été envoyé. */
+  function readCtxLine(line: string) {
+    let p: any;
+    try {
+      p = JSON.parse(line);
+    } catch {
+      return;
+    }
+    const sid: string = p?.pane ?? "";
+    const c = p?.ctx;
+    if (!sid || !c) return;
+    const cw = c.context_window ?? {};
+    const rl = c.rate_limits ?? {};
+    const at = typeof p.at === "number" ? p.at * 1000 : Date.now();
+    // le relais réécrit son fichier à chaque rendu de status line ; on le relit,
+    // lui, toutes les 3 s. Un `at` figé = plus personne ne rend → claude fermé.
+    const prev = ctxUsage[sid];
+    ctxUsage[sid] = {
+      at,
+      seen: prev && prev.at === at ? prev.seen : Date.now(),
+      ctxPct: num(cw.used_percentage),
+      ctxTokens: num(cw.total_input_tokens),
+      ctxSize: num(cw.context_window_size),
+      fiveHourPct: num(rl.five_hour?.used_percentage),
+      fiveHourReset: resetAt(rl.five_hour?.resets_at),
+      weekPct: num(rl.seven_day?.used_percentage),
+      weekReset: resetAt(rl.seven_day?.resets_at),
+      model: c.model?.display_name ?? "",
+    };
+  }
+  listen<{ remoteId: string; line: string }>("arabel-ctx", (ev) => readCtxLine(ev.payload.line));
+
+  setInterval(async () => {
+    if (!settings.contextBanner) return;
+    if (![...sessions.values()].some((s) => isLocal(s.remote.id))) return;
+    try {
+      for (const line of (await rpc<string[]>("ctx_read")) ?? []) readCtxLine(line);
+    } catch {}
+  }, 3000);
+
+  // les échéances se relisent sur l'horloge de rafraîchissement déjà en place
+  // (liveTick) : pas de minuteur supplémentaire pour un compte à rebours.
+  const ctxNow = $derived.by(() => { liveTick; return Date.now(); });
+  const activeCtx = $derived.by(() => {
+    const sid = activeTab?.active;
+    return sid ? ctxUsage[sid] : undefined;
+  });
+  /** Le bandeau ne s'affiche que s'il a quelque chose à dire : un pane sans
+   *  claude n'a jamais rendu de status line, donc jamais de relevé. */
+  const showCtx = $derived(settings.contextBanner && !!activeCtx && activeCtx.ctxPct !== null);
+  /** Plus rafraîchi (claude fermé, la plupart du temps) : on grise au lieu de
+   *  faire disparaître — les chiffres restent vrais, ils ne sont juste plus vivants. */
+  const ctxStale = $derived(!!activeCtx && ctxNow - activeCtx.seen > 120_000);
+
+  /** « 2h14 » / « 3d » — l'échéance d'une fenêtre de quota, au plus court. */
+  function untilText(ts: number | null, now: number): string {
+    if (!ts) return "";
+    const m = Math.round((ts - now) / 60000);
+    if (m <= 0) return "now";
+    if (m < 60) return `${m}m`;
+    const h = Math.floor(m / 60);
+    if (h < 24) return m % 60 ? `${h}h${String(m % 60).padStart(2, "0")}` : `${h}h`;
+    return `${Math.round(h / 24)}d`;
+  }
+  /** Infobulle d'une fenêtre de quota : consommé, restant, et quand ça repart. */
+  function quotaTitle(name: string, pct: number, reset: number | null, now: number): string {
+    const when = reset
+      ? ` · resets in ${untilText(reset, now)} (${new Date(reset).toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit" })})`
+      : "";
+    return `${name} — ${Math.round(pct)}% used, ${Math.round(100 - pct)}% left${when}`;
+  }
+  function ktok(n: number | null): string {
+    return n === null ? "?" : n >= 1000 ? `${Math.round(n / 1000)}k` : `${n}`;
   }
 
   // ─── panneau fichiers SFTP ────────────────────────────────────────────────
@@ -3631,6 +3792,23 @@
   </div>
 {/snippet}
 
+<!-- Une ligne du bandeau contexte/quotas. La barre se REMPLIT toujours de ce
+     qui est consommé (comme cpu/ram/disque au-dessus) ; le chiffre à droite dit
+     ce qui compte pour cette ligne-là, et l'infobulle donne les deux. -->
+{#snippet ctxRow(label: string, ratio: number, right: string, title: string)}
+  <div class="ctx-row" {title}>
+    <span class="ctx-label">{label}</span>
+    <span class="meter-track ctx-track">
+      <span
+        class="meter-fill"
+        class:warn={ratio > 0.7}
+        class:crit={ratio > 0.9}
+        style="width:{Math.round(Math.min(1, Math.max(0, ratio)) * 100)}%"></span>
+    </span>
+    <span class="ctx-val">{right}</span>
+  </div>
+{/snippet}
+
 {#snippet emptyState(icon: Snippet, title: string, hint: string, action: { label: string; run: () => void } | null)}
   <div class="empty">
     <span class="empty-icon">{@render icon()}</span>
@@ -3719,6 +3897,42 @@
         {/if}
       </nav>
       <div class="sb-foot">
+        {#if showCtx && activeCtx}
+          <div class="ctx" class:stale={ctxStale} title={ctxStale ? "Last reading — no status line render since" : ""} transition:fly={{ y: 6, duration: 140 }}>
+            <div class="ctx-head">
+              <span class="ctx-title">Claude Code</span>
+              {#if activeCtx.model}<span class="ctx-model" title="Model of this session">{activeCtx.model}</span>{/if}
+            </div>
+            {@render ctxRow(
+              "ctx",
+              (activeCtx.ctxPct ?? 0) / 100,
+              `${Math.round(activeCtx.ctxPct ?? 0)}%`,
+              `Context of this session — ${Math.round(activeCtx.ctxPct ?? 0)}% used` +
+                (activeCtx.ctxSize ? ` · ${ktok(activeCtx.ctxTokens)} / ${ktok(activeCtx.ctxSize)} tokens` : ""),
+            )}
+            {#if activeCtx.fiveHourPct !== null}
+              {@render ctxRow(
+                "5h",
+                activeCtx.fiveHourPct / 100,
+                `${Math.round(100 - activeCtx.fiveHourPct)}% left`,
+                quotaTitle("5-hour window", activeCtx.fiveHourPct, activeCtx.fiveHourReset, ctxNow),
+              )}
+            {/if}
+            {#if activeCtx.weekPct !== null}
+              {@render ctxRow(
+                "7d",
+                activeCtx.weekPct / 100,
+                `${Math.round(100 - activeCtx.weekPct)}% left`,
+                quotaTitle("Weekly window", activeCtx.weekPct, activeCtx.weekReset, ctxNow),
+              )}
+            {/if}
+            {#if activeCtx.fiveHourPct === null && activeCtx.weekPct === null}
+              <!-- Claude Code ne connaît ses quotas qu'après une première réponse
+                   d'API : avant ça, il n'a rien à nous dire là-dessus. -->
+              <div class="ctx-wait">quotas after the first reply</div>
+            {/if}
+          </div>
+        {/if}
         <button class="sb-settings" onclick={() => (modal = { type: "connections" })}>
           {@render iTerminal()}<span>Connections</span>
         </button>
@@ -4434,6 +4648,16 @@
                 <span>Show a system notification on agent events</span>
               </label>
               <p class="f-hint">Both stay quiet while you are looking at the pane that raised the event.</p>
+              <label class="f-check">
+                <input type="checkbox" bind:checked={settings.contextBanner} onchange={() => { save(); applyContextBanner(); }} />
+                <span>Show <b>context &amp; usage</b> under the sidebar for the pane you're on</span>
+              </label>
+              <p class="f-hint">
+                Context of the session, plus how much of your 5-hour and weekly windows is left. The numbers only exist inside
+                Claude Code's status line, so arabel becomes that status line: <code>~/.arabel/ctx.sh</code> is wired into
+                <code>~/.claude/settings.json</code>, here and on every Claude-enabled remote. A status line you already had is
+                kept and called by ours; unchecking gives it back. Takes effect on the next <code>claude</code> you launch.
+              </p>
             </div>
             <div class="mgr-head"><span>Agent teams</span></div>
             <div class="group">
@@ -4729,6 +4953,66 @@
   /* marque de l'app : logo + nom, en pied de sidebar (au-dessus de Settings) —
      loin des feux macOS, identique sur Windows/Linux */
   .sb-foot { flex: none; }
+  /* bandeau contexte & quotas : au-dessus de Connections/Settings, séparé par un
+     filet — c'est une lecture, pas une commande, il ne doit pas se lire comme
+     une 3e entrée de menu. */
+  .ctx {
+    margin: 8px 8px 6px;
+    padding: 7px 10px 8px;
+    border-top: 1px solid var(--border);
+  }
+  .ctx-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 6px;
+    margin-bottom: 6px;
+  }
+  .ctx-title {
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--text-tertiary);
+  }
+  .ctx-model {
+    font-size: 10px;
+    color: var(--text-tertiary);
+    opacity: 0.75;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .ctx-row {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    height: 16px;
+  }
+  .ctx-label {
+    flex: none;
+    width: 20px;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    color: var(--text-tertiary);
+  }
+  .ctx-track { flex: 1; width: auto; min-width: 0; }
+  .ctx-val {
+    flex: none;
+    width: 54px;
+    text-align: right;
+    font-size: 10.5px;
+    font-variant-numeric: tabular-nums;
+    color: var(--text-tertiary);
+  }
+  .ctx.stale { opacity: 0.45; }
+  .ctx-wait {
+    margin-top: 4px;
+    font-size: 10px;
+    color: var(--text-tertiary);
+    opacity: 0.7;
+  }
   /* marque discrète (« fantôme ») sous Settings, avec la version */
   .sb-brand {
     display: flex;
