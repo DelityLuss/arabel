@@ -52,6 +52,12 @@ futures-util = "0.3"
 # le backend API répond. Compiler whisper.cpp demande cmake + un toolchain C++ ;
 # `--no-default-features` produit un binaire API-only qui n'en a pas besoin.
 whisper-rs = { version = "0.16", optional = true }
+# Parakeet TDT 0.6B v3 (NVIDIA) via ONNX Runtime : 25 langues dont le français,
+# et nettement plus rapide que Whisper sur CPU. Pas de C++ à compiler — mais ort
+# télécharge les binaires ONNX Runtime pendant le build, ce que je n'ai pas pu
+# vérifier ici (CDN bloqué). D'où une feature qui n'est PAS dans `default` :
+# le build de release reste exactement celui qui existait.
+parakeet-rs = { version = "0.3", optional = true }
 
 # macOS : inférence sur le GPU via Metal — sur Apple Silicon c'est plusieurs fois
 # plus rapide que le CPU, et ça laisse les cœurs à l'app.
@@ -61,6 +67,7 @@ whisper-rs = { version = "0.16", optional = true, features = ["metal"] }
 [features]
 default = ["local-whisper"]
 local-whisper = ["dep:whisper-rs"]
+local-parakeet = ["dep:parakeet-rs"]
 
 # Build release optimisé : LTO complet + un seul codegen-unit = meilleur inlining
 # à travers les crates (crypto russh, tokio, parseur xterm côté natif). strip = binaire plus léger.

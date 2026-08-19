@@ -100,8 +100,8 @@
     if (cmd === "shell_enhance") return "suggestions enabled — open a new terminal." as T;
     if (cmd === "mosh_available") return true as T;
     // démo web : pas de micro ni de coffre derrière, la dictée reste inerte
-    if (cmd === "voice_local_available" || cmd === "voice_key_present") return false as T;
-    if (cmd === "voice_devices" || cmd === "voice_models") return [] as T;
+    if (cmd === "voice_local_available" || cmd === "voice_parakeet_available" || cmd === "voice_key_present") return false as T;
+    if (cmd === "voice_devices" || cmd === "voice_models" || cmd === "voice_parakeet_models") return [] as T;
     if (cmd === "wsl_distros") return ["Ubuntu", "Debian"] as T;
     if (cmd === "sftp_paste_image") return "/home/deploy/.arabel/paste/demo.png" as T;
     if (cmd === "sftp_home") return "/home/deploy" as T;
@@ -273,20 +273,34 @@
     { label: "Groq", base: "https://api.groq.com/openai/v1", model: "whisper-large-v3-turbo" },
     { label: "OpenAI", base: "https://api.openai.com/v1", model: "gpt-4o-transcribe" },
   ];
-  /** Modèles GGML de whisper.cpp, téléchargés à la demande dans le dossier de
-   *  config. Le champ URL reste éditable : si un nom change côté HuggingFace,
-   *  ça se rattrape sans nouvelle version de l'app. */
+  /** Modèles GGML de whisper.cpp, téléchargés à la demande. Les URL sont figées
+   *  ici : si un nom bouge côté HuggingFace, le téléchargement remonte le 404
+   *  avec l'URL fautive et ça se corrige d'une ligne. */
   const HF_MODELS = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/";
   const WHISPER_MODELS = [
     { file: "ggml-base.bin", size: "148 MB", note: "quick, shaky on French" },
     { file: "ggml-small.bin", size: "488 MB", note: "fair balance" },
     { file: "ggml-large-v3-turbo-q5_0.bin", size: "574 MB", note: "best quality for the size" },
   ];
+  /** Parakeet TDT 0.6B v3 (NVIDIA) exporté en ONNX : 25 langues dont le français,
+   *  détection automatique, et sur CPU il va bien plus vite que Whisper large.
+   *  Un modèle = un DOSSIER (encodeur + décodeur/joint + vocabulaire), là où un
+   *  Whisper tient dans un seul .bin. En int8 : même précision, trois fois plus
+   *  léger que le fp32. */
+  const HF_PARAKEET = "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/";
+  const PARAKEET_MODEL = {
+    dir: "parakeet-tdt-0.6b-v3",
+    label: "parakeet-tdt-0.6b-v3 (int8)",
+    size: "~650 MB",
+    note: "25 languages, auto-detected",
+    files: ["encoder-model.int8.onnx", "decoder_joint-model.int8.onnx", "vocab.txt"],
+  };
   const VOICE_DEFAULTS = {
-    backend: "api" as "api" | "local",
+    backend: "api" as "api" | "local" | "parakeet",
     apiBase: VOICE_PRESETS[0].base,
     apiModel: VOICE_PRESETS[0].model,
-    modelPath: "", // modèle GGML pour le backend local
+    modelPath: "", // modèle GGML pour le backend Whisper local
+    parakeetPath: "", // dossier du modèle Parakeet
     language: "", // vide = détection auto ; forcer « fr » aide beaucoup Whisper
     prompt: "", // amorce de vocabulaire (noms de commandes, jargon)
     device: "", // vide = micro par défaut du système
@@ -2788,9 +2802,11 @@
   // Code de la touche qui a ouvert la dictée en mode maintien ; null hors maintien.
   let dictateHoldKey: string | null = null;
   let voiceLocalOk = $state(false); // backend Whisper local compilé dans ce binaire ?
+  let voiceParakeetOk = $state(false); // idem pour Parakeet (feature séparée)
   let voiceKeySaved = $state(false); // clé d'API présente dans le coffre (jamais relue ici)
   let voiceDevices = $state<string[]>([]);
   let voiceModels = $state<[string, number][]>([]);
+  let voiceParakeetModels = $state<[string, number][]>([]);
   let voiceDl = $state<{ file: string; received: number; total: number } | null>(null);
 
   listen<number>("voice-level", (e) => {
@@ -2809,6 +2825,8 @@
       return toast("Set up dictation first — Settings → Voice.", "error");
     if (v.backend === "local" && !v.modelPath)
       return toast("Pick a local model first — Settings → Voice.", "error");
+    if (v.backend === "parakeet" && !v.parakeetPath)
+      return toast("Download the Parakeet model first — Settings → Voice.", "error");
     try {
       await rpc("voice_start", { device: v.device || null });
     } catch (e) {
@@ -2872,9 +2890,11 @@
   async function refreshVoice() {
     if (!inTauri) return;
     voiceLocalOk = await rpc<boolean>("voice_local_available").catch(() => false);
+    voiceParakeetOk = await rpc<boolean>("voice_parakeet_available").catch(() => false);
     voiceKeySaved = await rpc<boolean>("voice_key_present").catch(() => false);
     voiceDevices = await rpc<string[]>("voice_devices").catch(() => []);
     voiceModels = await rpc<[string, number][]>("voice_models").catch(() => []);
+    voiceParakeetModels = await rpc<[string, number][]>("voice_parakeet_models").catch(() => []);
   }
 
   async function saveVoiceKey(key: string) {
@@ -2901,6 +2921,39 @@
       toast(`Download: ${e}`, "error", 8000);
     } finally {
       voiceDl = null;
+    }
+  }
+
+  async function downloadParakeet() {
+    if (voiceDl) return;
+    voiceDl = { file: PARAKEET_MODEL.dir, received: 0, total: 0 };
+    try {
+      const path = await rpc<string>("voice_parakeet_download", {
+        dir: PARAKEET_MODEL.dir,
+        files: PARAKEET_MODEL.files.map((f) => [f, HF_PARAKEET + f]),
+      });
+      settings.voice.parakeetPath = path;
+      settings.voice.backend = "parakeet";
+      save();
+      await refreshVoice();
+      toast("Parakeet ready", "success");
+    } catch (e) {
+      toast(`Download: ${e}`, "error", 10000);
+    } finally {
+      voiceDl = null;
+    }
+  }
+
+  async function deleteParakeet(path: string) {
+    try {
+      await rpc("voice_parakeet_delete", { path });
+      if (settings.voice.parakeetPath === path) {
+        settings.voice.parakeetPath = "";
+        save();
+      }
+      await refreshVoice();
+    } catch (e) {
+      toast(`${e}`, "error");
     }
   }
 
@@ -4421,7 +4474,10 @@
               <button type="button" class:on={settings.voice.backend === "api"} onclick={() => { settings.voice.backend = "api"; save(); }}>API</button>
               <button type="button" class:on={settings.voice.backend === "local"} disabled={!voiceLocalOk}
                 title={voiceLocalOk ? "" : "This build was made without the local-whisper feature"}
-                onclick={() => { settings.voice.backend = "local"; save(); }}>Local model</button>
+                onclick={() => { settings.voice.backend = "local"; save(); }}>Whisper</button>
+              <button type="button" class:on={settings.voice.backend === "parakeet"} disabled={!voiceParakeetOk}
+                title={voiceParakeetOk ? "" : "This build was made without the local-parakeet feature"}
+                onclick={() => { settings.voice.backend = "parakeet"; save(); }}>Parakeet</button>
             </div>
 
             {#if settings.voice.backend === "api"}
@@ -4445,7 +4501,7 @@
                 faster-whisper server of your own. The key is encrypted in the same local vault as your SSH passphrases; empty
                 the field to forget it.
               </p>
-            {:else}
+            {:else if settings.voice.backend === "local"}
               <div class="mgr-head"><span>Installed models</span></div>
               {#if voiceModels.length}
                 <div class="dl-list">
@@ -4480,6 +4536,32 @@
               <p class="f-hint">
                 Models come from HuggingFace and land next to Arabel's config. Nothing leaves the machine when you dictate —
                 the first transcription after a launch also pays for loading the model.
+              </p>
+            {:else}
+              <div class="mgr-head"><span>Parakeet model</span></div>
+              <div class="dl-list">
+                {#each voiceParakeetModels as [path, size] (path)}
+                  <div class="dl-row">
+                    <button type="button" class="chip grow" class:on={settings.voice.parakeetPath === path}
+                      onclick={() => { settings.voice.parakeetPath = path; save(); }}>{path.split(/[\\/]/).pop()}</button>
+                    <span class="dim">{(size / 1e6).toFixed(0)} MB</span>
+                    <button type="button" class="icon-btn" title="Delete this model" onclick={() => deleteParakeet(path)}>{@render iTrash()}</button>
+                  </div>
+                {:else}
+                  <div class="dl-row">
+                    <span class="grow">{PARAKEET_MODEL.label}<span class="dim"> · {PARAKEET_MODEL.size} · {PARAKEET_MODEL.note}</span></span>
+                    {#if voiceDl?.file === PARAKEET_MODEL.dir}
+                      <span class="dim">{voiceDl.total ? `${Math.round((voiceDl.received / voiceDl.total) * 100)} %` : `${(voiceDl.received / 1e6).toFixed(0)} MB`}</span>
+                    {:else}
+                      <button type="button" class="btn ghost" disabled={!!voiceDl} onclick={downloadParakeet}>Download</button>
+                    {/if}
+                  </div>
+                {/each}
+              </div>
+              <p class="f-hint">
+                Parakeet TDT (NVIDIA, ONNX Runtime) detects the language on its own across 25, French included, and on CPU it
+                runs well ahead of Whisper large. The <b>Language</b> and <b>Vocabulary hint</b> below don't apply to it —
+                a transducer takes no prompt. Everything stays on the machine.
               </p>
             {/if}
 

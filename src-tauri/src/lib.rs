@@ -161,6 +161,8 @@ pub fn run() {
     // backend local est compilé dans ce binaire.
     #[cfg(feature = "local-whisper")]
     let builder = builder.manage(voice::WhisperCache::default());
+    #[cfg(feature = "local-parakeet")]
+    let builder = builder.manage(voice::ParakeetCache::default());
     builder
         .setup(|app| {
             build_menu(app)?;
@@ -216,9 +218,13 @@ pub fn run() {
             voice::voice_stop,
             voice::voice_cancel,
             voice::voice_local_available,
+            voice::voice_parakeet_available,
             voice::voice_models,
             voice::voice_model_download,
             voice::voice_model_delete,
+            voice::voice_parakeet_models,
+            voice::voice_parakeet_download,
+            voice::voice_parakeet_delete,
             voice::voice_key_set,
             voice::voice_key_present,
             fonts::list_fonts

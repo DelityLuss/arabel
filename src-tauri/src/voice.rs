@@ -54,6 +54,13 @@ pub struct VoiceState(pub Mutex<Option<Rec>>);
 #[derive(Default)]
 pub struct WhisperCache(pub Mutex<Option<(PathBuf, Arc<whisper_rs::WhisperContext>)>>);
 
+/// Idem pour Parakeet. Le modèle est `Send` mais `transcribe_samples` prend
+/// `&mut self` (il porte l'état du décodeur TDT) : d'où le Mutex intérieur, qui
+/// sérialise aussi les dictées — une seule tourne à la fois de toute façon.
+#[cfg(feature = "local-parakeet")]
+#[derive(Default)]
+pub struct ParakeetCache(pub Mutex<Option<(PathBuf, Arc<Mutex<parakeet_rs::ParakeetTDT>>)>>);
+
 // ─── réglages venus du front ─────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
@@ -77,6 +84,10 @@ pub struct VoiceCfg {
     #[serde(default)]
     #[cfg_attr(not(feature = "local-whisper"), allow(dead_code))] // build API-only : personne ne le lit
     pub model_path: String,
+    /// Dossier du modèle Parakeet (encodeur + décodeur ONNX + vocab.txt).
+    #[serde(default)]
+    #[cfg_attr(not(feature = "local-parakeet"), allow(dead_code))]
+    pub parakeet_path: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -356,8 +367,60 @@ pub async fn voice_stop(
     }
     match cfg.backend.as_str() {
         "local" => transcribe_local(&app, pcm, cfg).await,
+        "parakeet" => transcribe_parakeet(&app, pcm, cfg).await,
         _ => transcribe_api(pcm, cfg).await,
     }
+}
+
+/// Parakeet TDT (NVIDIA) par ONNX Runtime. Le modèle détecte la langue seul
+/// parmi 25 — le réglage « Language » ne s'applique donc qu'à Whisper et à
+/// l'API, et l'amorce de vocabulaire n'existe pas ici (un transducteur n'a pas
+/// de conditionnement par prompt, contrairement à Whisper).
+#[cfg(feature = "local-parakeet")]
+async fn transcribe_parakeet(app: &AppHandle, pcm: Vec<f32>, cfg: VoiceCfg) -> Result<String, String> {
+    use parakeet_rs::{ParakeetTDT, Transcriber};
+
+    let path = PathBuf::from(cfg.parakeet_path.trim());
+    if cfg.parakeet_path.trim().is_empty() || !path.is_dir() {
+        return Err("no Parakeet model — download one in Settings → Voice".into());
+    }
+    let cache = app.state::<ParakeetCache>();
+    let cached = {
+        let g = cache.0.lock().map_err(|_| "parakeet cache poisoned")?;
+        g.as_ref().filter(|(p, _)| *p == path).map(|(_, m)| Arc::clone(m))
+    };
+    let model = match cached {
+        Some(m) => m,
+        None => {
+            let p = path.clone();
+            let fresh = tokio::task::spawn_blocking(move || {
+                ParakeetTDT::from_pretrained(&p, None).map_err(|e| format!("cannot load Parakeet: {e}"))
+            })
+            .await
+            .map_err(|e| e.to_string())??;
+            let fresh = Arc::new(Mutex::new(fresh));
+            if let Ok(mut g) = cache.0.lock() {
+                *g = Some((path.clone(), Arc::clone(&fresh)));
+            }
+            fresh
+        }
+    };
+
+    tokio::task::spawn_blocking(move || {
+        let mut m = model.lock().map_err(|_| "parakeet model poisoned")?;
+        // pcm est déjà en 16 kHz mono — c'est ce que resample() garantit.
+        let out = m
+            .transcribe_samples(pcm, WHISPER_RATE, 1, None)
+            .map_err(|e| format!("transcription failed: {e}"))?;
+        Ok(out.text.trim().to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[cfg(not(feature = "local-parakeet"))]
+async fn transcribe_parakeet(_app: &AppHandle, _pcm: Vec<f32>, _cfg: VoiceCfg) -> Result<String, String> {
+    Err("this build has no Parakeet — rebuild with the `local-parakeet` feature, or use another backend".into())
 }
 
 /// API compatible OpenAI (`POST {base}/audio/transcriptions`, multipart). Un
@@ -495,6 +558,11 @@ pub fn voice_local_available() -> bool {
     cfg!(feature = "local-whisper")
 }
 
+#[tauri::command]
+pub fn voice_parakeet_available() -> bool {
+    cfg!(feature = "local-parakeet")
+}
+
 /// WAV PCM 16 bits mono 16 kHz. 44 octets d'en-tête, pas de dépendance.
 fn wav16(pcm: &[f32]) -> Vec<u8> {
     let data_len = (pcm.len() * 2) as u32;
@@ -553,49 +621,163 @@ pub fn voice_models(app: AppHandle) -> Result<Vec<(String, u64)>, String> {
     Ok(out)
 }
 
-/// Télécharge un modèle GGML. Écrit dans un `.part` renommé à la fin : une
-/// coupure réseau laisse un fichier partiel identifiable, jamais un modèle
-/// tronqué que whisper.cpp chargerait à moitié.
-#[tauri::command]
-pub async fn voice_model_download(app: AppHandle, url: String, name: String) -> Result<String, String> {
+/// Un fichier vers son `.part` puis rename. `done` est le cumul déjà téléchargé
+/// par les fichiers précédents, `total` la taille de l'ensemble (0 = inconnue) :
+/// un modèle Parakeet en compte trois, la barre doit avancer d'un seul tenant.
+/// Le `.part` garantit qu'une coupure laisse un fichier partiel identifiable,
+/// jamais un modèle tronqué qu'un runtime chargerait à moitié.
+async fn fetch_file(
+    app: &AppHandle,
+    client: &reqwest::Client,
+    url: &str,
+    dest: &std::path::Path,
+    done: u64,
+    total: u64,
+) -> Result<u64, String> {
     use futures_util::StreamExt;
 
-    // Pas de séparateur de chemin dans le nom : il vient d'une liste, mais rien
-    // n'empêche un jour de le rendre libre — on ne veut pas écrire hors du dossier.
-    let safe = name.replace(['/', '\\'], "_");
-    if safe.is_empty() {
-        return Err("invalid model name".into());
-    }
-    let dir = models_dir(&app)?;
-    let dest = dir.join(&safe);
-    let part = dir.join(format!("{safe}.part"));
-
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60 * 60))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let res = client.get(&url).send().await.map_err(|e| format!("download failed: {e}"))?;
+    let part = dest.with_extension("part");
+    let res = client.get(url).send().await.map_err(|e| format!("download failed: {e}"))?;
     if !res.status().is_success() {
-        return Err(format!("download failed: {}", res.status()));
+        return Err(format!("download failed ({}): {url}", res.status()));
     }
-    let total = res.content_length().unwrap_or(0);
     let mut file = std::fs::File::create(&part).map_err(|e| e.to_string())?;
-    let mut received: u64 = 0;
+    let mut got: u64 = 0;
     let mut last = Instant::now();
     let mut stream = res.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| format!("download interrupted: {e}"))?;
         file.write_all(&chunk).map_err(|e| e.to_string())?;
-        received += chunk.len() as u64;
+        got += chunk.len() as u64;
         if last.elapsed() >= Duration::from_millis(200) {
             last = Instant::now();
-            let _ = app.emit("voice-download", DlProgress { received, total });
+            let _ = app.emit("voice-download", DlProgress { received: done + got, total });
         }
     }
     file.flush().map_err(|e| e.to_string())?;
     drop(file);
-    std::fs::rename(&part, &dest).map_err(|e| e.to_string())?;
-    let _ = app.emit("voice-download", DlProgress { received, total: received });
+    std::fs::rename(&part, dest).map_err(|e| e.to_string())?;
+    Ok(got)
+}
+
+fn http() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(60 * 60))
+        .build()
+        .map_err(|e| e.to_string())
+}
+
+/// Nom de fichier sûr : il vient d'une liste côté UI, mais rien n'empêche un
+/// jour de le rendre libre — on ne veut écrire nulle part hors du dossier.
+fn safe_name(name: &str) -> Result<String, String> {
+    let safe = name.replace(['/', '\\'], "_");
+    if safe.is_empty() || safe.starts_with('.') {
+        return Err(format!("invalid model name: {name}"));
+    }
+    Ok(safe)
+}
+
+/// Modèles Parakeet installés : un dossier par modèle, reconnu à son vocab.txt
+/// (c'est le fichier que parakeet-rs exige, en plus des deux ONNX).
+#[tauri::command]
+pub fn voice_parakeet_models(app: AppHandle) -> Result<Vec<(String, u64)>, String> {
+    let dir = models_dir(&app)?;
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())?.flatten() {
+        let path = entry.path();
+        if !path.is_dir() || !path.join("vocab.txt").is_file() {
+            continue;
+        }
+        // taille = somme des fichiers du dossier, pour l'afficher comme un GGML
+        let size = std::fs::read_dir(&path)
+            .map(|rd| rd.flatten().filter_map(|f| f.metadata().ok()).map(|m| m.len()).sum())
+            .unwrap_or(0);
+        if let Some(name) = path.to_str() {
+            out.push((name.to_string(), size));
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Télécharge un modèle Parakeet : plusieurs fichiers dans un dossier. On somme
+/// d'abord les tailles par des HEAD, sinon la barre n'aurait aucun total à
+/// montrer sur ~650 Mo. Le dossier n'est nommé qu'à la fin (`.part` renommé) :
+/// une coupure ne laisse pas un dossier à moitié plein que le loader croirait
+/// complet — il verrait un vocab.txt et échouerait plus loin, sans expliquer.
+#[tauri::command]
+pub async fn voice_parakeet_download(
+    app: AppHandle,
+    dir: String,
+    files: Vec<(String, String)>, // (nom de fichier, URL)
+) -> Result<String, String> {
+    if files.is_empty() {
+        return Err("no file to download".into());
+    }
+    let root = models_dir(&app)?;
+    let dest = root.join(safe_name(&dir)?);
+    let staging = root.join(format!("{}.part", safe_name(&dir)?));
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging).map_err(|e| e.to_string())?;
+    }
+    std::fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
+
+    let client = http()?;
+    let mut total = 0u64;
+    for (_, url) in &files {
+        if let Ok(r) = client.head(url).send().await {
+            total += r.content_length().unwrap_or(0);
+        }
+    }
+
+    let mut done = 0u64;
+    for (name, url) in &files {
+        let target = staging.join(safe_name(name)?);
+        match fetch_file(&app, &client, url, &target, done, total).await {
+            Ok(got) => done += got,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&staging); // pas de dossier à moitié rempli
+                return Err(e);
+            }
+        }
+    }
+    if dest.exists() {
+        std::fs::remove_dir_all(&dest).map_err(|e| e.to_string())?;
+    }
+    std::fs::rename(&staging, &dest).map_err(|e| e.to_string())?;
+    let _ = app.emit("voice-download", DlProgress { received: done, total: done });
+    dest.to_str().map(str::to_string).ok_or_else(|| "invalid path".into())
+}
+
+/// Même précaution que pour un GGML : ONNX Runtime mappe les fichiers, et
+/// Windows refuse d'effacer ce qui est encore ouvert.
+#[tauri::command]
+pub fn voice_parakeet_delete(app: AppHandle, path: String) -> Result<(), String> {
+    #[cfg(feature = "local-parakeet")]
+    {
+        let cache = app.state::<ParakeetCache>();
+        let mut g = match cache.0.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        if g.as_ref().is_some_and(|(p, _)| p == &PathBuf::from(&path)) {
+            *g = None;
+        }
+        drop(g);
+    }
+    #[cfg(not(feature = "local-parakeet"))]
+    let _ = &app;
+    std::fs::remove_dir_all(path).map_err(|e| e.to_string())
+}
+
+/// Télécharge un modèle GGML (whisper.cpp) : un seul fichier.
+#[tauri::command]
+pub async fn voice_model_download(app: AppHandle, url: String, name: String) -> Result<String, String> {
+    let dir = models_dir(&app)?;
+    let dest = dir.join(safe_name(&name)?);
+    let client = http()?;
+    let got = fetch_file(&app, &client, &url, &dest, 0, 0).await?;
+    let _ = app.emit("voice-download", DlProgress { received: got, total: got });
     dest.to_str().map(str::to_string).ok_or_else(|| "invalid path".into())
 }
 
