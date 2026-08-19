@@ -1,6 +1,6 @@
 [package]
 name = "arabel"
-version = "0.6.2"
+version = "0.6.3"
 description = "Terminal SSH pour piloter des agents IA"
 authors = ["you"]
 edition = "2021"
