@@ -4,6 +4,7 @@ mod local;
 mod sftp;
 pub mod ssh;
 mod store;
+mod update;
 mod voice;
 
 use ssh::SshState;
@@ -233,7 +234,8 @@ pub fn run() {
             voice::voice_parakeet_delete,
             voice::voice_key_set,
             voice::voice_key_present,
-            fonts::list_fonts
+            fonts::list_fonts,
+            update::update_check
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")

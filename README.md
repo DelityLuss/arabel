@@ -38,6 +38,7 @@ a terminal, a sidebar, and the handful of things you actually reach for.
 | **SFTP** | Browse, download, drag-and-drop upload. |
 | **Port forwards & browser panes** | Preview your dev server inside the grid. |
 | **Dictation** | Speak into any pane (⌘⇧M): the mic is read natively (cpal), and transcription runs through an OpenAI-compatible API (Groq, OpenAI, or a server of your own), or fully offline — Whisper (whisper.cpp) or **Parakeet TDT v3** (NVIDIA, via ONNX Runtime; 25 languages auto-detected, far quicker than Whisper large on CPU). The text is inserted, not sent — you read it first. |
+| **Update check** | At startup, then every 6 hours, arabel asks GitHub for the latest published release. A newer one shows up as a discreet strip above Settings — one click opens the release page. Nothing is ever downloaded or installed behind your back, and the check is a checkbox away from off (Settings → Terminal → Updates). |
 | **Getting around** | Command palette (⌘P) over panes, projects and remotes · find in terminal (⌘F) · zoom a pane · drag panes between tabs and projects. |
 | **Yours to tweak** | 18 rebindable actions, a theme editor (16-colour ANSI grid, 5 presets incl. OLED), font import from VS Code, live CPU/RAM/disk meters, and config sharing between machines (secrets excluded). |
 
@@ -120,6 +121,33 @@ network access to that CDN, and it has never been through CI here:
 ```sh
 npm run tauri build -- --features local-parakeet
 ```
+
+### Staying up to date
+
+The app tells you when a new version is out; it does not update itself. On
+startup and every 6 hours it does one anonymous `GET` on
+`api.github.com/repos/DelityLuss/arabel/releases/latest`, compares the tag to
+its own version, and shows a strip in the sidebar if the tag wins (`update.rs`).
+Draft releases are invisible to that endpoint, so nothing is announced until you
+publish the release by hand. Dismissing the strip skips that one version;
+unticking *Tell me when a new version is out* stops the network call for good.
+
+Real auto-update (download, verify, swap the binary) means adding
+`tauri-plugin-updater`, and that plugin only accepts an update it can verify
+against a minisign key:
+
+```sh
+npm run tauri signer generate -- -w ~/.tauri/arabel.key
+```
+
+The public half goes into `tauri.conf.json` (`plugins.updater.pubkey`), the
+private half plus its password become `TAURI_SIGNING_PRIVATE_KEY` /
+`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` in the release workflow, and
+`tauri-action` needs `includeUpdaterJson: true` so each release carries the
+`latest.json` the plugin reads. That is the whole gap — the key is the part a
+CI job cannot generate for you. On macOS it would also spare you Gatekeeper's
+"unverified developer" wall on every release, since the app fetches the bundle
+itself instead of the browser quarantining it.
 
 ## Development
 

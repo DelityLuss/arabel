@@ -331,6 +331,11 @@
     // branche sur la status line de Claude Code (voir ctx.rs), donc il touche à
     // ta config d'agent — ça se demande, ça ne s'impose pas.
     contextBanner: false,
+    // Vérification de mise à jour : un GET sur la dernière release GitHub au
+    // démarrage puis toutes les 6 h. Rien n'est téléchargé ni installé — voir
+    // update.rs. Décochable pour qui ne veut aucun appel réseau spontané.
+    updateCheck: true,
+    updateSkipped: "", // version dont on a fermé le bandeau : on ne la représente plus
     projects: true, // décoché = terminaux seuls ; les projets restent en mémoire, juste masqués
     emojiAnim: true, // emojis de projet animés en continu ; décoché = figés sur la 1re frame
     cursorStyle: "bar" as "bar" | "block" | "underline",
@@ -2355,6 +2360,56 @@
     return n === null ? "?" : n >= 1000 ? `${Math.round(n / 1000)}k` : `${n}`;
   }
 
+  // ─── mise à jour de l'app ─────────────────────────────────────────────────
+  // On DÉTECTE, on n'installe pas : `update_check` (update.rs) lit la dernière
+  // release publiée sur GitHub et dit si elle est plus récente. Le bandeau de
+  // la sidebar propose alors d'ouvrir la page de release. Le choix de ne pas
+  // remplacer le binaire tout seul est expliqué en tête d'update.rs.
+  type UpdateInfo = { version: string; current: string; url: string; notes: string; publishedAt: string };
+  let update = $state<UpdateInfo | null>(null);
+  let updateBusy = $state(false); // vérification manuelle en cours (bouton des réglages)
+  let updateChecked = $state(0); // horodatage de la dernière réponse, pour l'afficher
+
+  /** `manual` = déclenché depuis les réglages : on parle même quand tout va bien
+   *  (et même si la vérification auto est décochée). En automatique, une panne
+   *  réseau ou un quota d'API épuisé ne doit RIEN afficher. */
+  async function checkUpdate(manual: boolean) {
+    if (!inTauri || updateBusy) return;
+    updateBusy = true;
+    try {
+      const info = await rpc<UpdateInfo | null>("update_check");
+      updateChecked = Date.now();
+      update = info;
+      // vérification manuelle : on repart de zéro, même sur une version déjà
+      // écartée — l'utilisateur vient justement de la redemander.
+      if (info && manual && settings.updateSkipped === info.version) { settings.updateSkipped = ""; save(); }
+      if (manual && !info) toast(`arabel ${appVersion} is the latest version`, "success");
+    } catch (e) {
+      if (manual) toast(`Update check failed — ${e}`, "error");
+    } finally {
+      updateBusy = false;
+    }
+  }
+  /** Bandeau masqué pour cette version-là : il reviendra à la suivante. */
+  function skipUpdate() {
+    if (!update) return;
+    settings.updateSkipped = update.version;
+    save();
+  }
+  const showUpdate = $derived(!!update && update.version !== settings.updateSkipped);
+
+  if (inTauri) {
+    // Premier sondage une fois le store lu — c'est lui qui porte le réglage, on
+    // ne veut pas appeler le réseau chez quelqu'un qui l'a décoché. Puis toutes
+    // les 6 h : l'app reste souvent ouverte des jours d'affilée.
+    const first = setInterval(() => {
+      if (!loaded) return;
+      clearInterval(first);
+      if (settings.updateCheck) checkUpdate(false);
+    }, 3000);
+    setInterval(() => { if (settings.updateCheck) checkUpdate(false); }, 6 * 3600_000);
+  }
+
   // ─── panneau fichiers SFTP ────────────────────────────────────────────────
   type FEntry = { name: string; isDir: boolean; size: number };
   let files = $state<{ open: boolean; remote: Remote | null; path: string; entries: FEntry[]; busy: boolean; over: boolean }>({
@@ -3897,6 +3952,24 @@
         {/if}
       </nav>
       <div class="sb-foot">
+        {#if showUpdate && update}
+          {@const u = update}
+          <!-- Bandeau de mise à jour : au-dessus du contexte, donc juste sous la
+               liste. Il ne s'impose qu'une fois par version — la croix l'écarte
+               jusqu'à la suivante. -->
+          <div class="upd" transition:fly={{ y: 6, duration: 140 }}>
+            <div class="upd-head">
+              <span class="upd-title">Update available</span>
+              <button class="icon-btn upd-x" title="Skip this version" onclick={skipUpdate}>{@render iClose()}</button>
+            </div>
+            <button
+              class="upd-btn"
+              title={`arabel ${u.version} is out — you are on ${u.current}. Opens the release page: pick the package for your OS.`}
+              onclick={() => openUrl(u.url).catch((e) => toast(String(e), "error"))}>
+              {@render iDownload()}<span>Get v{u.version}</span>
+            </button>
+          </div>
+        {/if}
         {#if showCtx && activeCtx}
           <div class="ctx" class:stale={ctxStale} title={ctxStale ? "Last reading — no status line render since" : ""} transition:fly={{ y: 6, duration: 140 }}>
             <div class="ctx-head">
@@ -4682,6 +4755,30 @@
                 always close a pane yourself with {formatCombo(settings.keymap["close-pane"])} or its ✕ button (appears on hover).
               </p>
             </div>
+            <div class="mgr-head"><span>Updates</span></div>
+            <div class="group">
+              <label class="f-check">
+                <input type="checkbox" bind:checked={settings.updateCheck} onchange={() => save()} />
+                <span>Tell me when a new version is out</span>
+              </label>
+              <div class="sync-row">
+                <button type="button" class="btn ghost" disabled={updateBusy || !inTauri} onclick={() => checkUpdate(true)}>
+                  {#if updateBusy}{@render iSpinner(12)}{:else}{@render iRefresh()}{/if}Check now
+                </button>
+                {#if update}
+                  {@const u = update}
+                  <button type="button" class="btn ghost" onclick={() => openUrl(u.url).catch((e) => toast(String(e), "error"))}>
+                    {@render iExternal()}Release page
+                  </button>
+                {/if}
+              </div>
+              <p class="f-hint">
+                You are on <b>v{appVersion}</b>{#if update} — <b>v{update.version}</b> is available{:else if updateChecked} — up to date{/if}. arabel
+                only <em>reads</em> the latest release published on GitHub (at startup, then every 6 hours) and tells you about it: nothing is
+                downloaded and nothing is installed behind your back. Updating stays one click to the release page, where you pick the
+                package for your OS.
+              </p>
+            </div>
             <div class="sheet-actions"><button type="submit" class="btn">Close</button></div>
           </form>
         {:else if settingsTab === "voice"}
@@ -4953,6 +5050,46 @@
   /* marque de l'app : logo + nom, en pied de sidebar (au-dessus de Settings) —
      loin des feux macOS, identique sur Windows/Linux */
   .sb-foot { flex: none; }
+  /* bandeau « mise à jour dispo » : même gabarit que .ctx (filet + marges),
+     mais lui PORTE une action, d'où le bouton plein largeur en accent discret. */
+  .upd {
+    margin: 8px 8px 6px;
+    padding: 7px 10px 8px;
+    border-top: 1px solid var(--border);
+  }
+  .upd-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+    margin-bottom: 6px;
+  }
+  .upd-title {
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--accent);
+  }
+  .upd-x { opacity: 0; }
+  .upd:hover .upd-x { opacity: 1; }
+  .upd-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    width: 100%;
+    height: 26px;
+    border: 1px solid var(--accent-subtle);
+    border-radius: var(--radius-md);
+    background: var(--accent-subtle);
+    color: var(--accent);
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .upd-btn:hover { border-color: var(--accent); }
+
   /* bandeau contexte & quotas : au-dessus de Connections/Settings, séparé par un
      filet — c'est une lecture, pas une commande, il ne doit pas se lire comme
      une 3e entrée de menu. */
