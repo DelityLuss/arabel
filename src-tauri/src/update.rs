@@ -61,12 +61,26 @@ fn is_newer(remote: &str, local: &str) -> bool {
     }
 }
 
+/// Première release téléchargeable d'une réponse `GET /releases` : la liste
+/// arrive triée du plus récent au plus ancien. Les pré-releases comptent — c'est
+/// tout l'intérêt par rapport à `releases/latest`. Les brouillons n'apparaissent
+/// pas pour un appel anonyme, mais on les écarte quand même : un jeton dans
+/// l'environnement de la CI suffirait à les faire remonter.
+fn newest_published(list: &serde_json::Value) -> Option<&serde_json::Value> {
+    list.as_array()?
+        .iter()
+        .find(|r| r.get("draft").and_then(serde_json::Value::as_bool) != Some(true))
+}
+
 /// Interroge la dernière release publiée et renvoie `Some` seulement si elle
 /// est plus récente que le binaire en cours. `None` = déjà à jour.
 ///
-/// L'API `releases/latest` ignore d'elle-même les brouillons et les
-/// pré-releases : le workflow de release crée un brouillon, donc rien ne sort
-/// d'ici tant que tu ne l'as pas publié à la main.
+/// On liste les releases au lieu d'appeler `releases/latest` : cet endpoint-là
+/// écarte AUSSI les pré-releases, et toutes les releases d'arabel en sont — il
+/// répondait donc 404 en permanence, et la vérification concluait « à jour »
+/// quoi qu'il arrive. La liste, elle, est triée par date de création et ne
+/// montre pas les brouillons à un appel anonyme : le premier élément est
+/// exactement la dernière version téléchargeable.
 #[tauri::command]
 pub async fn update_check(app: tauri::AppHandle) -> Result<Option<UpdateInfo>, String> {
     let current = app.package_info().version.to_string();
@@ -76,7 +90,7 @@ pub async fn update_check(app: tauri::AppHandle) -> Result<Option<UpdateInfo>, S
         .build()
         .map_err(|e| e.to_string())?;
     let res = client
-        .get(format!("https://api.github.com/repos/{REPO}/releases/latest"))
+        .get(format!("https://api.github.com/repos/{REPO}/releases?per_page=5"))
         .header("Accept", "application/vnd.github+json")
         .header("X-GitHub-Api-Version", "2022-11-28")
         .header("User-Agent", format!("arabel/{current}"))
@@ -84,18 +98,17 @@ pub async fn update_check(app: tauri::AppHandle) -> Result<Option<UpdateInfo>, S
         .await
         .map_err(|e| e.to_string())?;
     if !res.status().is_success() {
-        // 404 = aucune release publiée (que des brouillons) : ce n'est pas une
-        // panne, on répond « rien de neuf ». 403 = quota anonyme de l'API épuisé.
-        let code = res.status();
-        if code == reqwest::StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        return Err(format!("GitHub answered {code}"));
+        // 404 = dépôt introuvable ; 403 = quota anonyme de l'API épuisé.
+        return Err(format!("GitHub answered {}", res.status()));
     }
     // `res.json()` demanderait la feature `json` de reqwest, qu'on n'active pas
     // pour un seul appel : le texte + serde_json fait exactement pareil.
     let text = res.text().await.map_err(|e| e.to_string())?;
     let body: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    // Aucune release publiée (que des brouillons, invisibles ici) : rien de neuf.
+    let Some(body) = newest_published(&body) else {
+        return Ok(None);
+    };
     let tag = body
         .get("tag_name")
         .and_then(|v| v.as_str())
@@ -123,7 +136,22 @@ pub async fn update_check(app: tauri::AppHandle) -> Result<Option<UpdateInfo>, S
 
 #[cfg(test)]
 mod tests {
-    use super::is_newer;
+    use super::{is_newer, newest_published};
+
+    /// Le piège qui rendait la détection muette : toutes les releases d'arabel
+    /// sont des pré-releases, et `releases/latest` les ignore. Ici elles
+    /// comptent — seuls les brouillons sont écartés.
+    #[test]
+    fn takes_the_newest_non_draft() {
+        let list = serde_json::json!([
+            { "tag_name": "v0.7.0", "draft": true, "prerelease": false },
+            { "tag_name": "v0.6.3", "draft": false, "prerelease": true },
+            { "tag_name": "v0.6.2", "draft": false, "prerelease": true },
+        ]);
+        assert_eq!(newest_published(&list).unwrap()["tag_name"], "v0.6.3");
+        assert!(newest_published(&serde_json::json!([])).is_none());
+        assert!(newest_published(&serde_json::json!({ "message": "Not Found" })).is_none());
+    }
 
     #[test]
     fn compare_versions() {

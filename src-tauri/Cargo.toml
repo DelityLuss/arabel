@@ -1,6 +1,6 @@
 [package]
 name = "arabel"
-version = "0.6.3"
+version = "0.6.4"
 description = "Terminal SSH pour piloter des agents IA"
 authors = ["you"]
 edition = "2021"
@@ -53,10 +53,10 @@ futures-util = "0.3"
 # `--no-default-features` produit un binaire API-only qui n'en a pas besoin.
 whisper-rs = { version = "0.16", optional = true }
 # Parakeet TDT 0.6B v3 (NVIDIA) via ONNX Runtime : 25 langues dont le français,
-# et nettement plus rapide que Whisper sur CPU. Pas de C++ à compiler — mais ort
-# télécharge les binaires ONNX Runtime pendant le build, ce que je n'ai pas pu
-# vérifier ici (CDN bloqué). D'où une feature qui n'est PAS dans `default` :
-# le build de release reste exactement celui qui existait.
+# et nettement plus rapide que Whisper sur CPU. Pas de C++ à compiler : ort
+# télécharge un ONNX Runtime prébuilt pendant le build et le lie STATIQUEMENT
+# (le binaire exporte _OrtGetApiBase, rien à installer chez l'utilisateur). La
+# seule exigence est l'accès réseau au CDN de pyke au moment de compiler.
 parakeet-rs = { version = "0.3", optional = true }
 
 # macOS : inférence sur le GPU via Metal — sur Apple Silicon c'est plusieurs fois
@@ -65,7 +65,10 @@ parakeet-rs = { version = "0.3", optional = true }
 whisper-rs = { version = "0.16", optional = true, features = ["metal"] }
 
 [features]
-default = ["local-whisper"]
+# Parakeet est dans `default` : sans ça, `voice_parakeet_available()` répond
+# false, l'onglet Voice grise le bouton et la dictée locale la plus rapide
+# n'existe pour personne d'autre que celui qui recompile à la main.
+default = ["local-whisper", "local-parakeet"]
 local-whisper = ["dep:whisper-rs"]
 local-parakeet = ["dep:parakeet-rs"]
 

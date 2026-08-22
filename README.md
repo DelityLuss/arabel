@@ -114,23 +114,29 @@ no C++ toolchain:
 npm run tauri build -- --no-default-features
 ```
 
-**Parakeet** is a separate, opt-in feature. It needs no C++ toolchain — `ort`
-fetches prebuilt ONNX Runtime binaries during the build — but it does need
-network access to that CDN, and it has never been through CI here:
-
-```sh
-npm run tauri build -- --features local-parakeet
-```
+**Parakeet** is on by default too, and needs no C++ toolchain: `ort` fetches a
+prebuilt ONNX Runtime during the build and links it statically, so nothing has
+to be installed on the machine that runs the app. It does need network access to
+that CDN while compiling — drop it with `--no-default-features --features
+local-whisper` if you build offline.
 
 ### Staying up to date
 
 The app tells you when a new version is out; it does not update itself. On
 startup and every 6 hours it does one anonymous `GET` on
-`api.github.com/repos/DelityLuss/arabel/releases/latest`, compares the tag to
-its own version, and shows a strip in the sidebar if the tag wins (`update.rs`).
-Draft releases are invisible to that endpoint, so nothing is announced until you
-publish the release by hand. Dismissing the strip skips that one version;
-unticking *Tell me when a new version is out* stops the network call for good.
+`api.github.com/repos/DelityLuss/arabel/releases`, compares the newest published
+tag to its own version, and shows a strip in the sidebar if the tag wins
+(`update.rs`). The version in the sidebar footer says the same thing at a
+glance — it turns blue when an update exists, and clicking it opens the
+*Updates* section of the settings.
+
+It lists the releases rather than asking for `releases/latest`, because that
+endpoint skips **pre-releases as well as drafts** — and every arabel release so
+far is flagged as a pre-release, so it answered 404 forever and the app always
+believed itself up to date. Drafts stay invisible either way, so nothing is
+announced until you publish the release by hand. Dismissing the strip skips that
+one version; unticking *Tell me when a new version is out* stops the network
+call for good.
 
 Real auto-update (download, verify, swap the binary) means adding
 `tauri-plugin-updater`, and that plugin only accepts an update it can verify

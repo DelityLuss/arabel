@@ -2366,6 +2366,9 @@
   // la sidebar propose alors d'ouvrir la page de release. Le choix de ne pas
   // remplacer le binaire tout seul est expliqué en tête d'update.rs.
   type UpdateInfo = { version: string; current: string; url: string; notes: string; publishedAt: string };
+  /** Dernière version déjà annoncée par une notification système. Local à la
+   *  machine, donc hors des settings (qui, eux, s'exportent d'un poste à l'autre). */
+  const UPDATE_TOLD = "arabel:update-told";
   let update = $state<UpdateInfo | null>(null);
   let updateBusy = $state(false); // vérification manuelle en cours (bouton des réglages)
   let updateChecked = $state(0); // horodatage de la dernière réponse, pour l'afficher
@@ -2384,6 +2387,13 @@
       // écartée — l'utilisateur vient justement de la redemander.
       if (info && manual && settings.updateSkipped === info.version) { settings.updateSkipped = ""; save(); }
       if (manual && !info) toast(`arabel ${appVersion} is the latest version`, "success");
+      // Notification système, UNE fois par version : le sondage repasse toutes
+      // les 6 h et l'app reste ouverte des jours — il ne doit pas re-sonner à
+      // chaque tour. En manuel on se tait : la feuille répond déjà à l'écran.
+      if (info && !manual && localStorage.getItem(UPDATE_TOLD) !== info.version) {
+        localStorage.setItem(UPDATE_TOLD, info.version);
+        notify("done", `arabel v${info.version} is out`, `You are on v${info.current} — Settings › Terminal › Updates.`);
+      }
     } catch (e) {
       if (manual) toast(`Update check failed — ${e}`, "error");
     } finally {
@@ -4015,7 +4025,12 @@
         <div class="sb-brand">
           <span class="sb-logo">{@render iLogo()}</span>
           <span class="sb-wordmark">arabel</span>
-          <span class="sb-ver">v{appVersion}</span>
+          <!-- La version est le seul rappel permanent : cliquable, elle ouvre les
+               réglages là où vit la section Updates, et passe en accent tant
+               qu'une release plus récente existe (même bandeau écarté). -->
+          <button class="sb-ver" class:sb-ver-new={!!update}
+            title={update ? `v${update.version} is available — you are on v${appVersion}` : `arabel v${appVersion} — check for updates`}
+            onclick={() => { settingsTab = "terminal"; modal = { type: "settings" }; }}>v{appVersion}</button>
         </div>
       </div>
     </aside>
@@ -5169,7 +5184,13 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .sb-ver { font-size: 11px; color: var(--text-tertiary); font-variant-numeric: tabular-nums; }
+  .sb-ver {
+    padding: 0; background: none; border: none; font-family: inherit; cursor: pointer;
+    font-size: 11px; color: var(--text-tertiary); font-variant-numeric: tabular-nums;
+  }
+  .sb-ver:hover { color: var(--text-secondary); }
+  /* une release plus récente existe : seul rappel qui survit à la fermeture du bandeau */
+  .sb-ver-new, .sb-ver-new:hover { color: var(--accent); }
   .sb-toggle { opacity: 0; transition: opacity 120ms; }
   .sidebar:hover .sb-toggle { opacity: 1; }
   .sb-scroll { flex: 1; overflow-y: auto; min-height: 0; padding-bottom: 8px; }
