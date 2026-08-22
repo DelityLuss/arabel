@@ -65,7 +65,8 @@ rather than the OS keychain — a deliberate choice for an unsigned build, see
 ## Install
 
 Grab a build from [Releases](https://github.com/DelityLuss/arabel/releases), or
-build it yourself:
+build it yourself. The macOS build is **Apple Silicon only** — see the Parakeet
+note below for why there is no universal binary any more.
 
 ```sh
 npm install
@@ -114,11 +115,23 @@ no C++ toolchain:
 npm run tauri build -- --no-default-features
 ```
 
-**Parakeet** is on by default too, and needs no C++ toolchain: `ort` fetches a
-prebuilt ONNX Runtime during the build and links it statically, so nothing has
-to be installed on the machine that runs the app. It does need network access to
-that CDN while compiling — drop it with `--no-default-features --features
-local-whisper` if you build offline.
+**Parakeet** needs no C++ toolchain: `ort` fetches a prebuilt ONNX Runtime
+during the build and links it statically, so nothing has to be installed on the
+machine that runs the app. It only needs network access to that CDN while
+compiling:
+
+```sh
+npm run tauri build -- --features local-parakeet
+```
+
+It is off by default because that prebuilt does not exist for every target, and
+the release workflow enables it only where it does:
+
+| | Parakeet | why |
+|---|---|---|
+| **macOS** | yes, arm64 | `ort` ships no `x86_64-apple-darwin` binary, so a universal build cannot carry Parakeet. Apple Silicon won the arbitration; Intel Macs no longer get a build. |
+| **Windows** | yes | nothing in the way. |
+| **Linux** | no | the prebuilt wants glibc ≥ 2.38 and GCC 13's libstdc++; building on ubuntu-22.04 fails at link (`__isoc23_strtol`, `_M_replace_cold`). Staying on 22.04 keeps the `.deb`/`.AppImage` runnable on ordinary distros. |
 
 ### Staying up to date
 

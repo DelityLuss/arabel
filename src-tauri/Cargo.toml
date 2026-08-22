@@ -65,10 +65,12 @@ parakeet-rs = { version = "0.3", optional = true }
 whisper-rs = { version = "0.16", optional = true, features = ["metal"] }
 
 [features]
-# Parakeet est dans `default` : sans ça, `voice_parakeet_available()` répond
-# false, l'onglet Voice grise le bouton et la dictée locale la plus rapide
-# n'existe pour personne d'autre que celui qui recompile à la main.
-default = ["local-whisper", "local-parakeet"]
+# Parakeet n'est PAS dans `default`, et ce n'est pas une frilosité : ort ne
+# distribue pas d'ONNX Runtime prébuilt pour toutes les cibles. Le workflow de
+# release l'active donc là où il existe (macOS arm64, Windows) et pas ailleurs
+# (Linux : le prébuilt réclame glibc ≥ 2.38, plus récente que le runner). Un
+# `default` global ferait échouer la CI Linux au lien.
+default = ["local-whisper"]
 local-whisper = ["dep:whisper-rs"]
 local-parakeet = ["dep:parakeet-rs"]
 

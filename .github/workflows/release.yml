@@ -15,12 +15,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: macos-latest      # binaire universel (Apple Silicon + Intel)
-            args: --target universal-apple-darwin
+          # Apple Silicon SEUL, et c'est Parakeet qui l'impose : ort ne publie
+          # pas d'ONNX Runtime prébuilt pour x86_64-apple-darwin, donc un
+          # binaire universel ne peut pas embarquer la dictée Parakeet. Choix
+          # assumé — les Mac Intel n'ont plus de build.
+          - platform: macos-latest
+            args: --target aarch64-apple-darwin --features local-parakeet
+          # Pas de Parakeet ici : le prébuilt ort est compilé contre glibc ≥ 2.38
+          # et la libstdc++ de GCC 13, que ce runner n'a pas (symboles
+          # __isoc23_strtol, _M_replace_cold introuvables au lien). Rester en
+          # 22.04 garde le .deb/.AppImage lançables sur les distros courantes.
           - platform: ubuntu-22.04
             args: ''
           - platform: windows-latest
-            args: ''
+            args: --features local-parakeet
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
@@ -40,8 +48,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          # macOS : les deux cibles pour produire le binaire universel
-          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin' || '' }}
 
       - uses: swatinem/rust-cache@v2
         with:
